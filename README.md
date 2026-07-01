@@ -106,15 +106,16 @@ Extra args after the project are passed through to `nvim`.
 A self-contained fuzzy picker (built on Neovim's `matchfuzzy` — **no Telescope/fzf-lua required**)
 is bound to these global keys when a project is open:
 
-| Key         | Finds                                                       |
-| ----------- | ----------------------------------------------------------- |
-| `<Space>ff` | text — live full-text search; results stream in as you type |
-| `<Space>fc` | classes                                                     |
-| `<Space>fd` | methods (jumps to the declaration)                          |
+| Key         | Finds                                                         |
+| ----------- | ------------------------------------------------------------- |
+| `<Space>ff` | text — enter a term, watch results stream in, then fuzzy them |
+| `<Space>fc` | classes                                                       |
+| `<Space>fd` | methods (jumps to the declaration)                            |
 
 In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` to move, `<CR>` to open,
-`<Esc>` to cancel. Bound to literal `<Space>` so it works regardless of your `mapleader`. Rebind
-or disable via `keys` in `setup()`:
+`<Esc>` to cancel. A status footer shows `shown / total` (and `searching… N found` while a text
+search is still streaming). Bound to literal `<Space>` so it works regardless of your `mapleader`.
+Rebind or disable via `keys` in `setup()`:
 
 ```lua
 require("jadxnvim").setup({

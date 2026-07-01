@@ -55,8 +55,17 @@ end
 
 local function highlight(bufnr, ft)
   vim.bo[bufnr].filetype = ft
+  -- Prefer treesitter when its parser is present; otherwise force the regex syntax to load.
+  -- Setting 'syntax' explicitly makes highlighting work even when the user's session never ran
+  -- `:syntax on` (e.g. a bare nvim launched just to browse an APK).
+  local ok_ts = false
   if ft == "java" then
-    pcall(vim.treesitter.start, bufnr, "java")
+    ok_ts = pcall(vim.treesitter.start, bufnr, "java")
+  end
+  if not ok_ts then
+    pcall(function()
+      vim.bo[bufnr].syntax = ft
+    end)
   end
 end
 
@@ -104,6 +113,12 @@ end
 
 --- Register the BufReadCmds that back jadx:// (Java) and jadxsmali:// (Smali) buffers. Idempotent.
 function M.setup()
+  -- A decompiler viewer needs highlighting on; enable the machinery if the session hasn't.
+  if not vim.g.syntax_on then
+    pcall(vim.cmd, "syntax enable")
+  end
+  pcall(vim.cmd, "filetype on")
+
   local group = vim.api.nvim_create_augroup("jadxnvim_code", { clear = true })
   vim.api.nvim_create_autocmd("BufReadCmd", {
     group = group,
