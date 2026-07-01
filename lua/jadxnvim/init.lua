@@ -5,6 +5,7 @@ local tree = require("jadxnvim.tree")
 local code = require("jadxnvim.code")
 local search = require("jadxnvim.search")
 local progress = require("jadxnvim.progress")
+local clipboard = require("jadxnvim.clipboard")
 
 local M = {}
 
@@ -27,6 +28,9 @@ M.config = {
   -- By default opening an APK creates/saves a .jadx project next to it. Set temp = true (or pass
   -- --temp on the CLI / to :Jadx) to work purely in memory and never write a .jadx file.
   temp = false,
+  -- Copy yanks to the system clipboard (via OSC 52, so it works over SSH). In code buffers
+  -- `y`/`Y` target the system clipboard. Set false to leave the clipboard alone.
+  clipboard = true,
   -- Global keymaps for the fuzzy finders. Set a value to false to skip mapping it.
   -- Bound to literal <Space> by default (works regardless of your mapleader).
   keys = {
@@ -96,6 +100,7 @@ local function ensure_setup()
   end
   code.setup()
   search.setup()
+  clipboard.setup(M.config.clipboard)
   map_finders()
   setup_load_handlers()
 end

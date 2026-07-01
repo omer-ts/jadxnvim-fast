@@ -33,6 +33,7 @@ local function common_keymaps(bufnr)
   vim.keymap.set("n", "<Tab>", function()
     M.toggle_view()
   end, { buffer = bufnr, silent = true, nowait = true, desc = "jadx: toggle Java/Smali" })
+  require("jadxnvim.clipboard").apply_buffer_maps(bufnr)
 end
 
 local function java_keymaps(bufnr)

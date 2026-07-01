@@ -140,6 +140,10 @@ In a **code** buffer (`jadx://<class>`, read-only `java`):
 | `<leader>jr` | Rename                         |
 | `<leader>jc` | Comment                        |
 
+In code buffers `y` / `Y` copy to your **computer's** clipboard — over SSH too, via OSC 52 (no
+`xclip`/`win32yank` needed). Disable with `clipboard = false` in `setup()`, or it steps aside if
+you've already configured a clipboard provider.
+
 Go-to-definition and usages integrate with the jumplist and quickfix, so `<C-o>`/`<C-i>` and
 `:cnext`/`:cprev` work as usual.
 
