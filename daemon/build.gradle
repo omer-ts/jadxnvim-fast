@@ -1,0 +1,50 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.gradleup.shadow' version '8.3.5'
+}
+
+def jadxVersion = '1.5.2'
+
+repositories {
+    mavenCentral()
+    google()
+}
+
+dependencies {
+    implementation "io.github.skylot:jadx-core:${jadxVersion}"
+    // Input plugins are discovered on the classpath at runtime.
+    runtimeOnly "io.github.skylot:jadx-dex-input:${jadxVersion}"
+    runtimeOnly "io.github.skylot:jadx-smali-input:${jadxVersion}"
+    // Java bytecode (.class/.jar) input support.
+    runtimeOnly "io.github.skylot:jadx-java-convert:${jadxVersion}"
+
+    implementation 'com.google.code.gson:gson:2.11.0'
+
+    // slf4j binding for jadx's logging (routed to stderr via logback.xml).
+    runtimeOnly 'ch.qos.logback:logback-classic:1.5.6'
+}
+
+application {
+    mainClass = 'jadxnvim.daemon.Main'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
+}
+
+// Single runnable fat jar: build/libs/jadxd.jar
+tasks.named('shadowJar') {
+    archiveBaseName = 'jadxd'
+    archiveClassifier = ''
+    archiveVersion = ''
+    // jadx discovers input/other plugins via ServiceLoader; without this the per-jar
+    // META-INF/services entries overwrite each other and no plugin (e.g. dex) loads.
+    mergeServiceFiles()
+}
+
+// Make `build` produce the shadow jar.
+tasks.named('build') {
+    dependsOn 'shadowJar'
+}

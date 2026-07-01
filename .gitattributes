@@ -1,0 +1,15 @@
+# Normalize line endings. Default to LF in the repo.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Shell scripts and the Gradle wrapper must stay LF so they run on the SSH/Linux server.
+scripts/jadxnvim text eol=lf
+scripts/jadxd    text eol=lf
+gradlew          text eol=lf
+daemon/gradlew   text eol=lf
+
+# Binary.
+*.jar binary

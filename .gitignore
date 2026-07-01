@@ -1,0 +1,17 @@
+# Gradle / Java
+daemon/.gradle/
+daemon/build/
+.gradle/
+build/
+*.class
+
+# jadx test inputs / projects (keep the repo clean of binaries)
+*.apk
+*.dex
+*.aab
+*.jadx
+samples/
+
+# Editor / OS
+*.swp
+.DS_Store

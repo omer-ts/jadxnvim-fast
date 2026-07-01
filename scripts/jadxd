@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Launch the jadxd daemon (stdin/stdout JSON-RPC).
+#
+#   jadxd <project.apk|.dex|.jar|.jadx>
+#
+# Set JADXD_JAVA_OPTS to pass JVM flags, e.g. JADXD_JAVA_OPTS="-Xmx6g" for very large APKs.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+jar="$here/daemon/build/libs/jadxd.jar"
+
+if [[ ! -f "$jar" ]]; then
+  echo "jadxd: daemon jar not found at $jar" >&2
+  echo "build it with: (cd '$here/daemon' && ./gradlew shadowJar)" >&2
+  exit 1
+fi
+
+exec java ${JADXD_JAVA_OPTS:-} -jar "$jar" "$@"

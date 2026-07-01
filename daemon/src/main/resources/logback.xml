@@ -1,0 +1,16 @@
+<configuration>
+    <!--
+      Route all jadx/library logging to stderr so the JSON-RPC stream on stdout stays clean.
+      Override the level with -Dorg.slf4j... or by editing this file when debugging the daemon.
+    -->
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="WARN">
+        <appender-ref ref="STDERR"/>
+    </root>
+</configuration>

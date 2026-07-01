@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Launch the jadxnvim UI on a project straight from the shell:
+#
+#   jadxnvim app.apk
+#   jadxnvim project.jadx
+#
+# This works even if you haven't added the plugin to your Neovim config: it prepends this
+# repo to runtimepath for the session. Your normal config is still loaded (colors, keymaps,
+# other plugins), and the project is opened automatically.
+#
+# Environment:
+#   JADXNVIM_NVIM    nvim binary to use            (default: nvim)
+#   JADXD_JAVA_OPTS  JVM options for the daemon    (e.g. -Xmx6g for very large APKs)
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+jar="$here/daemon/build/libs/jadxd.jar"
+nvim_bin="${JADXNVIM_NVIM:-nvim}"
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: jadxnvim <app.apk|.dex|.jar|.jadx> [extra nvim args...]" >&2
+  exit 2
+fi
+project="$1"
+shift
+
+if [[ ! -f "$jar" ]]; then
+  echo "jadxnvim: daemon not built yet, building (first run only)..." >&2
+  ( cd "$here/daemon" && ./gradlew --console=plain shadowJar ) >&2
+fi
+if [[ ! -e "$project" ]]; then
+  echo "jadxnvim: file not found: $project" >&2
+  exit 1
+fi
+
+# `--cmd` runs before config load so the plugin is on runtimepath; the `-c` open() runs at
+# startup. Long-bracket strings keep paths with spaces intact.
+exec "$nvim_bin" "$@" \
+  --cmd "lua vim.opt.runtimepath:prepend([[$here]])" \
+  -c "lua require('jadxnvim').open([[$project]])"
