@@ -23,13 +23,24 @@ public final class Main {
 		Session session = new Session();
 		Rpc rpc = new Rpc(session, protocolOut);
 
-		boolean preload = argv.length >= 1 && argv[0] != null && !argv[0].isEmpty();
-		if (preload) {
-			session.setInitialInput(argv[0]);
+		String input = null;
+		boolean prefetch = false;
+		for (String a : argv) {
+			if ("--prefetch".equals(a)) {
+				prefetch = true;
+			} else if (input == null && a != null && !a.isEmpty()) {
+				input = a;
+			}
+		}
+
+		if (input != null) {
+			session.setInitialInput(input);
+			session.setPrefetch(prefetch);
 			try {
 				session.loadProject(null);
 			} catch (Exception e) {
 				System.err.println("[jadxd] preload failed: " + e);
+				rpc.notify("loadError", java.util.Map.of("message", String.valueOf(e.getMessage())));
 			}
 		}
 

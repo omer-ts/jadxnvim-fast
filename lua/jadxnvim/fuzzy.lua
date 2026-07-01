@@ -1,13 +1,18 @@
 -- A small self-contained fuzzy picker (no external plugin dependency).
 --
--- Uses Neovim's built-in `matchfuzzy` over a list of items. Each item is a table with a `text`
--- field (shown + matched) plus any payload. A floating results window shows matches; a one-line
--- prompt window below filters as you type. <CR> selects, <C-n>/<C-p> or <Up>/<Down> move,
--- <Esc>/<C-c> cancels.
+-- Two modes:
+--   * static  - pass `items`; typing filters them locally via Neovim's built-in `matchfuzzy`.
+--   * dynamic - pass `on_query(query, emit)`; typing (debounced) calls the provider, which may
+--               call `emit(items)` repeatedly to stream results in live.
+--
+-- A floating results window shows matches; a one-line prompt below drives it. <CR> selects,
+-- <C-n>/<C-p> or <Up>/<Down> move, <Esc>/<C-c> cancels.
+
+local uv = vim.uv or vim.loop
 
 local M = {}
 
---- Pure filter (exposed for testing). Returns the matching items, best first, capped at `limit`.
+--- Pure filter (exposed for testing). Returns matching items, best first, capped at `limit`.
 function M.filter(items, query, limit)
   limit = limit or 200
   if not query or query == "" then
@@ -21,7 +26,6 @@ function M.filter(items, query, limit)
   if ok then
     return res
   end
-  -- Fallback to substring filtering if matchfuzzy is unavailable.
   local out, q = {}, query:lower()
   for _, it in ipairs(items) do
     if it.text:lower():find(q, 1, true) then
@@ -34,12 +38,19 @@ function M.filter(items, query, limit)
   return out
 end
 
---- Open the picker. opts = { items, title, on_select(item), limit }.
+--- Open the picker. opts:
+---   { title, on_select(item), limit, debounce,
+---     items                       -- static mode
+---     on_query(query, emit),      -- dynamic mode
+---     on_close() }
 function M.pick(opts)
   local items = opts.items or {}
   local on_select = opts.on_select or function() end
+  local on_query = opts.on_query
+  local on_close = opts.on_close
   local title = opts.title or " jadx "
   local max_display = opts.limit or 200
+  local debounce_ms = opts.debounce or 150
 
   local total_w, total_h = vim.o.columns, vim.o.lines
   local width = math.max(20, math.min(110, math.floor(total_w * 0.8)))
@@ -63,47 +74,105 @@ function M.pick(opts)
   vim.wo[results_win].cursorline = true
   vim.wo[results_win].wrap = false
 
-  local filtered = {}
-  local function render()
-    local q = (vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false))[1] or ""
-    filtered = M.filter(items, q, max_display)
+  local closed = false
+  local current = {}
+  local query_seq = 0
+  local timer
+
+  local function show(list)
+    current = list or {}
+    if not vim.api.nvim_buf_is_valid(results_buf) then
+      return
+    end
+    local prev = vim.api.nvim_win_is_valid(results_win)
+        and vim.api.nvim_win_get_cursor(results_win)[1] or 1
     local lines = {}
-    for i, it in ipairs(filtered) do
+    for i, it in ipairs(current) do
       lines[i] = it.text
     end
     vim.bo[results_buf].modifiable = true
     vim.api.nvim_buf_set_lines(results_buf, 0, -1, false, #lines > 0 and lines or { "" })
     vim.bo[results_buf].modifiable = false
     if vim.api.nvim_win_is_valid(results_win) then
-      pcall(vim.api.nvim_win_set_cursor, results_win, { 1, 0 })
-      pcall(vim.api.nvim_win_set_config, results_win, { title = title .. ("(%d)"):format(#filtered) })
+      local target = math.max(1, math.min(#current > 0 and #current or 1, prev))
+      pcall(vim.api.nvim_win_set_cursor, results_win, { target, 0 })
+      pcall(vim.api.nvim_win_set_config, results_win, { title = title .. ("(%d)"):format(#current) })
+    end
+  end
+
+  local function prompt_text()
+    return (vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false))[1] or ""
+  end
+
+  local function recompute()
+    local q = prompt_text()
+    if on_query then
+      query_seq = query_seq + 1
+      local seq = query_seq
+      on_query(q, function(list)
+        vim.schedule(function()
+          if not closed and seq == query_seq then
+            show(list)
+          end
+        end)
+      end)
+    else
+      show(M.filter(items, q, max_display))
+    end
+  end
+
+  local function on_change()
+    if on_query and debounce_ms > 0 then
+      if timer then
+        timer:stop()
+        timer:close()
+        timer = nil
+      end
+      timer = uv.new_timer()
+      timer:start(debounce_ms, 0, function()
+        timer:stop()
+        timer:close()
+        timer = nil
+        vim.schedule(recompute)
+      end)
+    else
+      recompute()
     end
   end
 
   local function move(delta)
-    if not vim.api.nvim_win_is_valid(results_win) or #filtered == 0 then
+    if not vim.api.nvim_win_is_valid(results_win) or #current == 0 then
       return
     end
     local cur = vim.api.nvim_win_get_cursor(results_win)[1]
-    local nl = math.max(1, math.min(#filtered, cur + delta))
+    local nl = math.max(1, math.min(#current, cur + delta))
     vim.api.nvim_win_set_cursor(results_win, { nl, 0 })
   end
 
-  local closed = false
   local function close()
     if closed then
       return
     end
     closed = true
+    if timer then
+      pcall(function()
+        timer:stop()
+        timer:close()
+      end)
+      timer = nil
+    end
     pcall(vim.api.nvim_win_close, prompt_win, true)
     pcall(vim.api.nvim_win_close, results_win, true)
     pcall(vim.cmd, "stopinsert")
+    if on_close then
+      pcall(on_close)
+    end
   end
 
   local function accept()
     local item
-    if vim.api.nvim_win_is_valid(results_win) and #filtered > 0 then
-      item = filtered[vim.api.nvim_win_get_cursor(results_win)[1]]
+    if vim.api.nvim_win_is_valid(results_win) and #current > 0 then
+      item = current[vim.api.nvim_win_get_cursor(results_win)[1]]
     end
     close()
     if item then
@@ -115,7 +184,7 @@ function M.pick(opts)
 
   local group = vim.api.nvim_create_augroup("jadxnvim_fuzzy", { clear = true })
   vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
-    group = group, buffer = prompt_buf, callback = render,
+    group = group, buffer = prompt_buf, callback = on_change,
   })
   vim.api.nvim_create_autocmd("BufLeave", { group = group, buffer = prompt_buf, callback = close })
 
@@ -130,17 +199,16 @@ function M.pick(opts)
     vim.keymap.set(mode, "<C-c>", close, kopts)
   end
 
-  render()
+  recompute()
   vim.cmd("startinsert")
 
-  -- Handle returned for tests / programmatic control.
   return {
     close = close,
-    render = render,
+    render = recompute,
     accept = accept,
     prompt_buf = prompt_buf,
     results_win = results_win,
-    get_filtered = function() return filtered end,
+    get_filtered = function() return current end,
   }
 end
 

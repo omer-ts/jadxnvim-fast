@@ -41,6 +41,8 @@ public final class Session {
 
 	private Emitter emitter = (m, p) -> {
 	};
+	private boolean prefetch = false;
+	private java.util.concurrent.atomic.AtomicBoolean warmupCancel;
 	private JadxDecompiler jadx;
 	private String inputPath;
 	private Map<String, List<JavaClass>> packageIndex;
@@ -62,6 +64,10 @@ public final class Session {
 		this.inputPath = path;
 	}
 
+	public void setPrefetch(boolean prefetch) {
+		this.prefetch = prefetch;
+	}
+
 	public Object dispatch(String method, JsonObject params) throws Exception {
 		switch (method) {
 			case "loadProject":
@@ -78,6 +84,8 @@ public final class Session {
 				return memberPos(reqStr(params, "id"), reqInt(params, "index"));
 			case "getCode":
 				return getCode(reqStr(params, "id"));
+			case "getSmali":
+				return getSmali(reqStr(params, "id"));
 			case "gotoDef":
 				return gotoDef(reqStr(params, "id"), reqInt(params, "line"), reqInt(params, "col"));
 			case "findUsages":
@@ -113,6 +121,7 @@ public final class Session {
 		if (this.inputPath == null) {
 			throw new IllegalStateException("no input path provided");
 		}
+		cancelWarmup();
 		File given = new File(this.inputPath);
 		if (!given.exists()) {
 			throw new IllegalArgumentException("input not found: " + given.getAbsolutePath());
@@ -167,7 +176,68 @@ public final class Session {
 		info.put("renames", cd.getRenames() == null ? 0 : cd.getRenames().size());
 		info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
 		emitter.emit("ready", info);
+
+		if (prefetch) {
+			startWarmup(decompiler);
+		}
 		return info;
+	}
+
+	/**
+	 * Background pass that decompiles every top-level class so the client can show a real 0-100%
+	 * progress. Browsing stays available throughout; this only pre-fills the code cache. Runs at
+	 * low priority and is cancelled when a new project loads or the daemon shuts down.
+	 */
+	private void startWarmup(JadxDecompiler d) {
+		java.util.concurrent.atomic.AtomicBoolean cancel = new java.util.concurrent.atomic.AtomicBoolean(false);
+		this.warmupCancel = cancel;
+		Thread t = new Thread(() -> {
+			try {
+				List<JavaClass> all = d.getClasses();
+				int total = all.size();
+				if (total == 0) {
+					emitter.emit("loadDone", Map.of("total", 0));
+					return;
+				}
+				int done = 0;
+				int lastPct = -1;
+				for (JavaClass cls : all) {
+					if (cancel.get()) {
+						return;
+					}
+					try {
+						cls.getCodeInfo();
+					} catch (Throwable ignore) {
+						// keep going; some classes fail to decompile
+					}
+					done++;
+					int pct = (int) ((long) done * 100 / total);
+					if (pct != lastPct) {
+						lastPct = pct;
+						Map<String, Object> m = new LinkedHashMap<>();
+						m.put("done", done);
+						m.put("total", total);
+						m.put("percent", pct);
+						emitter.emit("loadProgress", m);
+					}
+				}
+				if (!cancel.get()) {
+					emitter.emit("loadDone", Map.of("total", total));
+				}
+			} catch (Throwable err) {
+				System.err.println("[jadxd] warmup error: " + err);
+			}
+		}, "jadx-warmup");
+		t.setDaemon(true);
+		t.setPriority(Thread.MIN_PRIORITY);
+		t.start();
+	}
+
+	private void cancelWarmup() {
+		if (warmupCancel != null) {
+			warmupCancel.set(true);
+			warmupCancel = null;
+		}
 	}
 
 	private static File defaultProjectFile(File input) {
@@ -515,7 +585,21 @@ public final class Session {
 		return result;
 	}
 
+	public Map<String, Object> getSmali(String id) {
+		JadxDecompiler d = ensureLoaded();
+		JavaClass cls = d.searchJavaClassByOrigFullName(id);
+		if (cls == null) {
+			throw new IllegalArgumentException("class not found: " + id);
+		}
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("id", id);
+		result.put("fullName", cls.getFullName());
+		result.put("smali", cls.getSmali());
+		return result;
+	}
+
 	public Map<String, Object> shutdown() {
+		cancelWarmup();
 		if (jadx != null) {
 			try {
 				jadx.close();

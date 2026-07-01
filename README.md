@@ -51,6 +51,7 @@ add it to the runtimepath. With lazy.nvim:
       -- jar = "/custom/path/jadxd.jar",
       -- java = "java",
       -- java_args = { "-Xmx6g" },  -- for very large APKs
+      -- prefetch = true,           -- real 0-100% load bar (warms full decompilation)
     })
   end,
 }
@@ -105,21 +106,22 @@ Extra args after the project are passed through to `nvim`.
 A self-contained fuzzy picker (built on Neovim's `matchfuzzy` — **no Telescope/fzf-lua required**)
 is bound to these global keys when a project is open:
 
-| Key          | Finds                                                  |
-| ------------ | ------------------------------------------------------ |
-| `<leader>ff` | text (full-text search, then fuzzy-narrow the results) |
-| `<leader>fc` | classes                                                |
-| `<leader>fd` | methods (jumps to the declaration)                     |
+| Key         | Finds                                                       |
+| ----------- | ----------------------------------------------------------- |
+| `<Space>ff` | text — live full-text search; results stream in as you type |
+| `<Space>fc` | classes                                                     |
+| `<Space>fd` | methods (jumps to the declaration)                          |
 
 In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` to move, `<CR>` to open,
-`<Esc>` to cancel. Rebind or disable via `keys` in `setup()`:
+`<Esc>` to cancel. Bound to literal `<Space>` so it works regardless of your `mapleader`. Rebind
+or disable via `keys` in `setup()`:
 
 ```lua
 require("jadxnvim").setup({
   keys = {
-    find_text = "<leader>ff",     -- set to false to skip mapping
-    find_classes = "<leader>fc",
-    find_methods = "<leader>fd",
+    find_text = "<Space>ff",      -- set to false to skip mapping
+    find_classes = "<Space>fc",
+    find_methods = "<Space>fd",
   },
 })
 ```
@@ -128,12 +130,13 @@ In the **tree** window: `<CR>` / `o` expand/collapse a package or open a class.
 
 In a **code** buffer (`jadx://<class>`, read-only `java`):
 
-| Key          | Action            |
-| ------------ | ----------------- |
-| `gd`         | Go to definition  |
-| `gr`         | Find usages       |
-| `<leader>jr` | Rename            |
-| `<leader>jc` | Comment           |
+| Key          | Action                         |
+| ------------ | ------------------------------ |
+| `gd`         | Go to definition               |
+| `gr`         | Find usages                    |
+| `<Tab>`      | Toggle Java ⟷ Smali view        |
+| `<leader>jr` | Rename                         |
+| `<leader>jc` | Comment                        |
 
 Go-to-definition and usages integrate with the jumplist and quickfix, so `<C-o>`/`<C-i>` and
 `:cnext`/`:cprev` work as usual.
@@ -156,6 +159,7 @@ All v1 milestones are implemented and tested against real APKs (incl. a 136 MB /
 - [x] Search (class/method/field names, streamed full-text, cancellable)
 - [x] Rename + comments persisted to the `.jadx` project (jadx-gui interop)
 - [x] Built-in fuzzy finders for classes / methods / text (no external picker needed)
+- [x] Java ⟷ Smali toggle (`<Tab>`) and a load progress bar (animated, or real % with `prefetch`)
 
 Roadmap toward broader jadx-gui parity: resource/`AndroidManifest` viewer, certificate info, smali
 view, bookmarks, deobfuscation toggle, mappings import/export, and instruction-level comments.

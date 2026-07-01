@@ -4,6 +4,7 @@ local rpc = require("jadxnvim.rpc")
 local tree = require("jadxnvim.tree")
 local code = require("jadxnvim.code")
 local search = require("jadxnvim.search")
+local progress = require("jadxnvim.progress")
 
 local M = {}
 
@@ -19,11 +20,16 @@ M.config = {
   jar = nil,
   -- Extra JVM args (e.g. {"-Xmx4g"}) for large APKs.
   java_args = {},
+  -- Prefetch (decompile all classes in the background) to show a real 0-100% load bar.
+  -- Off by default: with it off the load bar is an animated activity indicator. Enabling it on
+  -- very large APKs warms the whole decompilation, so give the JVM more heap via java_args.
+  prefetch = false,
   -- Global keymaps for the fuzzy finders. Set a value to false to skip mapping it.
+  -- Bound to literal <Space> by default (works regardless of your mapleader).
   keys = {
-    find_text = "<leader>ff",
-    find_classes = "<leader>fc",
-    find_methods = "<leader>fd",
+    find_text = "<Space>ff",
+    find_classes = "<Space>fc",
+    find_methods = "<Space>fd",
   },
 }
 
@@ -52,6 +58,34 @@ local function map_finders()
   map(keys.find_methods, function() require("jadxnvim.find").methods() end, "jadx: fuzzy find methods")
 end
 
+-- Register the daemon load-lifecycle handlers exactly once.
+local function setup_load_handlers()
+  if M._load_handlers then
+    return
+  end
+  M._load_handlers = true
+  rpc.on("loadProgress", function(p)
+    if M._loading then
+      progress.update(p.percent, "Decompiling " .. (M._loading_name or ""))
+    end
+  end)
+  rpc.on("loadDone", function()
+    if M._loading then
+      M._loading = false
+      vim.schedule(progress.finish)
+    end
+  end)
+  rpc.on("loadError", function(p)
+    if M._loading then
+      M._loading = false
+      vim.schedule(function()
+        progress.finish()
+        vim.notify("[jadxnvim] load failed: " .. tostring(p and p.message), vim.log.levels.ERROR)
+      end)
+    end
+  end)
+end
+
 -- Ensure config defaults and autocmds are in place even if the user never called setup().
 local function ensure_setup()
   if not M.config.jar then
@@ -60,6 +94,7 @@ local function ensure_setup()
   code.setup()
   search.setup()
   map_finders()
+  setup_load_handlers()
 end
 
 --- Open a jadx project (APK/dex/jar or .jadx file): start the daemon and show the tree.
@@ -85,14 +120,26 @@ function M.open(project)
   code.reset()
   tree.reset()
 
+  local name = vim.fn.fnamemodify(project, ":t")
   local cmd = { M.config.java }
   vim.list_extend(cmd, M.config.java_args)
   vim.list_extend(cmd, { "-jar", M.config.jar, project })
+  if M.config.prefetch then
+    table.insert(cmd, "--prefetch")
+  end
 
-  vim.notify("[jadxnvim] loading " .. vim.fn.fnamemodify(project, ":t") .. " ...", vim.log.levels.INFO)
+  M._loading = true
+  M._loading_name = name
+  progress.start("Loading " .. name)
   rpc.start(cmd, function(info)
+    -- Parse finished and the tree is ready. With prefetch, keep the bar (it now shows the
+    -- background decompilation %); otherwise we're done loading.
+    if not M.config.prefetch then
+      M._loading = false
+      progress.finish()
+    end
     vim.notify(
-      string.format("[jadxnvim] loaded %s (%s classes)", vim.fn.fnamemodify(project, ":t"), tostring(info.classes)),
+      string.format("[jadxnvim] loaded %s (%s classes)", name, tostring(info.classes)),
       vim.log.levels.INFO
     )
     tree.open()
@@ -100,6 +147,8 @@ function M.open(project)
 end
 
 function M.close()
+  M._loading = false
+  progress.finish()
   rpc.stop()
   tree.reset()
   code.reset()

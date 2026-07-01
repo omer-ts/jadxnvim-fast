@@ -72,69 +72,80 @@ function M.methods()
   end)
 end
 
---- Full-text search; results stream in, then a fuzzy picker narrows them. Open location on select.
-function M.text(query)
+--- Live full-text search: type in the picker and results stream in as you go. Open on select.
+function M.text()
   if not ensure() then
     return
   end
-  vim.ui.input({ prompt = "Search text: ", default = query or "" }, function(q)
-    if not q or q == "" then
+  local cap = 1000
+  local active = { id = nil, disposers = {}, collected = {} }
+
+  local function cancel_current()
+    if active.id then
+      rpc.request("cancelSearch", { searchId = active.id })
+    end
+    for _, d in ipairs(active.disposers) do
+      pcall(d)
+    end
+    active.disposers = {}
+    active.id = nil
+    active.collected = {}
+  end
+
+  local function on_query(query, emit)
+    cancel_current()
+    if not query or #query < 2 then
+      emit({})
       return
     end
-    local collected, my_id, cap = {}, nil, 2000
-    local disposers = {}
-    local function cleanup()
-      for _, d in ipairs(disposers) do
-        pcall(d)
+    local my = { id = nil }
+    local function push()
+      local items = {}
+      for _, it in ipairs(active.collected) do
+        items[#items + 1] = {
+          text = it.fullName .. ":" .. it.line .. "  " .. (it.text or ""),
+          id = it.id,
+          line = it.line,
+          col = it.col,
+        }
       end
-      disposers = {}
+      emit(items)
     end
 
-    disposers[#disposers + 1] = rpc.on("searchHits", function(p)
-      if p.searchId ~= my_id then
+    active.disposers[#active.disposers + 1] = rpc.on("searchHits", function(p)
+      if p.searchId ~= my.id then
         return
       end
       for _, it in ipairs(p.items or {}) do
-        collected[#collected + 1] = it
+        active.collected[#active.collected + 1] = it
       end
-      if #collected >= cap then
-        rpc.request("cancelSearch", { searchId = my_id })
+      push()
+      if #active.collected >= cap then
+        rpc.request("cancelSearch", { searchId = my.id })
       end
     end)
-    disposers[#disposers + 1] = rpc.on("searchDone", function(p)
-      if p.searchId ~= my_id then
-        return
+    active.disposers[#active.disposers + 1] = rpc.on("searchDone", function(p)
+      if p.searchId == my.id then
+        push()
       end
-      cleanup()
-      vim.schedule(function()
-        if #collected == 0 then
-          vim.notify("[jadxnvim] no matches for '" .. q .. "'", vim.log.levels.INFO)
-          return
-        end
-        local items = {}
-        for _, it in ipairs(collected) do
-          items[#items + 1] = {
-            text = it.fullName .. ":" .. it.line .. "  " .. (it.text or ""),
-            id = it.id,
-            line = it.line,
-            col = it.col,
-          }
-        end
-        local title = (#collected >= cap) and (" Text: " .. q .. " (capped) ") or (" Text: " .. q .. " ")
-        fuzzy.pick({ title = title, items = items, on_select = function(s)
-          code.open(s.id, { line = s.line, col = s.col })
-        end })
-      end)
     end)
 
-    rpc.request("searchText", { query = q, limit = cap }, function(err, res)
-      if err then
-        cleanup()
-        return err_notify("search", err)
+    rpc.request("searchText", { query = query, limit = cap }, function(err, res)
+      if not err and res then
+        my.id = res.searchId
+        active.id = res.searchId
       end
-      my_id = res.searchId
     end)
-  end)
+  end
+
+  fuzzy.pick({
+    title = " Text search ",
+    on_query = on_query,
+    on_close = cancel_current,
+    on_select = function(s)
+      code.open(s.id, { line = s.line, col = s.col })
+    end,
+  })
 end
 
 return M
