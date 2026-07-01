@@ -72,77 +72,71 @@ function M.methods()
   end)
 end
 
---- Full-text search: enter a term, watch results stream in (with a loading/count status),
---- then fuzzy-filter the loaded results. Open the selected location.
-function M.text(term)
+--- Full-text search, fully inside the popup: enter a term, watch results stream in (with a
+--- loading/count status in the popup), then fuzzy-filter the loaded results. Open on select.
+function M.text()
   if not ensure() then
     return
   end
-  local function run(query)
-    if not query or query == "" then
-      return
-    end
-    local cap = 5000
-    local search = { id = nil, disposers = {} }
-    local function cleanup()
-      if search.id then
-        rpc.request("cancelSearch", { searchId = search.id })
-      end
-      for _, d in ipairs(search.disposers) do
-        pcall(d)
-      end
-      search.disposers = {}
-    end
+  fuzzy.pick({
+    title = " Text search ",
+    items = {},
+    query_phase = {
+      prompt = "search term",
+      on_submit = function(term, handle)
+        term = vim.trim(term or "")
+        if term == "" then
+          handle.close()
+          return
+        end
+        handle.set_title(" Text: " .. term .. " ")
+        handle.set_loading(true)
 
-    local handle = fuzzy.pick({
-      title = " Text: " .. query .. " ",
-      items = {},
-      loading = true,
-      on_close = cleanup,
-      on_select = function(s)
-        code.open(s.id, { line = s.line, col = s.col })
+        local cap = 5000
+        local my = { id = nil }
+        local d1 = rpc.on("searchHits", function(p)
+          if p.searchId ~= my.id then
+            return
+          end
+          local batch = {}
+          for _, it in ipairs(p.items or {}) do
+            batch[#batch + 1] = {
+              text = it.fullName .. ":" .. it.line .. "  " .. (it.text or ""),
+              id = it.id,
+              line = it.line,
+              col = it.col,
+            }
+          end
+          vim.schedule(function()
+            handle.append(batch)
+          end)
+        end)
+        local d2 = rpc.on("searchDone", function(p)
+          if p.searchId == my.id then
+            vim.schedule(handle.done)
+          end
+        end)
+        handle.on_cleanup(function()
+          if my.id then
+            rpc.request("cancelSearch", { searchId = my.id })
+          end
+          pcall(d1)
+          pcall(d2)
+        end)
+
+        rpc.request("searchText", { query = term, limit = cap }, function(err, res)
+          if err then
+            vim.schedule(handle.done)
+            return
+          end
+          my.id = res.searchId
+        end)
       end,
-    })
-
-    local my = { id = nil }
-    search.disposers[#search.disposers + 1] = rpc.on("searchHits", function(p)
-      if p.searchId ~= my.id then
-        return
-      end
-      local batch = {}
-      for _, it in ipairs(p.items or {}) do
-        batch[#batch + 1] = {
-          text = it.fullName .. ":" .. it.line .. "  " .. (it.text or ""),
-          id = it.id,
-          line = it.line,
-          col = it.col,
-        }
-      end
-      vim.schedule(function()
-        handle.append(batch)
-      end)
-    end)
-    search.disposers[#search.disposers + 1] = rpc.on("searchDone", function(p)
-      if p.searchId == my.id then
-        vim.schedule(handle.done)
-      end
-    end)
-
-    rpc.request("searchText", { query = query, limit = cap }, function(err, res)
-      if err then
-        vim.schedule(handle.done)
-        return
-      end
-      my.id = res.searchId
-      search.id = res.searchId
-    end)
-  end
-
-  if term and term ~= "" then
-    run(term)
-  else
-    vim.ui.input({ prompt = "Search text: " }, run)
-  end
+    },
+    on_select = function(s)
+      code.open(s.id, { line = s.line, col = s.col })
+    end,
+  })
 end
 
 return M

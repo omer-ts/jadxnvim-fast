@@ -53,18 +53,30 @@ local function java_keymaps(bufnr)
   common_keymaps(bufnr)
 end
 
+-- Use treesitter only if BOTH a parser and highlight queries exist; a partial attach (parser
+-- without queries) would suppress the regex syntax and leave the buffer barely highlighted.
+local function ts_ready(lang)
+  if not pcall(vim.treesitter.language.add, lang) then
+    return false
+  end
+  local ok, q = pcall(vim.treesitter.query.get, lang, "highlights")
+  return ok and q ~= nil
+end
+
 local function highlight(bufnr, ft)
   vim.bo[bufnr].filetype = ft
-  -- Prefer treesitter when its parser is present; otherwise force the regex syntax to load.
-  -- Setting 'syntax' explicitly makes highlighting work even when the user's session never ran
-  -- `:syntax on` (e.g. a bare nvim launched just to browse an APK).
-  local ok_ts = false
-  if ft == "java" then
-    ok_ts = pcall(vim.treesitter.start, bufnr, "java")
+  local used_ts = false
+  if ft == "java" and ts_ready("java") then
+    used_ts = pcall(vim.treesitter.start, bufnr, "java")
   end
-  if not ok_ts then
+  if not used_ts then
+    -- Force the regex syntax to load (works even if the session never ran `:syntax on`) and sync
+    -- from the top so the whole decompiled file is highlighted, not just the visible window.
     pcall(function()
       vim.bo[bufnr].syntax = ft
+    end)
+    vim.api.nvim_buf_call(bufnr, function()
+      pcall(vim.cmd, "syntax sync fromstart")
     end)
   end
 end

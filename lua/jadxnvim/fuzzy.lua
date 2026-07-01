@@ -1,14 +1,12 @@
--- A small self-contained fuzzy picker (no external plugin dependency).
+-- A self-contained fuzzy picker (no external plugin dependency). Everything lives inside the
+-- floating popup: the input prompt, the streaming results, and a status line — nothing leaks to
+-- Neovim's command line or statusline.
 --
 -- Modes:
---   * static  - pass `items`; typing filters them locally via Neovim's built-in `matchfuzzy`.
---   * collect - pass `items = {}` + `loading = true`, then stream results in via the handle's
---               `append(list)` and finish with `done()`. The status footer shows a live "loading,
---               N found" while streaming, then "shown / found" once filtering.
---   * dynamic - pass `on_query(query, emit)`; typing (debounced) re-queries the provider.
---
--- A floating results window (with a status footer) shows matches; a one-line prompt below drives
--- it. <CR> selects, <C-n>/<C-p> or <Up>/<Down> move, <Esc>/<C-c> cancels.
+--   * static      - pass `items`; typing filters them locally via `matchfuzzy`.
+--   * query+collect - pass `query_phase = { prompt, on_submit(term, handle) }`. The popup opens
+--       asking for a search term; <CR> runs on_submit, which streams results in via
+--       handle.append(list)/handle.done(); then typing filters the collected results.
 
 local uv = vim.uv or vim.loop
 
@@ -45,12 +43,17 @@ end
 function M.pick(opts)
   local items = opts.items or {}
   local on_select = opts.on_select or function() end
-  local on_query = opts.on_query
-  local on_close = opts.on_close
   local title = opts.title or " jadx "
   local max_display = opts.limit or 200
-  local debounce_ms = opts.debounce or 150
+  local query_phase = opts.query_phase
   local loading = opts.loading or false
+
+  local cleanups = {}
+  if opts.on_close then
+    cleanups[#cleanups + 1] = opts.on_close
+  end
+
+  local mode = query_phase and "query" or "filter"
 
   local total_w, total_h = vim.o.columns, vim.o.lines
   local width = math.max(20, math.min(110, math.floor(total_w * 0.8)))
@@ -66,29 +69,35 @@ function M.pick(opts)
   local results_win = vim.api.nvim_open_win(results_buf, false, {
     relative = "editor", width = width, height = height, row = row, col = col,
     style = "minimal", border = "rounded", title = title, title_pos = "center",
-    footer = " 0 ", footer_pos = "right",
+    footer = "", footer_pos = "right",
   })
   local prompt_win = vim.api.nvim_open_win(prompt_buf, true, {
     relative = "editor", width = width, height = 1, row = row + height + 1, col = col,
-    style = "minimal", border = "rounded", title = " filter ", title_pos = "left",
+    style = "minimal", border = "rounded", title = " search term ", title_pos = "left",
   })
   vim.wo[results_win].cursorline = true
   vim.wo[results_win].wrap = false
 
+  local handle
   local closed = false
   local current = {}
-  local query_seq = 0
-  local debounce_timer
-  local spin_timer
-  local spin_frame = 0
+  local spin_frame, spin_timer = 0, nil
+
+  local function prompt_text()
+    return (vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false))[1] or ""
+  end
+
+  local function set_prompt_title()
+    local t = (mode == "query") and (" " .. (query_phase.prompt or "search term") .. " ") or " filter "
+    pcall(vim.api.nvim_win_set_config, prompt_win, { title = t, title_pos = "left" })
+  end
 
   local function status_text()
-    if loading then
-      local sp = SPINNER[(spin_frame % #SPINNER) + 1]
-      return string.format(" %s searching… %d found · %d shown ", sp, #items, #current)
+    if mode == "query" then
+      return " ⏎ search "
     end
-    if on_query then
-      return string.format(" %d shown ", #current)
+    if loading then
+      return string.format(" %s %d found · %d shown ", SPINNER[(spin_frame % #SPINNER) + 1], #items, #current)
     end
     return string.format(" %d / %d ", #current, #items)
   end
@@ -97,6 +106,12 @@ function M.pick(opts)
     if vim.api.nvim_win_is_valid(results_win) then
       pcall(vim.api.nvim_win_set_config, results_win, { footer = status_text(), footer_pos = "right" })
     end
+  end
+
+  local function set_lines(lines)
+    vim.bo[results_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(results_buf, 0, -1, false, #lines > 0 and lines or { "" })
+    vim.bo[results_buf].modifiable = false
   end
 
   local function show(list)
@@ -110,9 +125,7 @@ function M.pick(opts)
     for i, it in ipairs(current) do
       lines[i] = it.text
     end
-    vim.bo[results_buf].modifiable = true
-    vim.api.nvim_buf_set_lines(results_buf, 0, -1, false, #lines > 0 and lines or { "" })
-    vim.bo[results_buf].modifiable = false
+    set_lines(lines)
     if vim.api.nvim_win_is_valid(results_win) then
       local target = math.max(1, math.min(#current > 0 and #current or 1, prev))
       pcall(vim.api.nvim_win_set_cursor, results_win, { target, 0 })
@@ -120,44 +133,14 @@ function M.pick(opts)
     update_status()
   end
 
-  local function prompt_text()
-    return (vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false))[1] or ""
-  end
-
   local function recompute()
-    local q = prompt_text()
-    if on_query then
-      query_seq = query_seq + 1
-      local seq = query_seq
-      on_query(q, function(list)
-        vim.schedule(function()
-          if not closed and seq == query_seq then
-            show(list)
-          end
-        end)
-      end)
-    else
-      show(M.filter(items, q, max_display))
+    if mode == "query" then
+      current = {}
+      set_lines({ "", "   Type a search term above, then press <Enter>.", "" })
+      update_status()
+      return
     end
-  end
-
-  local function on_change()
-    if on_query and debounce_ms > 0 then
-      if debounce_timer then
-        debounce_timer:stop()
-        debounce_timer:close()
-        debounce_timer = nil
-      end
-      debounce_timer = uv.new_timer()
-      debounce_timer:start(debounce_ms, 0, function()
-        debounce_timer:stop()
-        debounce_timer:close()
-        debounce_timer = nil
-        vim.schedule(recompute)
-      end)
-    else
-      recompute()
-    end
+    show(M.filter(items, prompt_text(), max_display))
   end
 
   local function stop_spinner()
@@ -170,7 +153,10 @@ function M.pick(opts)
     end
   end
 
-  if loading then
+  local function start_spinner()
+    if spin_timer then
+      return
+    end
     spin_timer = uv.new_timer()
     spin_timer:start(120, 120, vim.schedule_wrap(function()
       spin_frame = spin_frame + 1
@@ -183,8 +169,7 @@ function M.pick(opts)
       return
     end
     local cur = vim.api.nvim_win_get_cursor(results_win)[1]
-    local nl = math.max(1, math.min(#current, cur + delta))
-    vim.api.nvim_win_set_cursor(results_win, { nl, 0 })
+    vim.api.nvim_win_set_cursor(results_win, { math.max(1, math.min(#current, cur + delta)), 0 })
   end
 
   local function close()
@@ -193,22 +178,26 @@ function M.pick(opts)
     end
     closed = true
     stop_spinner()
-    if debounce_timer then
-      pcall(function()
-        debounce_timer:stop()
-        debounce_timer:close()
-      end)
-      debounce_timer = nil
-    end
     pcall(vim.api.nvim_win_close, prompt_win, true)
     pcall(vim.api.nvim_win_close, results_win, true)
     pcall(vim.cmd, "stopinsert")
-    if on_close then
-      pcall(on_close)
+    for _, fn in ipairs(cleanups) do
+      pcall(fn)
     end
   end
 
   local function accept()
+    if mode == "query" then
+      local term = prompt_text()
+      mode = "filter"
+      set_prompt_title()
+      vim.api.nvim_buf_set_lines(prompt_buf, 0, -1, false, { "" })
+      recompute()
+      if query_phase and query_phase.on_submit then
+        query_phase.on_submit(term, handle)
+      end
+      return
+    end
     local item
     if vim.api.nvim_win_is_valid(results_win) and #current > 0 then
       item = current[vim.api.nvim_win_get_cursor(results_win)[1]]
@@ -221,6 +210,12 @@ function M.pick(opts)
     end
   end
 
+  local function on_change()
+    if mode == "filter" then
+      recompute()
+    end
+  end
+
   local group = vim.api.nvim_create_augroup("jadxnvim_fuzzy", { clear = true })
   vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
     group = group, buffer = prompt_buf, callback = on_change,
@@ -228,20 +223,17 @@ function M.pick(opts)
   vim.api.nvim_create_autocmd("BufLeave", { group = group, buffer = prompt_buf, callback = close })
 
   local kopts = { buffer = prompt_buf, nowait = true, silent = true }
-  for _, mode in ipairs({ "i", "n" }) do
-    vim.keymap.set(mode, "<Down>", function() move(1) end, kopts)
-    vim.keymap.set(mode, "<Up>", function() move(-1) end, kopts)
-    vim.keymap.set(mode, "<C-n>", function() move(1) end, kopts)
-    vim.keymap.set(mode, "<C-p>", function() move(-1) end, kopts)
-    vim.keymap.set(mode, "<CR>", accept, kopts)
-    vim.keymap.set(mode, "<Esc>", close, kopts)
-    vim.keymap.set(mode, "<C-c>", close, kopts)
+  for _, m in ipairs({ "i", "n" }) do
+    vim.keymap.set(m, "<Down>", function() move(1) end, kopts)
+    vim.keymap.set(m, "<Up>", function() move(-1) end, kopts)
+    vim.keymap.set(m, "<C-n>", function() move(1) end, kopts)
+    vim.keymap.set(m, "<C-p>", function() move(-1) end, kopts)
+    vim.keymap.set(m, "<CR>", accept, kopts)
+    vim.keymap.set(m, "<Esc>", close, kopts)
+    vim.keymap.set(m, "<C-c>", close, kopts)
   end
 
-  recompute()
-  vim.cmd("startinsert")
-
-  return {
+  handle = {
     close = close,
     render = recompute,
     accept = accept,
@@ -249,22 +241,42 @@ function M.pick(opts)
     results_win = results_win,
     get_filtered = function() return current end,
     status = status_text,
-    --- Append streamed results (collect mode) and re-apply the current filter.
+    on_cleanup = function(fn) cleanups[#cleanups + 1] = fn end,
+    set_title = function(t)
+      title = t
+      pcall(vim.api.nvim_win_set_config, results_win, { title = t, title_pos = "center" })
+    end,
+    set_loading = function(v)
+      loading = v and true or false
+      if loading then
+        start_spinner()
+      else
+        stop_spinner()
+      end
+      update_status()
+    end,
     append = function(list)
       for _, it in ipairs(list or {}) do
         items[#items + 1] = it
       end
-      if not on_query then
+      if mode == "filter" then
         recompute()
       end
     end,
-    --- Mark streaming complete: stop the loading spinner and finalize the status.
     done = function()
       loading = false
       stop_spinner()
       update_status()
     end,
   }
+
+  set_prompt_title()
+  if loading then
+    start_spinner()
+  end
+  recompute()
+  vim.cmd("startinsert")
+  return handle
 end
 
 return M
