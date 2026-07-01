@@ -47,6 +47,7 @@ public final class Session {
 	private java.util.concurrent.atomic.AtomicBoolean exportCancel;
 	private File exportDir;
 	private File indexDir;
+	private File namesDir;
 	private File metaDir;
 	private volatile SearchIndex searchIndex;
 	private volatile boolean sourcesReady = false;
@@ -184,6 +185,7 @@ public final class Session {
 		this.freshCode.clear();
 		this.exportDir = new File(projFile.getAbsoluteFile().getParentFile(), stripExt(projFile.getName()) + ".jadxnvim");
 		this.indexDir = new File(exportDir, "index");
+		this.namesDir = new File(exportDir, "index-names");
 		this.metaDir = new File(exportDir, "index-meta");
 		this.searchIndex = null;
 		this.sourcesReady = false;
@@ -231,18 +233,19 @@ public final class Session {
 		java.util.concurrent.atomic.AtomicBoolean cancel = new java.util.concurrent.atomic.AtomicBoolean(false);
 		this.exportCancel = cancel;
 		File idxDir = this.indexDir;
+		File nmDir = this.namesDir;
 		File mDir = this.metaDir;
 		File input = this.inputFile;
 		Thread t = new Thread(() -> {
 			try {
 				long sig = input.length();
 				if (SearchIndex.isValid(mDir, sig)) {
-					searchIndex = SearchIndex.load(idxDir, mDir);
+					searchIndex = SearchIndex.load(idxDir, nmDir, mDir);
 					sourcesReady = true;
 					emitter.emit("loadDone", Map.of("total", 0, "cached", true));
 					return;
 				}
-				searchIndex = buildIndex(d, idxDir, mDir, sig, cancel);
+				searchIndex = buildIndex(d, idxDir, nmDir, mDir, sig, cancel);
 				if (searchIndex != null && !cancel.get()) {
 					sourcesReady = true;
 					emitter.emit("loadDone", Map.of("total", 1));
@@ -261,11 +264,12 @@ public final class Session {
 	 * Decompile every top-level class and stream it into the ripgrep shard index. Each class is
 	 * unloaded right after writing so peak memory stays bounded even on 400k-class APKs.
 	 */
-	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File mDir, long sig,
+	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File nmDir, File mDir, long sig,
 			java.util.concurrent.atomic.AtomicBoolean cancel) throws Exception {
 		deleteDir(idxDir);
+		deleteDir(nmDir);
 		deleteDir(mDir);
-		SearchIndex.Builder builder = new SearchIndex.Builder(idxDir);
+		SearchIndex.Builder builder = new SearchIndex.Builder(idxDir, nmDir);
 		List<JavaClass> all = d.getClasses();
 		int total = all.size();
 		if (total == 0) {
@@ -298,7 +302,15 @@ public final class Session {
 					return;
 				}
 				try {
-					builder.add(cls.getRawName(), cls.getFullName(), cls.getCode());
+					List<String> methodNames = new ArrayList<>();
+					try {
+						for (JavaMethod mth : cls.getMethods()) {
+							methodNames.add(mth.getName());
+						}
+					} catch (Throwable ignore) {
+						// no methods indexed for this class
+					}
+					builder.add(cls.getRawName(), cls.getFullName(), cls.getCode(), methodNames);
 				} catch (Throwable ignore) {
 					// keep going; a failed class just isn't indexed
 				} finally {
@@ -702,7 +714,9 @@ public final class Session {
 		}
 		// Text search uses the ripgrep shard index once it's ready; name search and the
 		// not-yet-indexed case use the in-memory scan.
-		SearchIndex idx = ("text".equals(kind) && sourcesReady) ? searchIndex : null;
+		// Pass the index for both text (shard scan) and name (class/method name files) searches once
+		// the export is ready; Search decides how to use it and falls back to the in-memory scan.
+		SearchIndex idx = sourcesReady ? searchIndex : null;
 		int searchId = search().start(d, kind, query, opts, idx, rgPath);
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("searchId", searchId);

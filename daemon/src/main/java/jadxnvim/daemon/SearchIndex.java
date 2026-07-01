@@ -22,10 +22,12 @@ final class SearchIndex {
 	private static final int SHARDS = 32;
 
 	private final File shardsDir;
+	private final File namesDir;
 	private final ShardMeta[] shards;
 
-	private SearchIndex(File shardsDir, ShardMeta[] shards) {
+	private SearchIndex(File shardsDir, File namesDir, ShardMeta[] shards) {
 		this.shardsDir = shardsDir;
+		this.namesDir = namesDir;
 		this.shards = shards;
 	}
 
@@ -33,8 +35,25 @@ final class SearchIndex {
 		return shardsDir;
 	}
 
+	/**
+	 * Directory of per-shard class/method name files ({@code cls_s*.txt}, {@code mth_s*.txt}) that
+	 * back the fast (ripgrep) class/method finders. Separate from {@link #shardsDir()} so full-text
+	 * search never scans it. Null/absent means only the in-memory name scan is available.
+	 */
+	File namesDir() {
+		return namesDir;
+	}
+
 	static String shardName(int i) {
 		return String.format("s%03d.txt", i);
+	}
+
+	static String classesName(int i) {
+		return String.format("cls_s%03d.txt", i);
+	}
+
+	static String methodsName(int i) {
+		return String.format("mth_s%03d.txt", i);
 	}
 
 	private static int shardOf(String id) {
@@ -130,23 +149,34 @@ final class SearchIndex {
 	/** Concurrent-safe builder that streams class code into shard files and records the index. */
 	static final class Builder {
 		private final File shardsDir;
+		private final File namesDir;
 		private final Writer[] writers = new Writer[SHARDS];
+		private final Writer[] clsWriters = new Writer[SHARDS];
+		private final Writer[] mthWriters = new Writer[SHARDS];
 		private final Object[] locks = new Object[SHARDS];
 		private final int[] lineCount = new int[SHARDS];
 		private final ShardMeta[] meta = new ShardMeta[SHARDS];
 
-		Builder(File shardsDir) throws IOException {
+		Builder(File shardsDir, File namesDir) throws IOException {
 			this.shardsDir = shardsDir;
+			this.namesDir = namesDir;
 			shardsDir.mkdirs();
+			namesDir.mkdirs();
 			for (int i = 0; i < SHARDS; i++) {
 				writers[i] = Files.newBufferedWriter(new File(shardsDir, shardName(i)).toPath(),
+						StandardCharsets.UTF_8);
+				clsWriters[i] = Files.newBufferedWriter(new File(namesDir, classesName(i)).toPath(),
+						StandardCharsets.UTF_8);
+				mthWriters[i] = Files.newBufferedWriter(new File(namesDir, methodsName(i)).toPath(),
 						StandardCharsets.UTF_8);
 				locks[i] = new Object();
 				meta[i] = new ShardMeta();
 			}
 		}
 
-		void add(String id, String fullName, String code) throws IOException {
+		// methodNames.get(i) is the name of the method at index i in JavaClass.getMethods(), so the
+		// index can be carried through the name files for lazy navigation (memberPos) on select.
+		void add(String id, String fullName, String code, List<String> methodNames) throws IOException {
 			if (code == null) {
 				code = "";
 			}
@@ -165,17 +195,38 @@ final class SearchIndex {
 				writers[shard].write(code);
 				lineCount[shard] += lines;
 				meta[shard].add(start, id, fullName);
+				// name files: class line "fullName\tid", method line "name\tfullName\tid\tindex".
+				// Names/ids are Java identifiers/dotted names, so they never contain tab/newline.
+				clsWriters[shard].write(fullName);
+				clsWriters[shard].write('\t');
+				clsWriters[shard].write(id);
+				clsWriters[shard].write('\n');
+				if (methodNames != null) {
+					Writer mw = mthWriters[shard];
+					for (int i = 0; i < methodNames.size(); i++) {
+						String nm = methodNames.get(i);
+						if (nm == null || nm.isEmpty()) {
+							continue;
+						}
+						mw.write(nm);
+						mw.write('\t');
+						mw.write(fullName);
+						mw.write('\t');
+						mw.write(id);
+						mw.write('\t');
+						mw.write(Integer.toString(i));
+						mw.write('\n');
+					}
+				}
 			}
 		}
 
 		/** Close shard files and write the persisted line index; returns the queryable index. */
 		SearchIndex finish(File metaDir, long signature) throws IOException {
-			for (Writer w : writers) {
-				try {
-					w.close();
-				} catch (Exception ignore) {
-					// best effort
-				}
+			for (int i = 0; i < SHARDS; i++) {
+				closeQuietly(writers[i]);
+				closeQuietly(clsWriters[i]);
+				closeQuietly(mthWriters[i]);
 			}
 			metaDir.mkdirs();
 			for (int i = 0; i < SHARDS; i++) {
@@ -190,7 +241,17 @@ final class SearchIndex {
 			}
 			Files.write(new File(metaDir, ".sig").toPath(),
 					Long.toString(signature).getBytes(StandardCharsets.UTF_8));
-			return new SearchIndex(shardsDir, meta);
+			return new SearchIndex(shardsDir, namesDir, meta);
+		}
+
+		private static void closeQuietly(Writer w) {
+			try {
+				if (w != null) {
+					w.close();
+				}
+			} catch (Exception ignore) {
+				// best effort
+			}
 		}
 	}
 
@@ -209,7 +270,7 @@ final class SearchIndex {
 		}
 	}
 
-	static SearchIndex load(File shardsDir, File metaDir) throws IOException {
+	static SearchIndex load(File shardsDir, File namesDir, File metaDir) throws IOException {
 		ShardMeta[] shards = new ShardMeta[SHARDS];
 		for (int i = 0; i < SHARDS; i++) {
 			ShardMeta m = new ShardMeta();
@@ -233,6 +294,6 @@ final class SearchIndex {
 			}
 			shards[i] = m;
 		}
-		return new SearchIndex(shardsDir, shards);
+		return new SearchIndex(shardsDir, namesDir, shards);
 	}
 }

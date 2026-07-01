@@ -66,7 +66,17 @@ final class Search {
 			boolean truncated = false;
 			try {
 				if ("name".equals(kind)) {
-					int[] r = runName(jadx, searchId, pattern, opts, cancel);
+					int[] r = null;
+					boolean namesRg = index != null && index.namesDir() != null
+							&& index.namesDir().isDirectory()
+							&& ("class".equals(opts.kind) || "method".equals(opts.kind));
+					if (namesRg) {
+						// Fast path: ripgrep over the class/method name files built during export.
+						r = runNameRg(searchId, query, opts, index, rgPath, cancel);
+					}
+					if (r == null) {
+						r = runName(jadx, searchId, pattern, opts, cancel);
+					}
 					count = r[0];
 					truncated = r[1] == 1;
 				} else if (index != null && index.shardsDir().isDirectory()) {
@@ -353,6 +363,116 @@ final class Search {
 			flush(searchId, hits);
 		}
 		return new int[] { count, 0 };
+	}
+
+	// Fast class/method name search: ripgrep the per-shard name files, anchoring the query to the
+	// name column only ("^[^\t]*<query>"). Each line already carries the class id (and, for methods,
+	// the method index), so results need no decompilation. Returns null if rg can't be launched.
+	private int[] runNameRg(int searchId, String query, Opts opts, SearchIndex index, String rgPath,
+			AtomicBoolean cancel) {
+		boolean methods = "method".equals(opts.kind);
+		List<String> cmd = new ArrayList<>();
+		cmd.add(rgPath != null && !rgPath.isEmpty() ? rgPath : "rg");
+		cmd.add("--no-filename");
+		cmd.add("--no-line-number");
+		cmd.add("--no-heading");
+		cmd.add("--no-ignore");
+		if (!opts.caseSensitive) {
+			cmd.add("-i");
+		}
+		cmd.add("-g");
+		cmd.add(methods ? "mth_s*.txt" : "cls_s*.txt");
+		cmd.add("-e");
+		cmd.add("^[^\\t]*" + (opts.regex ? query : rgEscape(query)));
+		cmd.add(index.namesDir().getAbsolutePath());
+
+		Process proc;
+		try {
+			proc = new ProcessBuilder(cmd).redirectErrorStream(false).start();
+		} catch (Exception e) {
+			System.err.println("[jadxd] ripgrep unavailable for name search: " + e);
+			return null;
+		}
+		try {
+			proc.getOutputStream().close();
+		} catch (Exception ignore) {
+			// no stdin needed
+		}
+
+		List<Map<String, Object>> batch = new ArrayList<>();
+		int count = 0;
+		boolean truncated = false;
+		try (BufferedReader r = new BufferedReader(
+				new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
+			String line;
+			while ((line = r.readLine()) != null) {
+				if (cancel.get()) {
+					break;
+				}
+				String[] f = line.split("\t", -1);
+				Map<String, Object> hit = new LinkedHashMap<>();
+				if (methods) {
+					// name \t classFullName \t id \t index
+					if (f.length < 4) {
+						continue;
+					}
+					int idx;
+					try {
+						idx = Integer.parseInt(f[3]);
+					} catch (NumberFormatException e) {
+						continue;
+					}
+					String label = f[0] + "  ·  " + f[1];
+					hit.put("id", f[2]);
+					hit.put("index", idx);
+					hit.put("kind", "method");
+					hit.put("fullName", label);
+					hit.put("line", 1);
+					hit.put("col", 0);
+					hit.put("text", label);
+				} else {
+					// fullName \t id
+					if (f.length < 2) {
+						continue;
+					}
+					hit.put("id", f[1]);
+					hit.put("kind", "class");
+					hit.put("fullName", f[0]);
+					hit.put("line", 1);
+					hit.put("col", 0);
+					hit.put("text", f[0]);
+				}
+				batch.add(hit);
+				count++;
+				if (batch.size() >= 500) {
+					flush(searchId, batch);
+				}
+				if (count >= opts.limit) {
+					flush(searchId, batch);
+					truncated = true;
+					break;
+				}
+			}
+		} catch (Exception e) {
+			System.err.println("[jadxd] name search read error: " + e);
+		} finally {
+			proc.destroy();
+		}
+		flush(searchId, batch);
+		return new int[] { count, truncated ? 1 : 0 };
+	}
+
+	// Escape a literal string for use inside a ripgrep (Rust) regex.
+	private static String rgEscape(String s) {
+		StringBuilder sb = new StringBuilder(s.length() + 8);
+		for (int i = 0; i < s.length(); i++) {
+			char c = s.charAt(i);
+			if ("\\.+*?()|[]{}^$".indexOf(c) >= 0) {
+				sb.append('\\');
+			}
+			sb.append(c);
+		}
+		return sb.toString();
 	}
 
 	// Stream class-name matches (including inner classes). No decompilation.
