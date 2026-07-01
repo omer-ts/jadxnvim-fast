@@ -182,6 +182,8 @@ All v1 milestones are implemented and tested against real APKs (incl. a 136 MB /
 - [x] Search (class/method/field names, and ripgrep full-text over an on-load export — fast on
       400k-class APKs, cached, with results re-located onto the live decompiled line)
 - [x] Saved searches ("search tabs"): reopen or close past text searches / xrefs (`<Space>fs`)
+- [x] Class / method finders stream matches server-side (query-driven), so they never load millions
+      of names into one response and can't OOM the daemon on huge APKs
 - [x] Rename + comments persisted to the `.jadx` project (jadx-gui interop)
 - [x] Built-in fuzzy finders for classes / methods / text (no external picker needed)
 - [x] Java ⟷ Smali toggle (`<Tab>`) and a load progress bar (animated, or real % with `prefetch`)

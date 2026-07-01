@@ -52,6 +52,7 @@ final class Search {
 		int limit = 2000;
 		boolean caseSensitive = false;
 		boolean regex = false;
+		String kind = "all"; // for name search: "class" | "method" | "all"
 	}
 
 	synchronized int start(JadxDecompiler jadx, String kind, String query, Opts opts, SearchIndex index,
@@ -289,6 +290,16 @@ final class Search {
 
 	// returns {count, truncated(0/1)}
 	private int[] runName(JadxDecompiler jadx, int searchId, Pattern pattern, Opts opts, AtomicBoolean cancel) {
+		// Class- and method-only searches (the fuzzy finders) stream lightweight matches without
+		// decompiling — enumerating names is cheap and never holds the whole (potentially millions
+		// of methods) list in memory, so it scales to 400k-class APKs. The declaration position is
+		// resolved lazily when the user opens a result.
+		if ("class".equals(opts.kind)) {
+			return runClassNames(jadx, searchId, pattern, opts, cancel);
+		}
+		if ("method".equals(opts.kind)) {
+			return runMethodNames(jadx, searchId, pattern, opts, cancel);
+		}
 		int count = 0;
 		for (JavaClass cls : jadx.getClassesWithInners()) {
 			if (cancel.get()) {
@@ -341,6 +352,75 @@ final class Search {
 			}
 			flush(searchId, hits);
 		}
+		return new int[] { count, 0 };
+	}
+
+	// Stream class-name matches (including inner classes). No decompilation.
+	private int[] runClassNames(JadxDecompiler jadx, int searchId, Pattern pattern, Opts opts,
+			AtomicBoolean cancel) {
+		int count = 0;
+		List<Map<String, Object>> batch = new ArrayList<>();
+		for (JavaClass cls : jadx.getClassesWithInners()) {
+			if (cancel.get()) {
+				break;
+			}
+			if (pattern.matcher(cls.getName()).find() || pattern.matcher(cls.getFullName()).find()) {
+				Map<String, Object> hit = new LinkedHashMap<>();
+				hit.put("id", cls.getRawName());
+				hit.put("fullName", cls.getFullName());
+				hit.put("kind", "class");
+				hit.put("line", 1);
+				hit.put("col", 0);
+				hit.put("text", cls.getFullName());
+				batch.add(hit);
+				count++;
+				if (batch.size() >= 500) {
+					flush(searchId, batch);
+				}
+				if (count >= opts.limit) {
+					flush(searchId, batch);
+					return new int[] { count, 1 };
+				}
+			}
+		}
+		flush(searchId, batch);
+		return new int[] { count, 0 };
+	}
+
+	// Stream method-name matches from top-level classes, carrying the method index for navigation.
+	private int[] runMethodNames(JadxDecompiler jadx, int searchId, Pattern pattern, Opts opts,
+			AtomicBoolean cancel) {
+		int count = 0;
+		List<Map<String, Object>> batch = new ArrayList<>();
+		for (JavaClass cls : jadx.getClasses()) {
+			if (cancel.get()) {
+				break;
+			}
+			List<JavaMethod> methods = cls.getMethods();
+			for (int i = 0; i < methods.size(); i++) {
+				JavaMethod mth = methods.get(i);
+				if (pattern.matcher(mth.getName()).find()) {
+					Map<String, Object> hit = new LinkedHashMap<>();
+					hit.put("id", cls.getRawName());
+					hit.put("index", i);
+					hit.put("kind", "method");
+					hit.put("fullName", mth.getName() + "  ·  " + cls.getFullName());
+					hit.put("line", 1);
+					hit.put("col", 0);
+					hit.put("text", mth.getName() + "  ·  " + cls.getFullName());
+					batch.add(hit);
+					count++;
+					if (batch.size() >= 500) {
+						flush(searchId, batch);
+					}
+					if (count >= opts.limit) {
+						flush(searchId, batch);
+						return new int[] { count, 1 };
+					}
+				}
+			}
+		}
+		flush(searchId, batch);
 		return new int[] { count, 0 };
 	}
 

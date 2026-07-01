@@ -25,56 +25,99 @@ end
 local class_previewer = preview.class
 local method_previewer = preview.method
 
---- Fuzzy-find a class by name; open it on select.
-function M.classes()
-  if not ensure() then
-    return
-  end
-  rpc.request("listClasses", {}, function(err, res)
-    if err then
-      return err_notify("listClasses", err)
-    end
+local function open_method(it)
+  rpc.request("memberPos", { id = it.id, index = it.index }, function(e, r)
     vim.schedule(function()
-      local items = {}
-      for _, c in ipairs(res.items or {}) do
-        items[#items + 1] = { text = c.label, id = c.id }
-      end
-      local title = res.truncated and " Classes (truncated) " or " Classes "
-      fuzzy.pick({ title = title, items = items, previewer = class_previewer(), on_select = function(it)
+      if e or not r then
         code.open(it.id)
-      end })
+      else
+        code.open(it.id, { line = r.line, col = r.col })
+      end
     end)
   end)
 end
 
---- Fuzzy-find a method by name; open its class and jump to the declaration on select.
-function M.methods()
+-- Query-driven name finder: enter a term, the daemon streams matching names (server-side, so it
+-- never loads millions of names into one response and can't OOM on huge APKs), then you fuzzy-
+-- filter the streamed results. Used for both classes and methods.
+local function name_finder(kind, title, prompt, on_select, previewer)
   if not ensure() then
     return
   end
-  rpc.request("listMethods", {}, function(err, res)
-    if err then
-      return err_notify("listMethods", err)
-    end
-    vim.schedule(function()
-      local items = {}
-      for _, m in ipairs(res.items or {}) do
-        items[#items + 1] = { text = m.label, id = m.id, index = m.index }
-      end
-      local title = res.truncated and " Methods (truncated) " or " Methods "
-      fuzzy.pick({ title = title, items = items, previewer = method_previewer(), on_select = function(it)
-        rpc.request("memberPos", { id = it.id, index = it.index }, function(e, r)
+  fuzzy.pick({
+    title = title,
+    items = {},
+    previewer = previewer,
+    query_phase = {
+      prompt = prompt,
+      on_submit = function(term, handle)
+        term = vim.trim(term or "")
+        if term == "" then
+          handle.close()
+          return
+        end
+        handle.set_loading(true)
+        local my = { id = nil }
+        local collected = {}
+        local d1 = rpc.on("searchHits", function(p)
+          if p.searchId ~= my.id then
+            return
+          end
+          local batch = {}
+          for _, it in ipairs(p.items or {}) do
+            local item = { text = it.fullName, id = it.id, index = it.index, kind = it.kind }
+            batch[#batch + 1] = item
+            collected[#collected + 1] = item
+          end
           vim.schedule(function()
-            if e or not r then
-              code.open(it.id)
-            else
-              code.open(it.id, { line = r.line, col = r.col })
-            end
+            handle.append(batch)
           end)
         end)
-      end })
-    end)
-  end)
+        local d2 = rpc.on("searchDone", function(p)
+          if p.searchId == my.id then
+            vim.schedule(function()
+              handle.done()
+              if #collected > 0 then
+                searches.record({
+                  title = string.format(" %s '%s' (%d) ", vim.trim(title), term, #collected),
+                  items = collected,
+                  previewer = previewer,
+                  on_select = on_select,
+                })
+              end
+            end)
+          end
+        end)
+        handle.on_cleanup(function()
+          if my.id then
+            rpc.request("cancelSearch", { searchId = my.id })
+          end
+          pcall(d1)
+          pcall(d2)
+        end)
+        rpc.request("searchName", { query = term, kind = kind, limit = 5000 }, function(err, res)
+          if err then
+            vim.schedule(handle.done)
+            return
+          end
+          my.id = res.searchId
+        end)
+      end,
+    },
+    on_select = on_select,
+  })
+end
+
+--- Find a class by name; open it on select.
+function M.classes()
+  name_finder("class", " Classes ", "class name", function(it)
+    code.open(it.id)
+  end, class_previewer())
+end
+
+--- Find a method by name; open its class and jump to the declaration on select.
+function M.methods()
+  name_finder("method", " Methods ", "method name", open_method, method_previewer())
 end
 
 --- Full-text search, fully inside the popup: enter a term, watch results stream in (with a

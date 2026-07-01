@@ -697,6 +697,9 @@ public final class Session {
 		if (params.has("regex") && !params.get("regex").isJsonNull()) {
 			opts.regex = params.get("regex").getAsBoolean();
 		}
+		if (params.has("kind") && !params.get("kind").isJsonNull()) {
+			opts.kind = params.get("kind").getAsString();
+		}
 		// Text search uses the ripgrep shard index once it's ready; name search and the
 		// not-yet-indexed case use the in-memory scan.
 		SearchIndex idx = ("text".equals(kind) && sourcesReady) ? searchIndex : null;
