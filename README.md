@@ -91,7 +91,7 @@ Extra args after the project are passed through to `nvim`.
 | `:Jadx <path>`         | Open an APK / dex / jar / `.jadx` project and show the tree     |
 | `:JadxTree`            | Focus the project tree                                          |
 | `:JadxDef`             | Go to definition of the symbol under the cursor                 |
-| `:JadxUsages`          | Find usages of the symbol under the cursor (→ quickfix)         |
+| `:JadxUsages`          | Find usages of the symbol under the cursor (xref, browsable + preview) |
 | `:JadxSearch [text]`   | Full-text search across decompiled code (streamed → quickfix)   |
 | `:JadxSearchName [q]`  | Search class/method/field names                                 |
 | `:JadxSearchCancel`    | Cancel the running search                                       |
@@ -136,7 +136,7 @@ In a **code** buffer (`jadx://<class>`, read-only `java`):
 | Key          | Action                         |
 | ------------ | ------------------------------ |
 | `gd`         | Go to definition               |
-| `gr`         | Find usages                    |
+| `gr`         | Find usages (xref) — browsable list with preview |
 | `<Tab>`      | Toggle Java ⟷ Smali view        |
 | `<leader>jr` | Rename                         |
 | `<leader>jc` | Comment                        |

@@ -2,6 +2,8 @@
 
 local rpc = require("jadxnvim.rpc")
 local code = require("jadxnvim.code")
+local fuzzy = require("jadxnvim.fuzzy")
+local preview = require("jadxnvim.preview")
 
 local M = {}
 
@@ -52,19 +54,25 @@ function M.find_usages()
         notify("no usages found for " .. name, vim.log.levels.WARN)
         return
       end
+      -- jadx-gui-style xref: a browsable list of usages with a live code preview.
       local items = {}
       for _, u in ipairs(usages) do
         items[#items + 1] = {
-          filename = "jadx://" .. u.id,
-          lnum = u.line,
-          col = (u.col or 0) + 1, -- quickfix col is 1-based
-          text = u.text or "",
+          text = u.fullName .. ":" .. u.line .. "  " .. (u.text or ""),
+          id = u.id,
+          line = u.line,
+          col = u.col,
         }
       end
-      local title = string.format("jadx usages: %s (%d%s)", name, #usages, res.truncated and "+" or "")
-      vim.fn.setqflist({}, " ", { title = title, items = items })
-      vim.cmd("botright copen")
-      notify(string.format("%d usage(s) of %s%s", #usages, name, res.truncated and " (truncated)" or ""))
+      local title = string.format(" Usages of %s (%d%s) ", name, #usages, res.truncated and "+" or "")
+      fuzzy.pick({
+        title = title,
+        items = items,
+        previewer = preview.class(),
+        on_select = function(it)
+          code.open(it.id, { line = it.line, col = it.col })
+        end,
+      })
     end)
   end)
 end

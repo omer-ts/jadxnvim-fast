@@ -3,6 +3,7 @@
 local rpc = require("jadxnvim.rpc")
 local code = require("jadxnvim.code")
 local fuzzy = require("jadxnvim.fuzzy")
+local preview = require("jadxnvim.preview")
 
 local M = {}
 
@@ -20,60 +21,8 @@ local function err_notify(what, err)
   end)
 end
 
--- Fetch a class's decompiled lines (cached per picker) for the preview pane.
-local function class_lines(cache, id, cb)
-  if cache[id] then
-    cb(cache[id])
-    return
-  end
-  rpc.request("getCode", { id = id }, function(err, res)
-    if err or not res then
-      cb(nil)
-      return
-    end
-    local lines = vim.split((res.code or ""):gsub("\r", ""), "\n", { plain = true })
-    cache[id] = lines
-    cb(lines)
-  end)
-end
-
--- A previewer that shows the class code centered on item.line (defaults to the top).
-local function class_previewer()
-  local cache = {}
-  return function(item, render)
-    if not item or not item.id then
-      return
-    end
-    class_lines(cache, item.id, function(lines)
-      if lines then
-        render({ lines = lines, filetype = "java", line = item.line or 1 })
-      end
-    end)
-  end
-end
-
--- A previewer for methods: resolves the declaration line via memberPos (cached on the item).
-local function method_previewer()
-  local cache = {}
-  return function(item, render)
-    if not item or not item.id then
-      return
-    end
-    class_lines(cache, item.id, function(lines)
-      if not lines then
-        return
-      end
-      if item._line then
-        render({ lines = lines, filetype = "java", line = item._line })
-        return
-      end
-      rpc.request("memberPos", { id = item.id, index = item.index }, function(e, r)
-        item._line = (not e and r) and r.line or 1
-        render({ lines = lines, filetype = "java", line = item._line })
-      end)
-    end)
-  end
-end
+local class_previewer = preview.class
+local method_previewer = preview.method
 
 --- Fuzzy-find a class by name; open it on select.
 function M.classes()
