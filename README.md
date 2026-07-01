@@ -165,6 +165,8 @@ All v1 milestones are implemented and tested against real APKs (incl. a 136 MB /
 - [x] Rename + comments persisted to the `.jadx` project (jadx-gui interop)
 - [x] Built-in fuzzy finders for classes / methods / text (no external picker needed)
 - [x] Java ⟷ Smali toggle (`<Tab>`) and a load progress bar (animated, or real % with `prefetch`)
+- [x] Syntax highlighting for Java and Smali (applies a readable palette on a bare Neovim; a
+      colorscheme you set is respected)
 
 Roadmap toward broader jadx-gui parity: resource/`AndroidManifest` viewer, certificate info, smali
 view, bookmarks, deobfuscation toggle, mappings import/export, and instruction-level comments.

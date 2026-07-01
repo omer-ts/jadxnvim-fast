@@ -123,6 +123,48 @@ local function fill_smali(bufnr, id)
   common_keymaps(bufnr)
 end
 
+-- On a bare Neovim (no colorscheme) the default theme leaves keywords/types/functions at the
+-- normal foreground, so code looks flat. Give the common syntax groups a readable VS Code-like
+-- palette (with 256-color fallbacks). Skipped entirely if the user has a colorscheme.
+local function apply_default_colors()
+  if vim.g.colors_name ~= nil then
+    return
+  end
+  -- Enable truecolor only when the terminal advertises it; otherwise the 256-color ctermfg
+  -- fallbacks are used (forcing termguicolors on a non-truecolor terminal garbles colors).
+  if not vim.o.termguicolors then
+    local ct = vim.env.COLORTERM
+    if ct == "truecolor" or ct == "24bit" then
+      vim.o.termguicolors = true
+    end
+  end
+  local set = function(group, gui, cterm)
+    pcall(vim.api.nvim_set_hl, 0, group, { fg = gui, ctermfg = cterm, default = false })
+  end
+  set("Comment", "#6a9955", 65)
+  set("Constant", "#4fc1ff", 75)
+  set("String", "#ce9178", 173)
+  set("Character", "#ce9178", 173)
+  set("Number", "#b5cea8", 151)
+  set("Float", "#b5cea8", 151)
+  set("Boolean", "#569cd6", 75)
+  set("Identifier", "#9cdcfe", 117)
+  set("Function", "#dcdcaa", 187)
+  set("Statement", "#c586c0", 176)
+  set("Conditional", "#c586c0", 176)
+  set("Repeat", "#c586c0", 176)
+  set("Label", "#c586c0", 176)
+  set("Keyword", "#569cd6", 75)
+  set("Exception", "#c586c0", 176)
+  set("Operator", "#d4d4d4", 252)
+  set("PreProc", "#c586c0", 176)
+  set("Type", "#4ec9b0", 79)
+  set("StorageClass", "#569cd6", 75)
+  set("Structure", "#4ec9b0", 79)
+  set("Typedef", "#4ec9b0", 79)
+  set("Special", "#d7ba7d", 180)
+end
+
 --- Register the BufReadCmds that back jadx:// (Java) and jadxsmali:// (Smali) buffers. Idempotent.
 function M.setup()
   -- A decompiler viewer needs highlighting on; enable the machinery if the session hasn't.
@@ -130,6 +172,7 @@ function M.setup()
     pcall(vim.cmd, "syntax enable")
   end
   pcall(vim.cmd, "filetype on")
+  apply_default_colors()
 
   local group = vim.api.nvim_create_augroup("jadxnvim_code", { clear = true })
   vim.api.nvim_create_autocmd("BufReadCmd", {
