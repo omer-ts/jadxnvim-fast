@@ -32,12 +32,24 @@ communication is local stdio, so there is no network protocol or auth to configu
 - [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) on `PATH` for fast full-text search
   (jadxnvim falls back to an in-memory scan if it's missing)
 - No system Gradle needed — the repo ships a Gradle wrapper
-- Enough RAM for very large APKs: parsing + exporting a 400k-class APK needs ~24 GB of JVM heap.
-  jadxnvim sizes the heap to 70% of available memory automatically (`-XX:MaxRAMPercentage`, so it
-  respects container/cgroup limits). If indexing still gets OOM-killed (daemon exits with code 137),
-  jadxnvim reopens the project **without** the search index so browsing and (slower) in-memory
-  search keep working — give the JVM more memory via `java_args = { "-Xmx24g" }`, lower the export
-  concurrency (`java_args = { "-Djadxnvim.indexThreads=4" }`), or set `export = false` to skip it.
+- Enough RAM for very large APKs. jadxnvim sizes the heap to 70% of available memory automatically
+  (`-XX:MaxRAMPercentage`, so it respects container/cgroup limits). If indexing still gets OOM-killed
+  (daemon exits with code 137), jadxnvim reopens the project **without** the search index so browsing
+  and (slower) in-memory search keep working — give the JVM more memory via `java_args = { "-Xmx24g" }`,
+  lower the export concurrency (`java_args = { "-Djadxnvim.indexThreads=4" }`), or set `export = false`.
+
+  Rough memory floor (measured, a large APK — 540 MB / 396k classes, idle after load):
+
+  | mode | live heap | load time |
+  | --- | --- | --- |
+  | default (`usage = true`) | ~6.9 GB | ~72 s |
+  | `usage = false` | ~4.6 GB | ~52 s |
+
+  jadx builds a global cross-reference (usage) graph at load — ~2.3 GB of it for a large APK — that powers
+  precise find-usages (`gr`) and single-use anonymous-class inlining. On a memory-constrained server
+  set `usage = false` to skip it: `gr` then falls back to a fast name-based text search, and anonymous
+  classes aren't inlined. The rest of the floor is jadx's parsed model + dex buffers, which must stay
+  in RAM for on-demand decompilation.
 
 ## Build the daemon
 

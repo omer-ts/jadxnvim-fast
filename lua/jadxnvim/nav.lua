@@ -52,6 +52,13 @@ function M.find_usages()
       local usages = res.usages or {}
       -- daemon may return name = null (JSON) which decodes to vim.NIL (a truthy userdata)
       local name = (type(res.name) == "string") and res.name or "symbol"
+      -- In low-memory mode (usage graph disabled) there is no semantic xref; fall back to a fast
+      -- name-based text search over the exported sources.
+      if res.usageFallback and #usages == 0 and name ~= "symbol" then
+        notify("find-usages: usage graph off — searching for '" .. name .. "' as text", vim.log.levels.INFO)
+        require("jadxnvim.search").text(name)
+        return
+      end
       if #usages == 0 then
         notify("no usages found for " .. name, vim.log.levels.WARN)
         return

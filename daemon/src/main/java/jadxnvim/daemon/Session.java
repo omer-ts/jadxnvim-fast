@@ -48,6 +48,7 @@ public final class Session {
 	};
 	private boolean export = true;
 	private boolean temp = false;
+	private boolean noUsage = false;
 	private java.util.concurrent.atomic.AtomicBoolean exportCancel;
 	private File exportDir;
 	private File indexDir;
@@ -87,6 +88,10 @@ public final class Session {
 
 	public void setTemp(boolean temp) {
 		this.temp = temp;
+	}
+
+	public void setNoUsage(boolean noUsage) {
+		this.noUsage = noUsage;
 	}
 
 	public Object dispatch(String method, JsonObject params) throws Exception {
@@ -173,6 +178,11 @@ public final class Session {
 		// export streams to disk at low, constant memory. Browsing re-decompiles per class (cheap,
 		// and the plugin caches the buffer), and search reads the exported files via ripgrep.
 		args.setCodeCache(NoOpCodeCache.INSTANCE);
+		// Optionally skip building the global usage/xref graph at load (a large, permanent heap cost
+		// on huge APKs). find-usages then falls back to a ripgrep scan of the exported sources.
+		if (noUsage) {
+			args.setUsageInfoCache(new UsageOff.Cache());
+		}
 
 		JadxDecompiler decompiler = new JadxDecompiler(args);
 		decompiler.load();
@@ -566,6 +576,9 @@ public final class Session {
 		Map<String, Object> result = new LinkedHashMap<>();
 		List<Map<String, Object>> usages = new ArrayList<>();
 		result.put("usages", usages);
+		// With the usage graph disabled there is no getUseIn() data; tell the client to fall back to
+		// a name-based text search over the exported sources.
+		result.put("usageFallback", noUsage);
 		if (node == null) {
 			result.put("name", null);
 			return result;

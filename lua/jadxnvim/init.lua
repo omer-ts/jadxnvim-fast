@@ -38,6 +38,11 @@ M.config = {
   clipboard = true,
   -- Remember the open classes + cursor positions per project and restore them on reopen.
   session = true,
+  -- Build jadx's cross-reference (usage) graph at load. It powers precise find-usages (gr) and
+  -- lets jadx inline single-use anonymous classes, but on a 400k-class APK it costs ~2 GB of heap
+  -- and ~20 s of load time. Set false to save that memory on constrained servers; find-usages then
+  -- falls back to a name-based text search and anonymous classes aren't inlined.
+  usage = true,
   -- Global keymaps for the fuzzy finders. Set a value to false to skip mapping it.
   -- Bound to literal <Space> by default (works regardless of your mapleader).
   keys = {
@@ -243,6 +248,9 @@ function M.open(project, opts)
   end
   if temp then
     table.insert(cmd, "--temp")
+  end
+  if M.config.usage == false then
+    table.insert(cmd, "--no-usage")
   end
   local rg = M.config.rg
   if not rg or rg == "" then

@@ -26,6 +26,7 @@ public final class Main {
 		String input = null;
 		boolean export = true;
 		boolean temp = false;
+		boolean noUsage = false;
 		String rgPath = null;
 		for (int i = 0; i < argv.length; i++) {
 			String a = argv[i];
@@ -33,6 +34,8 @@ public final class Main {
 				export = false;
 			} else if ("--temp".equals(a)) {
 				temp = true;
+			} else if ("--no-usage".equals(a)) {
+				noUsage = true;
 			} else if ("--rg".equals(a) && i + 1 < argv.length) {
 				rgPath = argv[++i];
 			} else if (a != null && a.startsWith("--rg=")) {
@@ -49,6 +52,7 @@ public final class Main {
 			session.setInitialInput(input);
 			session.setExport(export);
 			session.setTemp(temp);
+			session.setNoUsage(noUsage);
 			try {
 				session.loadProject(null);
 			} catch (Exception e) {
