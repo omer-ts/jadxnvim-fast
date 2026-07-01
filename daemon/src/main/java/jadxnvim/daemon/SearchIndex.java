@@ -1,0 +1,238 @@
+package jadxnvim.daemon;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.IOException;
+import java.io.Writer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.List;
+
+/**
+ * A ripgrep-friendly full-text index for decompiled sources.
+ *
+ * <p>Instead of one file per class (a 400k-class APK produces ~300k tiny files, which cripples
+ * ripgrep with per-file overhead), all class code is concatenated into a small number of "shard"
+ * files. A line index records, per shard, the first line of every class, so a ripgrep match at
+ * (shard, line) maps back to (class id, line-within-class). Search then scans ~32 files instead of
+ * hundreds of thousands.
+ */
+final class SearchIndex {
+
+	private static final int SHARDS = 32;
+
+	private final File shardsDir;
+	private final ShardMeta[] shards;
+
+	private SearchIndex(File shardsDir, ShardMeta[] shards) {
+		this.shardsDir = shardsDir;
+		this.shards = shards;
+	}
+
+	File shardsDir() {
+		return shardsDir;
+	}
+
+	static String shardName(int i) {
+		return String.format("s%03d.txt", i);
+	}
+
+	private static int shardOf(String id) {
+		return Math.floorMod(id.hashCode(), SHARDS);
+	}
+
+	/** Sorted per-shard index: parallel arrays of a class's first line, id and display name. */
+	private static final class ShardMeta {
+		int[] startLine = new int[0];
+		String[] id = new String[0];
+		String[] fullName = new String[0];
+		int size = 0;
+
+		void ensure(int cap) {
+			if (cap <= startLine.length) {
+				return;
+			}
+			int n = Math.max(cap, Math.max(16, startLine.length * 2));
+			startLine = java.util.Arrays.copyOf(startLine, n);
+			id = java.util.Arrays.copyOf(id, n);
+			fullName = java.util.Arrays.copyOf(fullName, n);
+		}
+
+		void add(int line, String cid, String fn) {
+			ensure(size + 1);
+			startLine[size] = line;
+			id[size] = cid;
+			fullName[size] = fn;
+			size++;
+		}
+
+		// Largest index whose startLine <= line, or -1.
+		int find(int line) {
+			int lo = 0;
+			int hi = size - 1;
+			int res = -1;
+			while (lo <= hi) {
+				int mid = (lo + hi) >>> 1;
+				if (startLine[mid] <= line) {
+					res = mid;
+					lo = mid + 1;
+				} else {
+					hi = mid - 1;
+				}
+			}
+			return res;
+		}
+	}
+
+	/** Result of mapping a (shard, line) match back to a class. */
+	static final class Hit {
+		final String id;
+		final String fullName;
+		final int line; // 1-based line within the class (matches getCode output)
+
+		Hit(String id, String fullName, int line) {
+			this.id = id;
+			this.fullName = fullName;
+			this.line = line;
+		}
+	}
+
+	Hit lookup(String shardFileName, int fileLine) {
+		int idx = shardIndexFromName(shardFileName);
+		if (idx < 0 || idx >= shards.length) {
+			return null;
+		}
+		ShardMeta m = shards[idx];
+		int p = m.find(fileLine);
+		if (p < 0) {
+			return null;
+		}
+		int local = fileLine - m.startLine[p] + 1;
+		return new Hit(m.id[p], m.fullName[p], local);
+	}
+
+	private static int shardIndexFromName(String name) {
+		// s%03d.txt
+		try {
+			int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+			String base = slash >= 0 ? name.substring(slash + 1) : name;
+			if (base.startsWith("s") && base.endsWith(".txt")) {
+				return Integer.parseInt(base.substring(1, base.length() - 4));
+			}
+		} catch (Exception ignore) {
+			// not a shard file
+		}
+		return -1;
+	}
+
+	// --- building ------------------------------------------------------------
+
+	/** Concurrent-safe builder that streams class code into shard files and records the index. */
+	static final class Builder {
+		private final File shardsDir;
+		private final Writer[] writers = new Writer[SHARDS];
+		private final Object[] locks = new Object[SHARDS];
+		private final int[] lineCount = new int[SHARDS];
+		private final ShardMeta[] meta = new ShardMeta[SHARDS];
+
+		Builder(File shardsDir) throws IOException {
+			this.shardsDir = shardsDir;
+			shardsDir.mkdirs();
+			for (int i = 0; i < SHARDS; i++) {
+				writers[i] = Files.newBufferedWriter(new File(shardsDir, shardName(i)).toPath(),
+						StandardCharsets.UTF_8);
+				locks[i] = new Object();
+				meta[i] = new ShardMeta();
+			}
+		}
+
+		void add(String id, String fullName, String code) throws IOException {
+			if (code == null) {
+				code = "";
+			}
+			if (!code.endsWith("\n")) {
+				code = code + "\n";
+			}
+			int lines = 0;
+			for (int i = 0; i < code.length(); i++) {
+				if (code.charAt(i) == '\n') {
+					lines++;
+				}
+			}
+			int shard = shardOf(id);
+			synchronized (locks[shard]) {
+				int start = lineCount[shard] + 1;
+				writers[shard].write(code);
+				lineCount[shard] += lines;
+				meta[shard].add(start, id, fullName);
+			}
+		}
+
+		/** Close shard files and write the persisted line index; returns the queryable index. */
+		SearchIndex finish(File metaDir, long signature) throws IOException {
+			for (Writer w : writers) {
+				try {
+					w.close();
+				} catch (Exception ignore) {
+					// best effort
+				}
+			}
+			metaDir.mkdirs();
+			for (int i = 0; i < SHARDS; i++) {
+				ShardMeta m = meta[i];
+				StringBuilder sb = new StringBuilder();
+				for (int j = 0; j < m.size; j++) {
+					sb.append(m.startLine[j]).append('\t').append(m.id[j]).append('\t')
+							.append(m.fullName[j]).append('\n');
+				}
+				Files.write(new File(metaDir, String.format("s%03d.idx", i)).toPath(),
+						sb.toString().getBytes(StandardCharsets.UTF_8));
+			}
+			Files.write(new File(metaDir, ".sig").toPath(),
+					Long.toString(signature).getBytes(StandardCharsets.UTF_8));
+			return new SearchIndex(shardsDir, meta);
+		}
+	}
+
+	// --- persistence ---------------------------------------------------------
+
+	static boolean isValid(File metaDir, long signature) {
+		File sig = new File(metaDir, ".sig");
+		if (!sig.isFile()) {
+			return false;
+		}
+		try {
+			String s = new String(Files.readAllBytes(sig.toPath()), StandardCharsets.UTF_8).trim();
+			return s.equals(Long.toString(signature));
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
+	static SearchIndex load(File shardsDir, File metaDir) throws IOException {
+		ShardMeta[] shards = new ShardMeta[SHARDS];
+		for (int i = 0; i < SHARDS; i++) {
+			ShardMeta m = new ShardMeta();
+			File f = new File(metaDir, String.format("s%03d.idx", i));
+			if (f.isFile()) {
+				List<String> lines = Files.readAllLines(f.toPath(), StandardCharsets.UTF_8);
+				for (String line : lines) {
+					if (line.isEmpty()) {
+						continue;
+					}
+					int t1 = line.indexOf('\t');
+					int t2 = line.indexOf('\t', t1 + 1);
+					if (t1 < 0 || t2 < 0) {
+						continue;
+					}
+					int start = Integer.parseInt(line.substring(0, t1));
+					String id = line.substring(t1 + 1, t2);
+					String fn = line.substring(t2 + 1);
+					m.add(start, id, fn);
+				}
+			}
+			shards[i] = m;
+		}
+		return new SearchIndex(shardsDir, shards);
+	}
+}

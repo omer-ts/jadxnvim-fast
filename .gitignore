@@ -10,6 +10,7 @@ build/
 *.dex
 *.aab
 *.jadx
+*.jadxnvim/
 samples/
 
 # Editor / OS

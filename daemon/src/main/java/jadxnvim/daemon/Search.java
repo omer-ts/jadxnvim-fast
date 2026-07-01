@@ -1,5 +1,8 @@
 package jadxnvim.daemon;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -10,6 +13,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import jadx.api.ICodeInfo;
 import jadx.api.JadxDecompiler;
@@ -46,7 +54,8 @@ final class Search {
 		boolean regex = false;
 	}
 
-	synchronized int start(JadxDecompiler jadx, String kind, String query, Opts opts) {
+	synchronized int start(JadxDecompiler jadx, String kind, String query, Opts opts, SearchIndex index,
+			String rgPath) {
 		int searchId = ++nextId;
 		AtomicBoolean cancel = new AtomicBoolean(false);
 		running.put(searchId, cancel);
@@ -57,6 +66,15 @@ final class Search {
 			try {
 				if ("name".equals(kind)) {
 					int[] r = runName(jadx, searchId, pattern, opts, cancel);
+					count = r[0];
+					truncated = r[1] == 1;
+				} else if (index != null && index.shardsDir().isDirectory()) {
+					// Fast path: ripgrep over the shard index. Fall back to the in-memory scan if
+					// rg is unavailable.
+					int[] r = runRg(searchId, query, opts, index, rgPath, cancel);
+					if (r == null) {
+						r = runText(jadx, searchId, pattern, opts, cancel);
+					}
 					count = r[0];
 					truncated = r[1] == 1;
 				} else {
@@ -90,6 +108,127 @@ final class Search {
 		int flags = opts.caseSensitive ? 0 : (Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
 		String pat = opts.regex ? query : Pattern.quote(query);
 		return Pattern.compile(pat, flags);
+	}
+
+	// Fast full-text search via ripgrep over the exported sources. Returns {count, truncated} or
+	// null if rg could not be started (so the caller falls back to the in-memory scan).
+	private int[] runRg(int searchId, String query, Opts opts, SearchIndex index, String rgPath,
+			AtomicBoolean cancel) {
+		List<String> cmd = new ArrayList<>();
+		cmd.add(rgPath != null && !rgPath.isEmpty() ? rgPath : "rg");
+		cmd.add("--json");
+		cmd.add("--line-number");
+		if (!opts.caseSensitive) {
+			cmd.add("-i");
+		}
+		if (!opts.regex) {
+			cmd.add("-F");
+		}
+		cmd.add("--");
+		cmd.add(query);
+		cmd.add(index.shardsDir().getAbsolutePath());
+
+		Process proc;
+		try {
+			proc = new ProcessBuilder(cmd).redirectErrorStream(false).start();
+		} catch (Exception e) {
+			System.err.println("[jadxd] ripgrep unavailable, using in-memory search: " + e);
+			return null;
+		}
+		try {
+			proc.getOutputStream().close();
+		} catch (Exception ignore) {
+			// no stdin needed
+		}
+
+		List<Map<String, Object>> batch = new ArrayList<>();
+		String batchId = null;
+		int count = 0;
+		boolean truncated = false;
+
+		try (BufferedReader r = new BufferedReader(
+				new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8))) {
+			String line;
+			outer: while ((line = r.readLine()) != null) {
+				if (cancel.get()) {
+					break;
+				}
+				JsonObject o;
+				try {
+					o = JsonParser.parseString(line).getAsJsonObject();
+				} catch (Exception e) {
+					continue;
+				}
+				JsonElement typeEl = o.get("type");
+				if (typeEl == null || !"match".equals(typeEl.getAsString())) {
+					continue;
+				}
+				JsonObject data = o.getAsJsonObject("data");
+				String path = textOf(data.getAsJsonObject("path"));
+				String lineText = textOf(data.getAsJsonObject("lines"));
+				if (lineText.endsWith("\n")) {
+					lineText = lineText.substring(0, lineText.length() - 1);
+				}
+				int fileLine = data.get("line_number").getAsInt();
+				// Map (shard file, line) back to (class id, line-within-class) via the index.
+				SearchIndex.Hit hit = index.lookup(path, fileLine);
+				if (hit == null) {
+					continue;
+				}
+
+				if (batchId != null && !batchId.equals(hit.id) && !batch.isEmpty()) {
+					flush(searchId, batch);
+				}
+				batchId = hit.id;
+
+				JsonArray subs = data.getAsJsonArray("submatches");
+				for (JsonElement se : subs) {
+					int startByte = se.getAsJsonObject().get("start").getAsInt();
+					Map<String, Object> m = new LinkedHashMap<>();
+					m.put("id", hit.id);
+					m.put("fullName", hit.fullName);
+					m.put("line", hit.line);
+					m.put("col", byteToChar(lineText, startByte));
+					m.put("text", lineText.strip());
+					batch.add(m);
+					count++;
+					if (count >= opts.limit) {
+						truncated = true;
+						break outer;
+					}
+				}
+			}
+			flush(searchId, batch);
+		} catch (Exception e) {
+			System.err.println("[jadxd] ripgrep read error: " + e);
+		} finally {
+			proc.destroy();
+		}
+		return new int[] { count, truncated ? 1 : 0 };
+	}
+
+	private static String textOf(JsonObject obj) {
+		if (obj == null) {
+			return "";
+		}
+		JsonElement t = obj.get("text");
+		return (t != null && !t.isJsonNull()) ? t.getAsString() : "";
+	}
+
+	// rg reports a UTF-8 byte offset within the line; map it to a character index (identity for ASCII).
+	private static int byteToChar(String lineText, int startByte) {
+		if (startByte <= 0) {
+			return 0;
+		}
+		int bytes = 0;
+		for (int i = 0; i < lineText.length(); i++) {
+			if (bytes >= startByte) {
+				return i;
+			}
+			char c = lineText.charAt(i);
+			bytes += (c < 0x80) ? 1 : (c < 0x800) ? 2 : 3;
+		}
+		return lineText.length();
 	}
 
 	// returns {count, truncated(0/1)}
@@ -137,6 +276,13 @@ final class Search {
 				}
 			}
 			flush(searchId, hits);
+			// Free the decompiled state so scanning a 400k-class APK in memory can't exhaust the
+			// heap (this path is only the fallback when the exported sources aren't ready).
+			try {
+				cls.unload();
+			} catch (Exception ignore) {
+				// best effort
+			}
 		}
 		return new int[] { count, 0 };
 	}

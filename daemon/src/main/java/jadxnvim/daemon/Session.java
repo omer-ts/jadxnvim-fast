@@ -14,6 +14,7 @@ import com.google.gson.JsonObject;
 import jadx.api.ICodeInfo;
 import jadx.api.JadxArgs;
 import jadx.api.JadxDecompiler;
+import jadx.api.impl.NoOpCodeCache;
 import jadx.api.JavaClass;
 import jadx.api.JavaMethod;
 import jadx.api.JavaNode;
@@ -41,9 +42,15 @@ public final class Session {
 
 	private Emitter emitter = (m, p) -> {
 	};
-	private boolean prefetch = false;
+	private boolean export = true;
 	private boolean temp = false;
-	private java.util.concurrent.atomic.AtomicBoolean warmupCancel;
+	private java.util.concurrent.atomic.AtomicBoolean exportCancel;
+	private File exportDir;
+	private File indexDir;
+	private File metaDir;
+	private volatile SearchIndex searchIndex;
+	private volatile boolean sourcesReady = false;
+	private String rgPath = "rg";
 	private JadxDecompiler jadx;
 	private String inputPath;
 	private Map<String, List<JavaClass>> packageIndex;
@@ -65,8 +72,12 @@ public final class Session {
 		this.inputPath = path;
 	}
 
-	public void setPrefetch(boolean prefetch) {
-		this.prefetch = prefetch;
+	public void setExport(boolean export) {
+		this.export = export;
+	}
+
+	public void setRgPath(String rgPath) {
+		this.rgPath = rgPath;
 	}
 
 	public void setTemp(boolean temp) {
@@ -126,7 +137,7 @@ public final class Session {
 		if (this.inputPath == null) {
 			throw new IllegalStateException("no input path provided");
 		}
-		cancelWarmup();
+		cancelExport();
 		File given = new File(this.inputPath);
 		if (!given.exists()) {
 			throw new IllegalArgumentException("input not found: " + given.getAbsolutePath());
@@ -152,6 +163,11 @@ public final class Session {
 		JadxArgs args = new JadxArgs();
 		args.getInputFiles().add(input);
 		args.setCodeData(cd);
+		// Don't retain decompiled code in memory. On huge APKs (e.g. 400k classes) the default
+		// in-memory cache exhausts the heap and GC-thrashes during the full export; without it the
+		// export streams to disk at low, constant memory. Browsing re-decompiles per class (cheap,
+		// and the plugin caches the buffer), and search reads the exported files via ripgrep.
+		args.setCodeCache(NoOpCodeCache.INSTANCE);
 
 		JadxDecompiler decompiler = new JadxDecompiler(args);
 		decompiler.load();
@@ -166,6 +182,11 @@ public final class Session {
 		this.methodList = null;
 		this.codeDataVersion = 0;
 		this.freshCode.clear();
+		this.exportDir = new File(projFile.getAbsoluteFile().getParentFile(), stripExt(projFile.getName()) + ".jadxnvim");
+		this.indexDir = new File(exportDir, "index");
+		this.metaDir = new File(exportDir, "index-meta");
+		this.searchIndex = null;
+		this.sourcesReady = false;
 		if (previous != null) {
 			try {
 				previous.close();
@@ -194,67 +215,133 @@ public final class Session {
 		info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
 		emitter.emit("ready", info);
 
-		if (prefetch) {
-			startWarmup(decompiler);
+		if (export && !temp) {
+			startExport(decompiler);
 		}
 		return info;
 	}
 
 	/**
-	 * Background pass that decompiles every top-level class so the client can show a real 0-100%
-	 * progress. Browsing stays available throughout; this only pre-fills the code cache. Runs at
-	 * low priority and is cancelled when a new project loads or the daemon shuts down.
+	 * Background pass that decompiles all classes and writes the Java sources to disk, so full-text
+	 * search can use ripgrep instead of re-scanning in memory. Browsing stays available throughout.
+	 * If the export already exists and matches the input, it is reused (instant). Reports 0-100%
+	 * progress via loadProgress/loadDone, and is cancelled on reload/shutdown.
 	 */
-	private void startWarmup(JadxDecompiler d) {
+	private void startExport(JadxDecompiler d) {
 		java.util.concurrent.atomic.AtomicBoolean cancel = new java.util.concurrent.atomic.AtomicBoolean(false);
-		this.warmupCancel = cancel;
+		this.exportCancel = cancel;
+		File idxDir = this.indexDir;
+		File mDir = this.metaDir;
+		File input = this.inputFile;
 		Thread t = new Thread(() -> {
 			try {
-				List<JavaClass> all = d.getClasses();
-				int total = all.size();
-				if (total == 0) {
-					emitter.emit("loadDone", Map.of("total", 0));
+				long sig = input.length();
+				if (SearchIndex.isValid(mDir, sig)) {
+					searchIndex = SearchIndex.load(idxDir, mDir);
+					sourcesReady = true;
+					emitter.emit("loadDone", Map.of("total", 0, "cached", true));
 					return;
 				}
-				int done = 0;
-				int lastPct = -1;
-				for (JavaClass cls : all) {
-					if (cancel.get()) {
-						return;
-					}
-					try {
-						cls.getCodeInfo();
-					} catch (Throwable ignore) {
-						// keep going; some classes fail to decompile
-					}
-					done++;
-					int pct = (int) ((long) done * 100 / total);
-					if (pct != lastPct) {
-						lastPct = pct;
-						Map<String, Object> m = new LinkedHashMap<>();
-						m.put("done", done);
-						m.put("total", total);
-						m.put("percent", pct);
-						emitter.emit("loadProgress", m);
-					}
-				}
-				if (!cancel.get()) {
-					emitter.emit("loadDone", Map.of("total", total));
+				searchIndex = buildIndex(d, idxDir, mDir, sig, cancel);
+				if (searchIndex != null && !cancel.get()) {
+					sourcesReady = true;
+					emitter.emit("loadDone", Map.of("total", 1));
 				}
 			} catch (Throwable err) {
-				System.err.println("[jadxd] warmup error: " + err);
+				System.err.println("[jadxd] export error: " + err);
+				emitter.emit("loadDone", Map.of("total", 0, "error", String.valueOf(err.getMessage())));
 			}
-		}, "jadx-warmup");
+		}, "jadx-export");
 		t.setDaemon(true);
 		t.setPriority(Thread.MIN_PRIORITY);
 		t.start();
 	}
 
-	private void cancelWarmup() {
-		if (warmupCancel != null) {
-			warmupCancel.set(true);
-			warmupCancel = null;
+	/**
+	 * Decompile every top-level class and stream it into the ripgrep shard index. Each class is
+	 * unloaded right after writing so peak memory stays bounded even on 400k-class APKs.
+	 */
+	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File mDir, long sig,
+			java.util.concurrent.atomic.AtomicBoolean cancel) throws Exception {
+		deleteDir(idxDir);
+		deleteDir(mDir);
+		SearchIndex.Builder builder = new SearchIndex.Builder(idxDir);
+		List<JavaClass> all = d.getClasses();
+		int total = all.size();
+		if (total == 0) {
+			return builder.finish(mDir, sig);
 		}
+		int threads = Math.max(2, Runtime.getRuntime().availableProcessors());
+		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads, r -> {
+			Thread th = new Thread(r, "jadx-index");
+			th.setDaemon(true);
+			th.setPriority(Thread.MIN_PRIORITY);
+			return th;
+		});
+		java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
+		java.util.concurrent.atomic.AtomicInteger lastPct = new java.util.concurrent.atomic.AtomicInteger(-1);
+		for (JavaClass cls : all) {
+			pool.submit(() -> {
+				if (cancel.get()) {
+					return;
+				}
+				try {
+					builder.add(cls.getRawName(), cls.getFullName(), cls.getCode());
+				} catch (Throwable ignore) {
+					// keep going; a failed class just isn't indexed
+				} finally {
+					try {
+						cls.unload();
+					} catch (Exception ignore) {
+						// best effort
+					}
+					int c = done.incrementAndGet();
+					int pct = (int) ((long) c * 100 / total);
+					if (pct != lastPct.getAndSet(pct)) {
+						Map<String, Object> m = new LinkedHashMap<>();
+						m.put("done", c);
+						m.put("total", total);
+						m.put("percent", pct);
+						emitter.emit("loadProgress", m);
+					}
+				}
+			});
+		}
+		pool.shutdown();
+		pool.awaitTermination(6, java.util.concurrent.TimeUnit.HOURS);
+		if (cancel.get()) {
+			return null;
+		}
+		return builder.finish(mDir, sig);
+	}
+
+	private static void deleteDir(File dir) {
+		if (dir == null || !dir.exists()) {
+			return;
+		}
+		File[] files = dir.listFiles();
+		if (files != null) {
+			for (File f : files) {
+				if (f.isDirectory()) {
+					deleteDir(f);
+				} else {
+					f.delete();
+				}
+			}
+		}
+		dir.delete();
+	}
+
+	private void cancelExport() {
+		if (exportCancel != null) {
+			exportCancel.set(true);
+			exportCancel = null;
+		}
+	}
+
+	private static String stripExt(String name) {
+		int dot = name.lastIndexOf('.');
+		return dot > 0 ? name.substring(0, dot) : name;
 	}
 
 	private static File defaultProjectFile(File input) {
@@ -366,7 +453,7 @@ public final class Session {
 	/** Resolve the declaration position of a method (by class id + index from {@link #listMethods}). */
 	public Map<String, Object> memberPos(String id, int index) {
 		JadxDecompiler d = ensureLoaded();
-		JavaClass cls = d.searchJavaClassByOrigFullName(id);
+		JavaClass cls = findClass(id);
 		if (cls == null) {
 			throw new IllegalArgumentException("class not found: " + id);
 		}
@@ -388,7 +475,7 @@ public final class Session {
 
 	public Map<String, Object> getCode(String id) {
 		JadxDecompiler d = ensureLoaded();
-		JavaClass cls = d.searchJavaClassByOrigFullName(id);
+		JavaClass cls = findClass(id);
 		if (cls == null) {
 			throw new IllegalArgumentException("class not found: " + id);
 		}
@@ -403,7 +490,7 @@ public final class Session {
 	/** Resolve the jadx node referenced at (line, col) inside class {@code id}, or null. */
 	private JavaNode nodeAt(String id, int line, int col) {
 		JadxDecompiler d = ensureLoaded();
-		JavaClass cls = d.searchJavaClassByOrigFullName(id);
+		JavaClass cls = findClass(id);
 		if (cls == null) {
 			throw new IllegalArgumentException("class not found: " + id);
 		}
@@ -598,15 +685,28 @@ public final class Session {
 		if (params.has("regex") && !params.get("regex").isJsonNull()) {
 			opts.regex = params.get("regex").getAsBoolean();
 		}
-		int searchId = search().start(d, kind, query, opts);
+		// Text search uses the ripgrep shard index once it's ready; name search and the
+		// not-yet-indexed case use the in-memory scan.
+		SearchIndex idx = ("text".equals(kind) && sourcesReady) ? searchIndex : null;
+		int searchId = search().start(d, kind, query, opts, idx, rgPath);
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("searchId", searchId);
 		return result;
 	}
 
-	public Map<String, Object> getSmali(String id) {
+	/** Resolve a class by id, accepting either the original (raw) or the jadx alias full name. */
+	private JavaClass findClass(String id) {
 		JadxDecompiler d = ensureLoaded();
 		JavaClass cls = d.searchJavaClassByOrigFullName(id);
+		if (cls == null) {
+			cls = d.searchJavaClassByAliasFullName(id);
+		}
+		return cls;
+	}
+
+	public Map<String, Object> getSmali(String id) {
+		JadxDecompiler d = ensureLoaded();
+		JavaClass cls = findClass(id);
 		if (cls == null) {
 			throw new IllegalArgumentException("class not found: " + id);
 		}
@@ -618,7 +718,7 @@ public final class Session {
 	}
 
 	public Map<String, Object> shutdown() {
-		cancelWarmup();
+		cancelExport();
 		if (jadx != null) {
 			try {
 				jadx.close();

@@ -51,6 +51,14 @@ vim.api.nvim_create_user_command("JadxSearchCancel", function()
   require("jadxnvim.search").cancel()
 end, { desc = "jadxnvim: cancel the running search" })
 
+vim.api.nvim_create_user_command("JadxSearches", function()
+  require("jadxnvim.searches").manager()
+end, { desc = "jadxnvim: reopen/close saved searches (search tabs)" })
+
+vim.api.nvim_create_user_command("JadxSearchesClear", function()
+  require("jadxnvim.searches").clear()
+end, { desc = "jadxnvim: close all saved searches" })
+
 vim.api.nvim_create_user_command("JadxFindClass", function()
   require("jadxnvim.find").classes()
 end, { desc = "jadxnvim: fuzzy-find a class" })

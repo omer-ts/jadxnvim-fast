@@ -206,12 +206,37 @@ function M.setup()
   })
 end
 
+-- The exported search index can decompile slightly differently from the on-demand view (jadx
+-- inlining is non-deterministic under parallel export), so a search hit's line number is only
+-- approximate. When we have the matched line's text, re-locate it in the actual buffer (nearest to
+-- the approximate line) so the cursor always lands on what you searched for.
+local function locate_line(bufnr, snippet, approx)
+  if not snippet or snippet == "" then
+    return approx
+  end
+  local target = vim.trim(snippet)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local best, best_dist
+  for i, l in ipairs(lines) do
+    if vim.trim(l) == target then
+      local d = math.abs(i - (approx or i))
+      if not best_dist or d < best_dist then
+        best, best_dist = i, d
+      end
+    end
+  end
+  return best or approx
+end
+
 local function open_named(name, opts)
   opts = opts or {}
   local win = M.target_win()
   vim.api.nvim_set_current_win(win)
   vim.cmd("edit " .. vim.fn.fnameescape(name))
   local bufnr = vim.api.nvim_get_current_buf()
+  if opts.find then
+    opts.line = locate_line(bufnr, opts.find, opts.line)
+  end
   if opts.line then
     local lnum = math.max(1, opts.line)
     local text = (vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false))[1] or ""

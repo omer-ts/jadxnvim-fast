@@ -22,7 +22,26 @@ function M.class_lines(cache, id, cb)
   end)
 end
 
---- Previewer showing item.id's code centered on item.line (defaults to the top).
+-- Re-locate a matched line's text in the decompiled lines (nearest to the approximate line), so the
+-- preview centers on what was actually searched even if the export decompiled slightly differently.
+local function locate(lines, snippet, approx)
+  if not snippet or snippet == "" then
+    return approx or 1
+  end
+  local target = vim.trim(snippet)
+  local best, best_dist
+  for i, l in ipairs(lines) do
+    if vim.trim(l) == target then
+      local d = math.abs(i - (approx or i))
+      if not best_dist or d < best_dist then
+        best, best_dist = i, d
+      end
+    end
+  end
+  return best or approx or 1
+end
+
+--- Previewer showing item.id's code centered on item.line (or the located snippet).
 function M.class()
   local cache = {}
   return function(item, render)
@@ -31,7 +50,8 @@ function M.class()
     end
     M.class_lines(cache, item.id, function(lines)
       if lines then
-        render({ lines = lines, filetype = "java", line = item.line or 1 })
+        local line = item.snippet and locate(lines, item.snippet, item.line) or (item.line or 1)
+        render({ lines = lines, filetype = "java", line = line })
       end
     end)
   end

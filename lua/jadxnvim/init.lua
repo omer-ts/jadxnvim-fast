@@ -21,10 +21,14 @@ M.config = {
   jar = nil,
   -- Extra JVM args (e.g. {"-Xmx4g"}) for large APKs.
   java_args = {},
-  -- Prefetch (decompile all classes in the background) to show a real 0-100% load bar.
-  -- Off by default: with it off the load bar is an animated activity indicator. Enabling it on
-  -- very large APKs warms the whole decompilation, so give the JVM more heap via java_args.
-  prefetch = false,
+  -- Export the decompiled sources to disk on load (in the background) so full-text search uses
+  -- ripgrep instead of re-scanning in memory — much faster on big APKs. Shows a real 0-100% load
+  -- bar and is cached between runs. Set false (or pass --no-export) to search purely in memory.
+  -- For very large APKs give the JVM more heap via java_args (e.g. {"-Xmx6g"}).
+  export = true,
+  -- Path to the ripgrep binary used for full-text search. Defaults to auto-detection
+  -- (`rg` on PATH). Only needed if rg isn't on PATH.
+  rg = nil,
   -- By default opening an APK creates/saves a .jadx project next to it. Set temp = true (or pass
   -- --temp on the CLI / to :Jadx) to work purely in memory and never write a .jadx file.
   temp = false,
@@ -37,6 +41,7 @@ M.config = {
     find_text = "<Space>ff",
     find_classes = "<Space>fc",
     find_methods = "<Space>fd",
+    saved_searches = "<Space>fs",
   },
 }
 
@@ -63,6 +68,7 @@ local function map_finders()
   map(keys.find_text, function() require("jadxnvim.find").text() end, "jadx: fuzzy find text")
   map(keys.find_classes, function() require("jadxnvim.find").classes() end, "jadx: fuzzy find classes")
   map(keys.find_methods, function() require("jadxnvim.find").methods() end, "jadx: fuzzy find methods")
+  map(keys.saved_searches, function() require("jadxnvim.searches").manager() end, "jadx: saved searches")
 end
 
 -- Register the daemon load-lifecycle handlers exactly once.
@@ -73,7 +79,7 @@ local function setup_load_handlers()
   M._load_handlers = true
   rpc.on("loadProgress", function(p)
     if M._loading then
-      progress.update(p.percent, "Decompiling " .. (M._loading_name or ""))
+      progress.update(p.percent, "Indexing " .. (M._loading_name or ""))
     end
   end)
   rpc.on("loadDone", function()
@@ -135,23 +141,47 @@ function M.open(project, opts)
   if temp == nil then
     temp = M.config.temp
   end
+  local will_export = M.config.export and not temp
   local cmd = { M.config.java }
+  -- Give the JVM a large heap by default (parsing + exporting a 400k-class APK needs it). Users
+  -- can override by putting their own -Xmx in java_args. -Xmx only caps the heap; the JVM commits
+  -- lazily, so this is safe for small APKs too.
+  local has_xmx = false
+  for _, a in ipairs(M.config.java_args) do
+    if type(a) == "string" and a:match("^%-Xmx") then
+      has_xmx = true
+    end
+  end
+  if not has_xmx then
+    local total = (vim.uv or vim.loop).get_total_memory()
+    if total and total > 0 then
+      local mb = math.max(2048, math.min(math.floor(total / 1048576 * 0.7), 49152))
+      table.insert(cmd, "-Xmx" .. mb .. "m")
+    end
+  end
   vim.list_extend(cmd, M.config.java_args)
   vim.list_extend(cmd, { "-jar", M.config.jar, project })
-  if M.config.prefetch then
-    table.insert(cmd, "--prefetch")
+  if not M.config.export then
+    table.insert(cmd, "--no-export")
   end
   if temp then
     table.insert(cmd, "--temp")
+  end
+  local rg = M.config.rg
+  if not rg or rg == "" then
+    rg = vim.fn.exepath("rg")
+  end
+  if rg and rg ~= "" then
+    vim.list_extend(cmd, { "--rg", rg })
   end
 
   M._loading = true
   M._loading_name = name
   progress.start("Loading " .. name)
   rpc.start(cmd, function(info)
-    -- Parse finished and the tree is ready. With prefetch, keep the bar (it now shows the
-    -- background decompilation %); otherwise we're done loading.
-    if not M.config.prefetch then
+    -- Parse finished and the tree is ready. While exporting, keep the bar (it now shows the
+    -- background decompile/export %); otherwise we're done loading.
+    if not will_export then
       M._loading = false
       progress.finish()
     end

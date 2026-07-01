@@ -13,10 +13,14 @@ renames and comments intact.
   Neovim plugin (Lua)  <--- newline JSON-RPC over stdio --->  jadxd daemon (JVM, embeds jadx-core)
 ```
 
-The daemon embeds `jadx-core` as a library and decompiles **lazily**: it loads the APK once and
-decompiles a class only when its code is requested. This is what makes huge APKs usable — e.g.
-Instagram (136 MB, ~158k classes) loads in ~50 s once, then any class decompiles in well under a
-second.
+The daemon embeds `jadx-core` as a library. It parses the APK once, then decompiles a class on
+demand for browsing. On first load it also **exports** the decompiled sources in the background into
+a compact, ripgrep-friendly index, so **full-text search runs at ripgrep speed** even on very large
+APKs. The export is cached, so subsequent opens skip it.
+
+Benchmarks (this is not a small tool): a large APK (540 MB, **396k classes**) parses in ~80 s, exports
+in ~3 min (one-time, cached), after which full-text search returns in **~0.1–0.3 s**. Instagram
+(136 MB, 158k classes) is proportionally faster.
 
 Both the daemon and Neovim are meant to run on the same (powerful) machine you SSH into;
 communication is local stdio, so there is no network protocol or auth to configure.
@@ -25,7 +29,11 @@ communication is local stdio, so there is no network protocol or auth to configu
 
 - Java 17+ (the daemon is built/run on the JVM)
 - Neovim 0.10+
+- [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) on `PATH` for fast full-text search
+  (jadxnvim falls back to an in-memory scan if it's missing)
 - No system Gradle needed — the repo ships a Gradle wrapper
+- Enough RAM for very large APKs: parsing + exporting a 400k-class APK needs ~24 GB of JVM heap.
+  jadxnvim sizes the heap to ~70% of your RAM automatically; override via `java_args`.
 
 ## Build the daemon
 
@@ -50,8 +58,9 @@ add it to the runtimepath. With lazy.nvim:
       -- jar defaults to <repo>/daemon/build/libs/jadxd.jar
       -- jar = "/custom/path/jadxd.jar",
       -- java = "java",
-      -- java_args = { "-Xmx6g" },  -- for very large APKs
-      -- prefetch = true,           -- real 0-100% load bar (warms full decompilation)
+      -- java_args = { "-Xmx24g" }, -- override the auto heap size
+      -- export = true,             -- decompile to a ripgrep index on load (fast search); cached
+      -- rg = "/path/to/rg",        -- ripgrep binary (default: auto-detect on PATH)
     })
   end,
 }
@@ -166,7 +175,9 @@ All v1 milestones are implemented and tested against real APKs (incl. a 136 MB /
 - [x] Daemon: lazy load, package tree, on-demand class decompilation
 - [x] Plugin: project tree, code view
 - [x] Cross-references (go-to-definition, find-usages)
-- [x] Search (class/method/field names, streamed full-text, cancellable)
+- [x] Search (class/method/field names, and ripgrep full-text over an on-load export — fast on
+      400k-class APKs, cached, with results re-located onto the live decompiled line)
+- [x] Saved searches ("search tabs"): reopen or close past text searches / xrefs (`<Space>fs`)
 - [x] Rename + comments persisted to the `.jadx` project (jadx-gui interop)
 - [x] Built-in fuzzy finders for classes / methods / text (no external picker needed)
 - [x] Java ⟷ Smali toggle (`<Tab>`) and a load progress bar (animated, or real % with `prefetch`)

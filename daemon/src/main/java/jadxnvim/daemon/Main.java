@@ -24,21 +24,30 @@ public final class Main {
 		Rpc rpc = new Rpc(session, protocolOut);
 
 		String input = null;
-		boolean prefetch = false;
+		boolean export = true;
 		boolean temp = false;
-		for (String a : argv) {
-			if ("--prefetch".equals(a)) {
-				prefetch = true;
+		String rgPath = null;
+		for (int i = 0; i < argv.length; i++) {
+			String a = argv[i];
+			if ("--no-export".equals(a)) {
+				export = false;
 			} else if ("--temp".equals(a)) {
 				temp = true;
+			} else if ("--rg".equals(a) && i + 1 < argv.length) {
+				rgPath = argv[++i];
+			} else if (a != null && a.startsWith("--rg=")) {
+				rgPath = a.substring("--rg=".length());
 			} else if (input == null && a != null && !a.isEmpty()) {
 				input = a;
 			}
 		}
 
+		if (rgPath != null && !rgPath.isEmpty()) {
+			session.setRgPath(rgPath);
+		}
 		if (input != null) {
 			session.setInitialInput(input);
-			session.setPrefetch(prefetch);
+			session.setExport(export);
 			session.setTemp(temp);
 			try {
 				session.loadProject(null);

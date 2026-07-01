@@ -4,6 +4,7 @@ local rpc = require("jadxnvim.rpc")
 local code = require("jadxnvim.code")
 local fuzzy = require("jadxnvim.fuzzy")
 local preview = require("jadxnvim.preview")
+local searches = require("jadxnvim.searches")
 
 local M = {}
 
@@ -97,6 +98,10 @@ function M.text()
         handle.set_title(" Text: " .. term .. " ")
         handle.set_loading(true)
 
+        local on_open = function(s)
+          code.open(s.id, { line = s.line, col = s.col, find = s.snippet })
+        end
+        local collected = {}
         local cap = 5000
         local my = { id = nil }
         local d1 = rpc.on("searchHits", function(p)
@@ -110,7 +115,9 @@ function M.text()
               id = it.id,
               line = it.line,
               col = it.col,
+              snippet = it.text,
             }
+            collected[#collected + 1] = batch[#batch]
           end
           vim.schedule(function()
             handle.append(batch)
@@ -118,7 +125,17 @@ function M.text()
         end)
         local d2 = rpc.on("searchDone", function(p)
           if p.searchId == my.id then
-            vim.schedule(handle.done)
+            vim.schedule(function()
+              handle.done()
+              if #collected > 0 then
+                searches.record({
+                  title = string.format(" Text: %s (%d) ", term, #collected),
+                  items = collected,
+                  previewer = preview.class(),
+                  on_select = on_open,
+                })
+              end
+            end)
           end
         end)
         handle.on_cleanup(function()
@@ -139,7 +156,7 @@ function M.text()
       end,
     },
     on_select = function(s)
-      code.open(s.id, { line = s.line, col = s.col })
+      code.open(s.id, { line = s.line, col = s.col, find = s.snippet })
     end,
   })
 end

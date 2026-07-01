@@ -10,7 +10,12 @@
         </encoder>
     </appender>
 
-    <root level="WARN">
+    <!--
+      jadx logs a decompile WARN for nearly every non-trivial method; on a 400k-class APK that is
+      millions of lines to stderr, which dominates export time. Suppress below ERROR. Set the env
+      var JADXD_LOG=warn (or edit here) when you actually need jadx warnings.
+    -->
+    <root level="${JADXD_LOG:-OFF}">
         <appender-ref ref="STDERR"/>
     </root>
 </configuration>

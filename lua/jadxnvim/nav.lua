@@ -4,6 +4,7 @@ local rpc = require("jadxnvim.rpc")
 local code = require("jadxnvim.code")
 local fuzzy = require("jadxnvim.fuzzy")
 local preview = require("jadxnvim.preview")
+local searches = require("jadxnvim.searches")
 
 local M = {}
 
@@ -49,7 +50,8 @@ function M.find_usages()
     end
     vim.schedule(function()
       local usages = res.usages or {}
-      local name = res.name or "symbol"
+      -- daemon may return name = null (JSON) which decodes to vim.NIL (a truthy userdata)
+      local name = (type(res.name) == "string") and res.name or "symbol"
       if #usages == 0 then
         notify("no usages found for " .. name, vim.log.levels.WARN)
         return
@@ -65,14 +67,11 @@ function M.find_usages()
         }
       end
       local title = string.format(" Usages of %s (%d%s) ", name, #usages, res.truncated and "+" or "")
-      fuzzy.pick({
-        title = title,
-        items = items,
-        previewer = preview.class(),
-        on_select = function(it)
-          code.open(it.id, { line = it.line, col = it.col })
-        end,
-      })
+      local on_open = function(it)
+        code.open(it.id, { line = it.line, col = it.col })
+      end
+      searches.record({ title = title, items = items, previewer = preview.class(), on_select = on_open })
+      fuzzy.pick({ title = title, items = items, previewer = preview.class(), on_select = on_open })
     end)
   end)
 end
