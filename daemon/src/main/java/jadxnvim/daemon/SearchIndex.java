@@ -3,10 +3,13 @@ package jadxnvim.daemon;
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * A ripgrep-friendly full-text index for decompiled sources.
@@ -24,15 +27,46 @@ final class SearchIndex {
 	private final File shardsDir;
 	private final File namesDir;
 	private final ShardMeta[] shards;
+	// class id -> {shardIndex, byteStart, byteLen} for reading a class's exported code off disk.
+	private final Map<String, long[]> codeLoc;
 
 	private SearchIndex(File shardsDir, File namesDir, ShardMeta[] shards) {
 		this.shardsDir = shardsDir;
 		this.namesDir = namesDir;
 		this.shards = shards;
+		this.codeLoc = new HashMap<>();
+		for (int i = 0; i < shards.length; i++) {
+			ShardMeta m = shards[i];
+			for (int j = 0; j < m.size; j++) {
+				codeLoc.put(m.id[j], new long[] { i, m.byteStart[j], m.byteLen[j] });
+			}
+		}
 	}
 
 	File shardsDir() {
 		return shardsDir;
+	}
+
+	/** True if this class's exported code can be read from disk via {@link #codeOf(String)}. */
+	boolean hasCode(String id) {
+		return codeLoc.containsKey(id);
+	}
+
+	/** Read a class's exported decompiled code straight from its shard (seek + read), or null. */
+	String codeOf(String id) {
+		long[] loc = codeLoc.get(id);
+		if (loc == null) {
+			return null;
+		}
+		File shard = new File(shardsDir, shardName((int) loc[0]));
+		try (RandomAccessFile raf = new RandomAccessFile(shard, "r")) {
+			raf.seek(loc[1]);
+			byte[] buf = new byte[(int) loc[2]];
+			raf.readFully(buf);
+			return new String(buf, StandardCharsets.UTF_8);
+		} catch (Exception e) {
+			return null;
+		}
 	}
 
 	/**
@@ -60,9 +94,11 @@ final class SearchIndex {
 		return Math.floorMod(id.hashCode(), SHARDS);
 	}
 
-	/** Sorted per-shard index: parallel arrays of a class's first line, id and display name. */
+	/** Sorted per-shard index: parallel arrays of a class's first line, byte range, id and name. */
 	private static final class ShardMeta {
 		int[] startLine = new int[0];
+		long[] byteStart = new long[0];
+		int[] byteLen = new int[0];
 		String[] id = new String[0];
 		String[] fullName = new String[0];
 		int size = 0;
@@ -73,13 +109,17 @@ final class SearchIndex {
 			}
 			int n = Math.max(cap, Math.max(16, startLine.length * 2));
 			startLine = java.util.Arrays.copyOf(startLine, n);
+			byteStart = java.util.Arrays.copyOf(byteStart, n);
+			byteLen = java.util.Arrays.copyOf(byteLen, n);
 			id = java.util.Arrays.copyOf(id, n);
 			fullName = java.util.Arrays.copyOf(fullName, n);
 		}
 
-		void add(int line, String cid, String fn) {
+		void add(int line, long bStart, int bLen, String cid, String fn) {
 			ensure(size + 1);
 			startLine[size] = line;
+			byteStart[size] = bStart;
+			byteLen[size] = bLen;
 			id[size] = cid;
 			fullName[size] = fn;
 			size++;
@@ -155,6 +195,7 @@ final class SearchIndex {
 		private final Writer[] mthWriters = new Writer[SHARDS];
 		private final Object[] locks = new Object[SHARDS];
 		private final int[] lineCount = new int[SHARDS];
+		private final long[] byteCount = new long[SHARDS];
 		private final ShardMeta[] meta = new ShardMeta[SHARDS];
 
 		Builder(File shardsDir, File namesDir) throws IOException {
@@ -189,12 +230,15 @@ final class SearchIndex {
 					lines++;
 				}
 			}
+			byte[] codeBytes = code.getBytes(StandardCharsets.UTF_8);
 			int shard = shardOf(id);
 			synchronized (locks[shard]) {
 				int start = lineCount[shard] + 1;
+				long byteStart = byteCount[shard];
 				writers[shard].write(code);
 				lineCount[shard] += lines;
-				meta[shard].add(start, id, fullName);
+				byteCount[shard] += codeBytes.length;
+				meta[shard].add(start, byteStart, codeBytes.length, id, fullName);
 				// name files: class line "fullName\tid", method line "name\tfullName\tid\tindex".
 				// Names/ids are Java identifiers/dotted names, so they never contain tab/newline.
 				clsWriters[shard].write(fullName);
@@ -233,7 +277,9 @@ final class SearchIndex {
 				ShardMeta m = meta[i];
 				StringBuilder sb = new StringBuilder();
 				for (int j = 0; j < m.size; j++) {
-					sb.append(m.startLine[j]).append('\t').append(m.id[j]).append('\t')
+					// startLine \t byteStart \t byteLen \t id \t fullName
+					sb.append(m.startLine[j]).append('\t').append(m.byteStart[j]).append('\t')
+							.append(m.byteLen[j]).append('\t').append(m.id[j]).append('\t')
 							.append(m.fullName[j]).append('\n');
 				}
 				Files.write(new File(metaDir, String.format("s%03d.idx", i)).toPath(),
@@ -281,15 +327,20 @@ final class SearchIndex {
 					if (line.isEmpty()) {
 						continue;
 					}
+					// startLine \t byteStart \t byteLen \t id \t fullName
 					int t1 = line.indexOf('\t');
 					int t2 = line.indexOf('\t', t1 + 1);
-					if (t1 < 0 || t2 < 0) {
+					int t3 = line.indexOf('\t', t2 + 1);
+					int t4 = line.indexOf('\t', t3 + 1);
+					if (t1 < 0 || t2 < 0 || t3 < 0 || t4 < 0) {
 						continue;
 					}
 					int start = Integer.parseInt(line.substring(0, t1));
-					String id = line.substring(t1 + 1, t2);
-					String fn = line.substring(t2 + 1);
-					m.add(start, id, fn);
+					long byteStart = Long.parseLong(line.substring(t1 + 1, t2));
+					int byteLen = Integer.parseInt(line.substring(t2 + 1, t3));
+					String id = line.substring(t3 + 1, t4);
+					String fn = line.substring(t4 + 1);
+					m.add(start, byteStart, byteLen, id, fn);
 				}
 			}
 			shards[i] = m;
