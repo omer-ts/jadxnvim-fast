@@ -181,6 +181,61 @@ public final class Session {
 			projFile = defaultProjectFile(input);
 		}
 
+		// Export paths (used by the cached fast-open check below and by startExport).
+		this.exportDir = new File(projFile.getAbsoluteFile().getParentFile(), stripExt(projFile.getName()) + ".jadxnvim");
+		this.indexDir = new File(exportDir, "index");
+		this.namesDir = new File(exportDir, "index-names");
+		this.metaDir = new File(exportDir, "index-meta");
+		long sig = input.length() * 31 + INDEX_FORMAT_VERSION;
+
+		// Lean fast-open: with a valid cached export, skip building the jadx model entirely (no
+		// multi-GB parse peak) and serve browse/search/tree from disk right away. The model is built
+		// on demand the first time a semantic op needs it.
+		if (lean && export && !temp && SearchIndex.isValid(metaDir, sig)
+				&& new File(namesDir, SearchIndex.classesName(0)).isFile()) {
+			JadxDecompiler prev = this.jadx;
+			this.jadx = null;
+			this.codeData = cd;
+			this.inputFile = input.getAbsoluteFile();
+			this.projectFile = projFile;
+			this.packageIndex = null;
+			this.classList = null;
+			this.methodList = null;
+			this.diskPkgIndex = null;
+			this.diskNames = null;
+			this.codeDataVersion = 0;
+			this.freshCode.clear();
+			this.searchIndex = SearchIndex.load(indexDir, namesDir, metaDir);
+			this.sourcesReady = true;
+			if (prev != null) {
+				try {
+					prev.close();
+				} catch (Exception ignore) {
+					// best effort
+				}
+			}
+			System.gc();
+			if (!projFile.exists()) {
+				try {
+					ProjectIO.save(projFile, this.inputFile, this.codeData);
+				} catch (IOException e) {
+					System.err.println("[jadxd] could not create project file: " + e);
+				}
+			}
+			Map<String, Object> info = new LinkedHashMap<>();
+			info.put("input", input.getAbsolutePath());
+			info.put("project", projFile.getAbsolutePath());
+			info.put("temp", false);
+			info.put("classes", searchIndex.classEntries().size());
+			info.put("renames", cd.getRenames() == null ? 0 : cd.getRenames().size());
+			info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
+			info.put("lean", true);
+			emitter.emit("ready", info);
+			emitter.emit("loadDone", Map.of("total", 0, "cached", true));
+			emitter.emit("modelUnloaded", Map.of("lean", true));
+			return info;
+		}
+
 		JadxDecompiler decompiler = buildModel(input, cd);
 
 		JadxDecompiler previous = this.jadx;
@@ -191,12 +246,10 @@ public final class Session {
 		this.packageIndex = null;
 		this.classList = null;
 		this.methodList = null;
+		this.diskPkgIndex = null;
+		this.diskNames = null;
 		this.codeDataVersion = 0;
 		this.freshCode.clear();
-		this.exportDir = new File(projFile.getAbsoluteFile().getParentFile(), stripExt(projFile.getName()) + ".jadxnvim");
-		this.indexDir = new File(exportDir, "index");
-		this.namesDir = new File(exportDir, "index-names");
-		this.metaDir = new File(exportDir, "index-meta");
 		this.searchIndex = null;
 		this.sourcesReady = false;
 		if (previous != null) {

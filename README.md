@@ -52,11 +52,12 @@ communication is local stdio, so there is no network protocol or auth to configu
 
   **Lean mode (`lean = true`)** goes further: once the on-load export is written, jadxnvim drops jadx's
   entire in-memory model and serves the class tree, code view and search straight from the on-disk
-  export — steady-state RAM falls to a few hundred MB. The model is rebuilt on demand (one-time, and
-  you'll see a notice) the first time you go-to-def, find-usages, view smali, or rename. Browsing and
-  search never trigger a reload. Note: the *export itself* still needs the full model in memory, so
-  peak memory during the one-time indexing is unchanged — lean mode wins on steady state, and pairs
-  well with a cached export. Implies `usage = false`; requires `export = true`.
+  export — steady-state RAM falls to a few hundred MB (~420 MB RSS on a large APK). The model is rebuilt on
+  demand (one-time, with a notice) the first time you go-to-def, find-usages, view smali, or rename;
+  browsing and search never trigger a reload. And once the export is **cached**, opening the project
+  skips building the model entirely — it serves from disk immediately, so there's no multi-GB parse
+  peak at all (a large APK opens in ~0 s at a few hundred MB). Only the *first* indexing of an APK needs
+  the full model in memory. Implies `usage = false`; requires `export = true`.
 
 ## Build the daemon
 
