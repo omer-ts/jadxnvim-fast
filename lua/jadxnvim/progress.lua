@@ -11,7 +11,7 @@ local M = {}
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 local BAR_W = 28
 
-local state = { win = nil, buf = nil, timer = nil, t0 = 0, frame = 0, title = "", percent = nil }
+local state = { win = nil, buf = nil, timer = nil, t0 = 0, frame = 0, title = "", percent = nil, width = 50 }
 
 local function bar_indeterminate(frame)
   local span = BAR_W * 2
@@ -39,12 +39,24 @@ local function render()
   local elapsed = (uv.now() - state.t0) / 1000
   local spin = SPINNER[(state.frame % #SPINNER) + 1]
   local line
+  -- Build the bar/percent/elapsed suffix first; it must always stay visible, so the title
+  -- (e.g. a long APK filename) is what gets truncated to fit the fixed-width window.
+  local suffix
   if state.percent then
-    line = string.format(" %s  %s  [%s] %3d%%  %4.1fs", spin, state.title,
-      bar_determinate(state.percent), state.percent, elapsed)
+    suffix = string.format("[%s] %3d%%  %4.1fs", bar_determinate(state.percent), state.percent, elapsed)
   else
-    line = string.format(" %s  %s  [%s]  %4.1fs", spin, state.title, bar_indeterminate(state.frame), elapsed)
+    suffix = string.format("[%s]  %4.1fs", bar_indeterminate(state.frame), elapsed)
   end
+  local fixed = 1 + vim.fn.strdisplaywidth(spin) + 2 + 2 + vim.fn.strdisplaywidth(suffix)
+  local title = state.title
+  local budget = state.width - fixed
+  if budget < 1 then
+    title = ""
+  elseif vim.fn.strdisplaywidth(title) > budget then
+    title = vim.fn.strcharpart(title, 0, budget - 1) .. "…"
+  end
+  line = string.format(" %s  %s  %s", spin, title, suffix)
+
   vim.bo[state.buf].modifiable = true
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { line })
   vim.bo[state.buf].modifiable = false
@@ -60,7 +72,8 @@ function M.start(title)
 
   state.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[state.buf].bufhidden = "wipe"
-  local width = math.min(70, vim.o.columns - 2)
+  local width = math.max(24, math.min(70, vim.o.columns - 2))
+  state.width = width
   state.win = vim.api.nvim_open_win(state.buf, false, {
     relative = "editor", anchor = "SE",
     row = vim.o.lines - 2, col = vim.o.columns - 1,
