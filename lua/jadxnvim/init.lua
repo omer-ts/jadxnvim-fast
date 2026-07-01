@@ -6,6 +6,7 @@ local code = require("jadxnvim.code")
 local search = require("jadxnvim.search")
 local progress = require("jadxnvim.progress")
 local clipboard = require("jadxnvim.clipboard")
+local session = require("jadxnvim.session")
 
 local M = {}
 
@@ -35,6 +36,8 @@ M.config = {
   -- Copy yanks to the system clipboard (via OSC 52, so it works over SSH). In code buffers
   -- `y`/`Y` target the system clipboard. Set false to leave the clipboard alone.
   clipboard = true,
+  -- Remember the open classes + cursor positions per project and restore them on reopen.
+  session = true,
   -- Global keymaps for the fuzzy finders. Set a value to false to skip mapping it.
   -- Bound to literal <Space> by default (works regardless of your mapleader).
   keys = {
@@ -99,6 +102,69 @@ local function setup_load_handlers()
   end)
 end
 
+-- Snapshot the open Java class buffers and their cursor lines (active one flagged).
+local function capture_session()
+  local buffers = {}
+  local active
+  local cur = vim.api.nvim_get_current_buf()
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b) then
+      local id = vim.b[b].jadx_class_id
+      if id and vim.b[b].jadx_view ~= "smali" then
+        local win = vim.fn.bufwinid(b)
+        local line
+        if win ~= -1 then
+          line = vim.api.nvim_win_get_cursor(win)[1]
+        else
+          local m = vim.api.nvim_buf_get_mark(b, '"')
+          line = (m[1] and m[1] > 0) and m[1] or 1
+        end
+        buffers[#buffers + 1] = { id = id, line = line }
+        if b == cur then
+          active = id
+        end
+      end
+    end
+  end
+  return { buffers = buffers, active = active }
+end
+
+local function save_session()
+  if not (M.config.session and M._project) then
+    return
+  end
+  local snap = capture_session()
+  -- Don't clobber a good session with an empty snapshot (e.g. after a daemon crash wiped buffers).
+  if #snap.buffers > 0 then
+    session.save(M._project, snap)
+  end
+end
+
+-- Reopen the classes from a previous session, focusing the last-active one at its cursor.
+local function restore_session(project)
+  if not M.config.session then
+    return
+  end
+  local st = session.load(project)
+  if not st or type(st.buffers) ~= "table" or #st.buffers == 0 then
+    return
+  end
+  for _, e in ipairs(st.buffers) do
+    if e.id and e.id ~= st.active then
+      pcall(code.open, e.id, { line = e.line })
+    end
+  end
+  if st.active then
+    pcall(code.open, st.active, { line = (function()
+      for _, e in ipairs(st.buffers) do
+        if e.id == st.active then
+          return e.line
+        end
+      end
+    end)() })
+  end
+end
+
 -- Ensure config defaults and autocmds are in place even if the user never called setup().
 local function ensure_setup()
   if not M.config.jar then
@@ -109,6 +175,13 @@ local function ensure_setup()
   clipboard.setup(M.config.clipboard)
   map_finders()
   setup_load_handlers()
+  if not M._session_autocmd then
+    M._session_autocmd = true
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      group = vim.api.nvim_create_augroup("jadxnvim_session", { clear = true }),
+      callback = save_session,
+    })
+  end
 end
 
 --- Open a jadx project (APK/dex/jar or .jadx file): start the daemon and show the tree.
@@ -132,6 +205,13 @@ function M.open(project, opts)
     )
     return
   end
+
+  -- Save the outgoing project's session before switching away (same-project reopen/recovery keeps
+  -- the on-disk session as the source of truth).
+  if M._project and M._project ~= project then
+    save_session()
+  end
+  M._project = project
 
   code.reset()
   tree.reset()
@@ -187,6 +267,7 @@ function M.open(project, opts)
       vim.log.levels.INFO
     )
     tree.open()
+    restore_session(project)
   end, function(code_)
     -- The daemon died unexpectedly (137 = OOM-killed, usually while indexing a huge APK). If we
     -- were building the search index, retry once without it so browsing + in-memory search still
@@ -209,11 +290,13 @@ function M.open(project, opts)
 end
 
 function M.close()
+  save_session()
   M._loading = false
   progress.finish()
   rpc.stop()
   tree.reset()
   code.reset()
+  M._project = nil
 end
 
 --- Toggle/focus the tree window (project must already be open).
