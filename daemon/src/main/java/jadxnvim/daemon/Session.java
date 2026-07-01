@@ -239,7 +239,10 @@ public final class Session {
 		Thread t = new Thread(() -> {
 			try {
 				long sig = input.length();
-				if (SearchIndex.isValid(mDir, sig)) {
+				// Reuse the cache only if it also has the name index (older caches predate it, so
+				// they rebuild once to gain fast class/method search).
+				boolean hasNames = new File(nmDir, SearchIndex.classesName(0)).isFile();
+				if (SearchIndex.isValid(mDir, sig) && hasNames) {
 					searchIndex = SearchIndex.load(idxDir, nmDir, mDir);
 					sourcesReady = true;
 					emitter.emit("loadDone", Map.of("total", 0, "cached", true));
