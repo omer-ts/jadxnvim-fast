@@ -93,9 +93,36 @@ Extra args after the project are passed through to `nvim`.
 | `:JadxSearch [text]`   | Full-text search across decompiled code (streamed → quickfix)   |
 | `:JadxSearchName [q]`  | Search class/method/field names                                 |
 | `:JadxSearchCancel`    | Cancel the running search                                       |
+| `:JadxFindClass`       | Fuzzy-find a class                                              |
+| `:JadxFindMethod`      | Fuzzy-find a method (jumps to its declaration)                  |
+| `:JadxFindText`        | Full-text search, then fuzzy-narrow the results                |
 | `:JadxRename`          | Rename the symbol under the cursor (persists to `.jadx`)        |
 | `:JadxComment`         | Comment the symbol under the cursor (persists to `.jadx`)       |
 | `:JadxClose`           | Close the project and stop the daemon                           |
+
+### Fuzzy finders
+
+A self-contained fuzzy picker (built on Neovim's `matchfuzzy` — **no Telescope/fzf-lua required**)
+is bound to these global keys when a project is open:
+
+| Key          | Finds                                                  |
+| ------------ | ------------------------------------------------------ |
+| `<leader>ff` | text (full-text search, then fuzzy-narrow the results) |
+| `<leader>fc` | classes                                                |
+| `<leader>fd` | methods (jumps to the declaration)                     |
+
+In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` to move, `<CR>` to open,
+`<Esc>` to cancel. Rebind or disable via `keys` in `setup()`:
+
+```lua
+require("jadxnvim").setup({
+  keys = {
+    find_text = "<leader>ff",     -- set to false to skip mapping
+    find_classes = "<leader>fc",
+    find_methods = "<leader>fd",
+  },
+})
+```
 
 In the **tree** window: `<CR>` / `o` expand/collapse a package or open a class.
 
@@ -128,6 +155,7 @@ All v1 milestones are implemented and tested against real APKs (incl. a 136 MB /
 - [x] Cross-references (go-to-definition, find-usages)
 - [x] Search (class/method/field names, streamed full-text, cancellable)
 - [x] Rename + comments persisted to the `.jadx` project (jadx-gui interop)
+- [x] Built-in fuzzy finders for classes / methods / text (no external picker needed)
 
 Roadmap toward broader jadx-gui parity: resource/`AndroidManifest` viewer, certificate info, smali
 view, bookmarks, deobfuscation toggle, mappings import/export, and instruction-level comments.

@@ -42,6 +42,18 @@ vim.api.nvim_create_user_command("JadxSearchCancel", function()
   require("jadxnvim.search").cancel()
 end, { desc = "jadxnvim: cancel the running search" })
 
+vim.api.nvim_create_user_command("JadxFindClass", function()
+  require("jadxnvim.find").classes()
+end, { desc = "jadxnvim: fuzzy-find a class" })
+
+vim.api.nvim_create_user_command("JadxFindMethod", function()
+  require("jadxnvim.find").methods()
+end, { desc = "jadxnvim: fuzzy-find a method" })
+
+vim.api.nvim_create_user_command("JadxFindText", function(opts)
+  require("jadxnvim.find").text(opts.args)
+end, { nargs = "?", desc = "jadxnvim: fuzzy-find across full-text search results" })
+
 vim.api.nvim_create_user_command("JadxRename", function()
   require("jadxnvim.edit").rename()
 end, { desc = "jadxnvim: rename symbol under cursor (persists to .jadx)" })

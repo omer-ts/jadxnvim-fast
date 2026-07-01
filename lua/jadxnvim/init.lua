@@ -19,6 +19,12 @@ M.config = {
   jar = nil,
   -- Extra JVM args (e.g. {"-Xmx4g"}) for large APKs.
   java_args = {},
+  -- Global keymaps for the fuzzy finders. Set a value to false to skip mapping it.
+  keys = {
+    find_text = "<leader>ff",
+    find_classes = "<leader>fc",
+    find_methods = "<leader>fd",
+  },
 }
 
 local function default_jar()
@@ -34,6 +40,18 @@ function M.setup(opts)
   search.setup()
 end
 
+local function map_finders()
+  local keys = M.config.keys or {}
+  local map = function(lhs, fn, desc)
+    if lhs then
+      vim.keymap.set("n", lhs, fn, { desc = desc, silent = true })
+    end
+  end
+  map(keys.find_text, function() require("jadxnvim.find").text() end, "jadx: fuzzy find text")
+  map(keys.find_classes, function() require("jadxnvim.find").classes() end, "jadx: fuzzy find classes")
+  map(keys.find_methods, function() require("jadxnvim.find").methods() end, "jadx: fuzzy find methods")
+end
+
 -- Ensure config defaults and autocmds are in place even if the user never called setup().
 local function ensure_setup()
   if not M.config.jar then
@@ -41,6 +59,7 @@ local function ensure_setup()
   end
   code.setup()
   search.setup()
+  map_finders()
 end
 
 --- Open a jadx project (APK/dex/jar or .jadx file): start the daemon and show the tree.

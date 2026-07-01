@@ -15,6 +15,7 @@ import jadx.api.ICodeInfo;
 import jadx.api.JadxArgs;
 import jadx.api.JadxDecompiler;
 import jadx.api.JavaClass;
+import jadx.api.JavaMethod;
 import jadx.api.JavaNode;
 import jadx.api.data.ICodeComment;
 import jadx.api.data.ICodeRename;
@@ -43,6 +44,8 @@ public final class Session {
 	private JadxDecompiler jadx;
 	private String inputPath;
 	private Map<String, List<JavaClass>> packageIndex;
+	private List<Map<String, Object>> classList;
+	private List<Map<String, Object>> methodList;
 	private Search searchEngine;
 	private JadxCodeData codeData = new JadxCodeData();
 	private File inputFile;
@@ -67,6 +70,12 @@ public final class Session {
 				return getPackages();
 			case "getClasses":
 				return getClasses(reqStr(params, "package"));
+			case "listClasses":
+				return listClasses(optInt(params, "limit", 100000));
+			case "listMethods":
+				return listMethods(optInt(params, "limit", 100000));
+			case "memberPos":
+				return memberPos(reqStr(params, "id"), reqInt(params, "index"));
 			case "getCode":
 				return getCode(reqStr(params, "id"));
 			case "gotoDef":
@@ -139,6 +148,8 @@ public final class Session {
 		this.inputFile = input.getAbsoluteFile();
 		this.projectFile = projFile;
 		this.packageIndex = null;
+		this.classList = null;
+		this.methodList = null;
 		this.codeDataVersion = 0;
 		this.freshCode.clear();
 		if (previous != null) {
@@ -218,6 +229,74 @@ public final class Session {
 			this.packageIndex = index;
 		}
 		return index;
+	}
+
+	/** Flat list of all top-level classes for the fuzzy finder: {id, label}. Cached. */
+	public Map<String, Object> listClasses(int limit) {
+		ensureLoaded();
+		if (classList == null) {
+			List<Map<String, Object>> items = new ArrayList<>();
+			for (JavaClass cls : jadx.getClasses()) {
+				Map<String, Object> m = new LinkedHashMap<>();
+				m.put("id", cls.getRawName());
+				m.put("label", cls.getFullName());
+				items.add(m);
+			}
+			items.sort(Comparator.comparing(m -> (String) m.get("label")));
+			classList = items;
+		}
+		boolean truncated = classList.size() > limit;
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("items", truncated ? classList.subList(0, limit) : classList);
+		result.put("truncated", truncated);
+		return result;
+	}
+
+	/** Flat list of all top-level classes' methods: {id, index, label}. Cached. */
+	public Map<String, Object> listMethods(int limit) {
+		ensureLoaded();
+		if (methodList == null) {
+			List<Map<String, Object>> items = new ArrayList<>();
+			for (JavaClass cls : jadx.getClasses()) {
+				List<JavaMethod> methods = cls.getMethods();
+				for (int i = 0; i < methods.size(); i++) {
+					Map<String, Object> m = new LinkedHashMap<>();
+					m.put("id", cls.getRawName());
+					m.put("index", i);
+					m.put("label", methods.get(i).getName() + "  ·  " + cls.getFullName());
+					items.add(m);
+				}
+			}
+			methodList = items;
+		}
+		boolean truncated = methodList.size() > limit;
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("items", truncated ? methodList.subList(0, limit) : methodList);
+		result.put("truncated", truncated);
+		return result;
+	}
+
+	/** Resolve the declaration position of a method (by class id + index from {@link #listMethods}). */
+	public Map<String, Object> memberPos(String id, int index) {
+		JadxDecompiler d = ensureLoaded();
+		JavaClass cls = d.searchJavaClassByOrigFullName(id);
+		if (cls == null) {
+			throw new IllegalArgumentException("class not found: " + id);
+		}
+		List<JavaMethod> methods = cls.getMethods();
+		if (index < 0 || index >= methods.size()) {
+			throw new IllegalArgumentException("method index out of range: " + index);
+		}
+		JavaMethod mth = methods.get(index);
+		ICodeInfo info = freshCodeInfo(cls, id);
+		int pos = mth.getDefPos();
+		int[] lc = pos >= 0 ? Positions.toLineCol(info.getCodeStr(), pos) : new int[] { 1, 0 };
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("id", id);
+		result.put("fullName", cls.getFullName());
+		result.put("line", lc[0]);
+		result.put("col", lc[1]);
+		return result;
 	}
 
 	public Map<String, Object> getCode(String id) {
@@ -405,6 +484,8 @@ public final class Session {
 		this.codeDataVersion++;
 		this.freshCode.clear();
 		this.packageIndex = null;
+		this.classList = null;
+		this.methodList = null;
 		saveProject(null);
 	}
 
@@ -483,5 +564,9 @@ public final class Session {
 			throw new IllegalArgumentException("missing required param: " + key);
 		}
 		return o.get(key).getAsInt();
+	}
+
+	private static int optInt(JsonObject o, String key, int fallback) {
+		return o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsInt() : fallback;
 	}
 }

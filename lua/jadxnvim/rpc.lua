@@ -10,7 +10,7 @@ local state = {
   job = nil,
   next_id = 0,
   pending = {}, -- id -> function(err, result)
-  handlers = {}, -- method -> function(params)
+  handlers = {}, -- method -> list of function(params)
   stdout_partial = "",
   ready = false,
   stopping = false,
@@ -30,9 +30,16 @@ local function dispatch(msg)
       cb(msg.error, msg.result)
     end
   elseif msg.method then
-    local h = state.handlers[msg.method]
-    if h then
-      h(msg.params)
+    local list = state.handlers[msg.method]
+    if list then
+      -- Iterate a snapshot so a handler may remove itself during dispatch.
+      local snapshot = {}
+      for i = 1, #list do
+        snapshot[i] = list[i]
+      end
+      for _, h in ipairs(snapshot) do
+        h(msg.params)
+      end
     end
   end
 end
@@ -89,8 +96,22 @@ local function on_exit(_, code, _)
 end
 
 --- Register a handler for an unsolicited notification method.
+--- Returns a disposer that removes this handler.
 function M.on(method, fn)
-  state.handlers[method] = fn
+  local list = state.handlers[method]
+  if not list then
+    list = {}
+    state.handlers[method] = list
+  end
+  table.insert(list, fn)
+  return function()
+    for i, f in ipairs(list) do
+      if f == fn then
+        table.remove(list, i)
+        return
+      end
+    end
+  end
 end
 
 function M.is_running()
