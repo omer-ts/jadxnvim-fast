@@ -113,9 +113,10 @@ is bound to these global keys when a project is open:
 | `<Space>fc` | classes                                                       |
 | `<Space>fd` | methods (jumps to the declaration)                            |
 
-In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` to move, `<CR>` to open,
-`<Esc>` to cancel. A status footer shows `shown / total` (and `searching… N found` while a text
-search is still streaming). Bound to literal `<Space>` so it works regardless of your `mapleader`.
+In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` (`<C-d>`/`<C-u>` to page) to move,
+`<CR>` to open, `<Esc>` to cancel. A **syntax-highlighted preview** of the highlighted result is
+shown beside the list (bat-style — line-numbered and centered on the match). A status footer shows
+`shown / total` (and `searching… N found` while a text search is still streaming). Bound to literal `<Space>` so it works regardless of your `mapleader`.
 Rebind or disable via `keys` in `setup()`:
 
 ```lua

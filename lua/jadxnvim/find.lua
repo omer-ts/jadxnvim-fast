@@ -20,6 +20,61 @@ local function err_notify(what, err)
   end)
 end
 
+-- Fetch a class's decompiled lines (cached per picker) for the preview pane.
+local function class_lines(cache, id, cb)
+  if cache[id] then
+    cb(cache[id])
+    return
+  end
+  rpc.request("getCode", { id = id }, function(err, res)
+    if err or not res then
+      cb(nil)
+      return
+    end
+    local lines = vim.split((res.code or ""):gsub("\r", ""), "\n", { plain = true })
+    cache[id] = lines
+    cb(lines)
+  end)
+end
+
+-- A previewer that shows the class code centered on item.line (defaults to the top).
+local function class_previewer()
+  local cache = {}
+  return function(item, render)
+    if not item or not item.id then
+      return
+    end
+    class_lines(cache, item.id, function(lines)
+      if lines then
+        render({ lines = lines, filetype = "java", line = item.line or 1 })
+      end
+    end)
+  end
+end
+
+-- A previewer for methods: resolves the declaration line via memberPos (cached on the item).
+local function method_previewer()
+  local cache = {}
+  return function(item, render)
+    if not item or not item.id then
+      return
+    end
+    class_lines(cache, item.id, function(lines)
+      if not lines then
+        return
+      end
+      if item._line then
+        render({ lines = lines, filetype = "java", line = item._line })
+        return
+      end
+      rpc.request("memberPos", { id = item.id, index = item.index }, function(e, r)
+        item._line = (not e and r) and r.line or 1
+        render({ lines = lines, filetype = "java", line = item._line })
+      end)
+    end)
+  end
+end
+
 --- Fuzzy-find a class by name; open it on select.
 function M.classes()
   if not ensure() then
@@ -35,7 +90,7 @@ function M.classes()
         items[#items + 1] = { text = c.label, id = c.id }
       end
       local title = res.truncated and " Classes (truncated) " or " Classes "
-      fuzzy.pick({ title = title, items = items, on_select = function(it)
+      fuzzy.pick({ title = title, items = items, previewer = class_previewer(), on_select = function(it)
         code.open(it.id)
       end })
     end)
@@ -57,7 +112,7 @@ function M.methods()
         items[#items + 1] = { text = m.label, id = m.id, index = m.index }
       end
       local title = res.truncated and " Methods (truncated) " or " Methods "
-      fuzzy.pick({ title = title, items = items, on_select = function(it)
+      fuzzy.pick({ title = title, items = items, previewer = method_previewer(), on_select = function(it)
         rpc.request("memberPos", { id = it.id, index = it.index }, function(e, r)
           vim.schedule(function()
             if e or not r then
@@ -81,6 +136,7 @@ function M.text()
   fuzzy.pick({
     title = " Text search ",
     items = {},
+    previewer = class_previewer(),
     query_phase = {
       prompt = "search term",
       on_submit = function(term, handle)

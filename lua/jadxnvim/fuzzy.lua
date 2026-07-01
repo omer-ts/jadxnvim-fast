@@ -1,12 +1,14 @@
 -- A self-contained fuzzy picker (no external plugin dependency). Everything lives inside the
--- floating popup: the input prompt, the streaming results, and a status line — nothing leaks to
--- Neovim's command line or statusline.
+-- floating popup: the input prompt, the streaming results, a status line, and an optional
+-- bat-style preview of the highlighted result (syntax-highlighted, line-numbered, centered on the
+-- matched line).
 --
 -- Modes:
 --   * static      - pass `items`; typing filters them locally via `matchfuzzy`.
 --   * query+collect - pass `query_phase = { prompt, on_submit(term, handle) }`. The popup opens
 --       asking for a search term; <CR> runs on_submit, which streams results in via
 --       handle.append(list)/handle.done(); then typing filters the collected results.
+-- Preview: pass `previewer = function(item, render)` where render({ lines|code, filetype, line }).
 
 local uv = vim.uv or vim.loop
 
@@ -43,9 +45,10 @@ end
 function M.pick(opts)
   local items = opts.items or {}
   local on_select = opts.on_select or function() end
+  local query_phase = opts.query_phase
+  local previewer = opts.previewer
   local title = opts.title or " jadx "
   local max_display = opts.limit or 200
-  local query_phase = opts.query_phase
   local loading = opts.loading or false
 
   local cleanups = {}
@@ -56,10 +59,13 @@ function M.pick(opts)
   local mode = query_phase and "query" or "filter"
 
   local total_w, total_h = vim.o.columns, vim.o.lines
-  local width = math.max(20, math.min(110, math.floor(total_w * 0.8)))
-  local height = math.max(3, math.min(25, math.floor(total_h * 0.6)))
-  local row = math.max(0, math.floor((total_h - height) / 2) - 1)
-  local col = math.floor((total_w - width) / 2)
+  local has_preview = previewer ~= nil and total_w >= 80
+  local W = math.min(has_preview and 160 or 110, math.floor(total_w * (has_preview and 0.9 or 0.8)))
+  local H = math.max(3, math.min(has_preview and 30 or 25, math.floor(total_h * (has_preview and 0.7 or 0.6))))
+  local base_row = math.max(0, math.floor((total_h - H) / 2) - 1)
+  local base_col = math.max(0, math.floor((total_w - W) / 2))
+  local rw = has_preview and math.floor(W * 0.42) or W
+  local pw = W - rw - 2
 
   local results_buf = vim.api.nvim_create_buf(false, true)
   local prompt_buf = vim.api.nvim_create_buf(false, true)
@@ -67,24 +73,46 @@ function M.pick(opts)
   vim.bo[prompt_buf].bufhidden = "wipe"
 
   local results_win = vim.api.nvim_open_win(results_buf, false, {
-    relative = "editor", width = width, height = height, row = row, col = col,
+    relative = "editor", width = rw, height = H, row = base_row, col = base_col,
     style = "minimal", border = "rounded", title = title, title_pos = "center",
     footer = "", footer_pos = "right",
   })
   local prompt_win = vim.api.nvim_open_win(prompt_buf, true, {
-    relative = "editor", width = width, height = 1, row = row + height + 1, col = col,
+    relative = "editor", width = rw, height = 1, row = base_row + H + 1, col = base_col,
     style = "minimal", border = "rounded", title = " search term ", title_pos = "left",
   })
   vim.wo[results_win].cursorline = true
   vim.wo[results_win].wrap = false
 
+  local preview_buf, preview_win
+  if has_preview then
+    preview_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[preview_buf].bufhidden = "wipe"
+    preview_win = vim.api.nvim_open_win(preview_buf, false, {
+      relative = "editor", width = pw, height = H, row = base_row, col = base_col + rw + 2,
+      style = "minimal", border = "rounded", title = " preview ", title_pos = "left",
+      focusable = false,
+    })
+    vim.wo[preview_win].number = true
+    vim.wo[preview_win].wrap = false
+    vim.wo[preview_win].cursorline = true
+  end
+
   local handle
   local closed = false
   local current = {}
   local spin_frame, spin_timer = 0, nil
+  local preview_seq, preview_timer = 0, nil
 
   local function prompt_text()
     return (vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false))[1] or ""
+  end
+
+  local function selected()
+    if not (vim.api.nvim_win_is_valid(results_win) and #current > 0) then
+      return nil
+    end
+    return current[vim.api.nvim_win_get_cursor(results_win)[1]]
   end
 
   local function set_prompt_title()
@@ -106,6 +134,68 @@ function M.pick(opts)
     if vim.api.nvim_win_is_valid(results_win) then
       pcall(vim.api.nvim_win_set_config, results_win, { footer = status_text(), footer_pos = "right" })
     end
+  end
+
+  local function render_preview(spec, seq)
+    if seq ~= preview_seq or not (preview_win and vim.api.nvim_win_is_valid(preview_win)) then
+      return
+    end
+    local lines = spec.lines
+    if type(lines) == "string" then
+      lines = vim.split(lines:gsub("\r", ""), "\n", { plain = true })
+    end
+    vim.bo[preview_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, lines)
+    vim.bo[preview_buf].modifiable = false
+    vim.bo[preview_buf].filetype = spec.filetype or ""
+    pcall(function()
+      vim.bo[preview_buf].syntax = spec.filetype or ""
+    end)
+    local l = math.max(1, math.min(#lines > 0 and #lines or 1, spec.line or 1))
+    pcall(vim.api.nvim_win_set_cursor, preview_win, { l, 0 })
+    pcall(vim.api.nvim_win_call, preview_win, function()
+      vim.cmd("normal! zz")
+    end)
+  end
+
+  local function update_preview()
+    if not (has_preview and preview_win) then
+      return
+    end
+    preview_seq = preview_seq + 1
+    local seq = preview_seq
+    local item = selected()
+    if preview_timer then
+      pcall(function()
+        preview_timer:stop()
+        preview_timer:close()
+      end)
+      preview_timer = nil
+    end
+    preview_timer = uv.new_timer()
+    preview_timer:start(60, 0, vim.schedule_wrap(function()
+      if preview_timer then
+        pcall(function()
+          preview_timer:stop()
+          preview_timer:close()
+        end)
+        preview_timer = nil
+      end
+      if closed or seq ~= preview_seq then
+        return
+      end
+      if not item then
+        vim.bo[preview_buf].modifiable = true
+        vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, {})
+        vim.bo[preview_buf].modifiable = false
+        return
+      end
+      previewer(item, function(spec)
+        vim.schedule(function()
+          render_preview(spec, seq)
+        end)
+      end)
+    end))
   end
 
   local function set_lines(lines)
@@ -131,6 +221,7 @@ function M.pick(opts)
       pcall(vim.api.nvim_win_set_cursor, results_win, { target, 0 })
     end
     update_status()
+    update_preview()
   end
 
   local function recompute()
@@ -170,6 +261,7 @@ function M.pick(opts)
     end
     local cur = vim.api.nvim_win_get_cursor(results_win)[1]
     vim.api.nvim_win_set_cursor(results_win, { math.max(1, math.min(#current, cur + delta)), 0 })
+    update_preview()
   end
 
   local function close()
@@ -178,8 +270,18 @@ function M.pick(opts)
     end
     closed = true
     stop_spinner()
+    if preview_timer then
+      pcall(function()
+        preview_timer:stop()
+        preview_timer:close()
+      end)
+      preview_timer = nil
+    end
     pcall(vim.api.nvim_win_close, prompt_win, true)
     pcall(vim.api.nvim_win_close, results_win, true)
+    if preview_win then
+      pcall(vim.api.nvim_win_close, preview_win, true)
+    end
     pcall(vim.cmd, "stopinsert")
     for _, fn in ipairs(cleanups) do
       pcall(fn)
@@ -198,10 +300,7 @@ function M.pick(opts)
       end
       return
     end
-    local item
-    if vim.api.nvim_win_is_valid(results_win) and #current > 0 then
-      item = current[vim.api.nvim_win_get_cursor(results_win)[1]]
-    end
+    local item = selected()
     close()
     if item then
       vim.schedule(function()
@@ -228,6 +327,8 @@ function M.pick(opts)
     vim.keymap.set(m, "<Up>", function() move(-1) end, kopts)
     vim.keymap.set(m, "<C-n>", function() move(1) end, kopts)
     vim.keymap.set(m, "<C-p>", function() move(-1) end, kopts)
+    vim.keymap.set(m, "<C-d>", function() move(5) end, kopts)
+    vim.keymap.set(m, "<C-u>", function() move(-5) end, kopts)
     vim.keymap.set(m, "<CR>", accept, kopts)
     vim.keymap.set(m, "<Esc>", close, kopts)
     vim.keymap.set(m, "<C-c>", close, kopts)
@@ -239,6 +340,7 @@ function M.pick(opts)
     accept = accept,
     prompt_buf = prompt_buf,
     results_win = results_win,
+    preview_win = preview_win,
     get_filtered = function() return current end,
     status = status_text,
     on_cleanup = function(fn) cleanups[#cleanups + 1] = fn end,
