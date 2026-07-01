@@ -17,12 +17,24 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 jar="$here/daemon/build/libs/jadxd.jar"
 nvim_bin="${JADXNVIM_NVIM:-nvim}"
 
-if [[ $# -lt 1 ]]; then
-  echo "usage: jadxnvim <app.apk|.dex|.jar|.jadx> [extra nvim args...]" >&2
+# Pull out --temp (work in memory, don't write a .jadx); the first non-flag arg is the project.
+temp="false"
+project=""
+rest=()
+for a in "$@"; do
+  if [[ "$a" == "--temp" ]]; then
+    temp="true"
+  elif [[ -z "$project" && "$a" != -* ]]; then
+    project="$a"
+  else
+    rest+=("$a")
+  fi
+done
+if [[ -z "$project" ]]; then
+  echo "usage: jadxnvim [--temp] <app.apk|.dex|.jar|.jadx> [extra nvim args...]" >&2
   exit 2
 fi
-project="$1"
-shift
+set -- "${rest[@]}"
 
 if [[ ! -f "$jar" ]]; then
   echo "jadxnvim: daemon not built yet, building (first run only)..." >&2
@@ -37,4 +49,4 @@ fi
 # startup. Long-bracket strings keep paths with spaces intact.
 exec "$nvim_bin" "$@" \
   --cmd "lua vim.opt.runtimepath:prepend([[$here]])" \
-  -c "lua require('jadxnvim').open([[$project]])"
+  -c "lua require('jadxnvim').open([[$project]], { temp = $temp })"

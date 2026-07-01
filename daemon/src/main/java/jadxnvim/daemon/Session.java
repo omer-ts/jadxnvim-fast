@@ -42,6 +42,7 @@ public final class Session {
 	private Emitter emitter = (m, p) -> {
 	};
 	private boolean prefetch = false;
+	private boolean temp = false;
 	private java.util.concurrent.atomic.AtomicBoolean warmupCancel;
 	private JadxDecompiler jadx;
 	private String inputPath;
@@ -66,6 +67,10 @@ public final class Session {
 
 	public void setPrefetch(boolean prefetch) {
 		this.prefetch = prefetch;
+	}
+
+	public void setTemp(boolean temp) {
+		this.temp = temp;
 	}
 
 	public Object dispatch(String method, JsonObject params) throws Exception {
@@ -169,9 +174,21 @@ public final class Session {
 			}
 		}
 
+		// Always materialize the project file so a plain "open" produces a jadx project (unless
+		// running with --temp). Never rewrite an already-existing .jadx here (that happens lazily
+		// on the first edit) to avoid churn.
+		if (!temp && !projFile.exists()) {
+			try {
+				ProjectIO.save(projFile, this.inputFile, this.codeData);
+			} catch (IOException e) {
+				System.err.println("[jadxd] could not create project file: " + e);
+			}
+		}
+
 		Map<String, Object> info = new LinkedHashMap<>();
 		info.put("input", input.getAbsolutePath());
-		info.put("project", projFile.getAbsolutePath());
+		info.put("project", temp ? null : projFile.getAbsolutePath());
+		info.put("temp", temp);
 		info.put("classes", decompiler.getClassesWithInners().size());
 		info.put("renames", cd.getRenames() == null ? 0 : cd.getRenames().size());
 		info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
@@ -556,7 +573,9 @@ public final class Session {
 		this.packageIndex = null;
 		this.classList = null;
 		this.methodList = null;
-		saveProject(null);
+		if (!temp) {
+			saveProject(null);
+		}
 	}
 
 	private Search search() {

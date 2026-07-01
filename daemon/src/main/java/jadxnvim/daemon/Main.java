@@ -25,9 +25,12 @@ public final class Main {
 
 		String input = null;
 		boolean prefetch = false;
+		boolean temp = false;
 		for (String a : argv) {
 			if ("--prefetch".equals(a)) {
 				prefetch = true;
+			} else if ("--temp".equals(a)) {
+				temp = true;
 			} else if (input == null && a != null && !a.isEmpty()) {
 				input = a;
 			}
@@ -36,6 +39,7 @@ public final class Main {
 		if (input != null) {
 			session.setInitialInput(input);
 			session.setPrefetch(prefetch);
+			session.setTemp(temp);
 			try {
 				session.loadProject(null);
 			} catch (Exception e) {

@@ -24,6 +24,9 @@ M.config = {
   -- Off by default: with it off the load bar is an animated activity indicator. Enabling it on
   -- very large APKs warms the whole decompilation, so give the JVM more heap via java_args.
   prefetch = false,
+  -- By default opening an APK creates/saves a .jadx project next to it. Set temp = true (or pass
+  -- --temp on the CLI / to :Jadx) to work purely in memory and never write a .jadx file.
+  temp = false,
   -- Global keymaps for the fuzzy finders. Set a value to false to skip mapping it.
   -- Bound to literal <Space> by default (works regardless of your mapleader).
   keys = {
@@ -98,7 +101,9 @@ local function ensure_setup()
 end
 
 --- Open a jadx project (APK/dex/jar or .jadx file): start the daemon and show the tree.
-function M.open(project)
+--- opts.temp = true works in memory and never writes a .jadx (overrides config.temp).
+function M.open(project, opts)
+  opts = opts or {}
   ensure_setup()
   if not project or project == "" then
     vim.notify("[jadxnvim] usage: :Jadx <path-to-apk-or-project>", vim.log.levels.ERROR)
@@ -121,11 +126,18 @@ function M.open(project)
   tree.reset()
 
   local name = vim.fn.fnamemodify(project, ":t")
+  local temp = opts.temp
+  if temp == nil then
+    temp = M.config.temp
+  end
   local cmd = { M.config.java }
   vim.list_extend(cmd, M.config.java_args)
   vim.list_extend(cmd, { "-jar", M.config.jar, project })
   if M.config.prefetch then
     table.insert(cmd, "--prefetch")
+  end
+  if temp then
+    table.insert(cmd, "--temp")
   end
 
   M._loading = true

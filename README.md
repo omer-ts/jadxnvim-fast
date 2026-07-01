@@ -66,6 +66,7 @@ The quickest way in — open a project straight from your terminal, no need to s
 # Linux / macOS / SSH server:
 scripts/jadxnvim app.apk
 scripts/jadxnvim project.jadx
+scripts/jadxnvim --temp app.apk   # work in memory, don't write a .jadx
 
 # Windows (PowerShell):
 scripts\jadxnvim.ps1 app.apk
@@ -144,11 +145,14 @@ Go-to-definition and usages integrate with the jumplist and quickfix, so `<C-o>`
 
 ## Seamless jadx-gui interop
 
-Renames and comments are stored in jadx's native code-data format and written to the `.jadx`
-project file (same `projectVersion`/`files`/`codeData` shape and GSON serialization jadx-gui uses).
-Open the same `.jadx` in jadx-gui and your renames/comments are there; conversely, opening a
-project edited in jadx-gui shows its renames/comments in jadxnvim. The decompiled input APK is
-referenced relatively, so a project directory stays portable.
+Opening an APK **creates a `.jadx` project next to it automatically** (use `--temp` / `temp = true`
+to work purely in memory and never write a file). Renames and comments are stored in jadx's native
+code-data format and written to that `.jadx` (same `projectVersion`/`files`/`codeData` shape and
+GSON serialization jadx-gui uses). Open the same `.jadx` in jadx-gui and your renames/comments are
+there; conversely, opening a project edited in jadx-gui shows its renames/comments in jadxnvim.
+Saving preserves fields jadxnvim doesn't manage (open tabs, tree state, ...), so round-tripping a
+jadx-gui project doesn't lose its UI state. The input APK is referenced relatively, so a project
+directory stays portable.
 
 ## Status
 

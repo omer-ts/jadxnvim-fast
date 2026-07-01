@@ -11,6 +11,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import jadx.api.data.ICodeComment;
 import jadx.api.data.ICodeRename;
@@ -75,8 +79,7 @@ final class ProjectIO {
 	}
 
 	static void save(File jadxFile, File input, JadxCodeData codeData) throws IOException {
-		ProjectFile pf = new ProjectFile();
-		pf.codeData = codeData;
+		Gson gson = gson();
 		Path base = jadxFile.getAbsoluteFile().getParentFile().toPath();
 		Path inputPath = input.getAbsoluteFile().toPath();
 		String rel;
@@ -85,13 +88,37 @@ final class ProjectIO {
 		} catch (IllegalArgumentException e) {
 			rel = inputPath.toString();
 		}
-		pf.files.add(rel.replace('\\', '/'));
+
+		// Preserve any fields we don't manage (openTabs, treeExpansions, ...) so re-saving a
+		// jadx-gui project keeps its state; only replace projectVersion/files/codeData.
+		JsonObject root = null;
+		if (jadxFile.exists()) {
+			try (Reader r = Files.newBufferedReader(jadxFile.toPath(), StandardCharsets.UTF_8)) {
+				JsonElement parsed = JsonParser.parseReader(r);
+				if (parsed != null && parsed.isJsonObject()) {
+					root = parsed.getAsJsonObject();
+				}
+			} catch (Exception ignore) {
+				root = null;
+			}
+		}
+		if (root == null) {
+			root = new JsonObject();
+		}
+		if (!root.has("projectVersion")) {
+			root.addProperty("projectVersion", PROJECT_VERSION);
+		}
+		JsonArray files = new JsonArray();
+		files.add(rel.replace('\\', '/'));
+		root.add("files", files);
+		root.add("codeData", gson.toJsonTree(codeData));
+
 		File parent = jadxFile.getAbsoluteFile().getParentFile();
 		if (parent != null) {
 			parent.mkdirs();
 		}
 		try (Writer w = Files.newBufferedWriter(jadxFile.toPath(), StandardCharsets.UTF_8)) {
-			gson().toJson(pf, w);
+			gson.toJson(root, w);
 		}
 	}
 

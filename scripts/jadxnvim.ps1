@@ -26,6 +26,11 @@ if (-not (Test-Path $jar)) {
 if (-not (Test-Path $Project)) { Write-Error "jadxnvim: file not found: $Project"; exit 1 }
 $proj = (Resolve-Path $Project).Path
 
-& $nvim @NvimArgs `
+# Pull out --temp (work in memory, don't write a .jadx) from the passthrough args.
+$temp = "false"
+$rest = @()
+foreach ($a in $NvimArgs) { if ($a -eq "--temp") { $temp = "true" } else { $rest += $a } }
+
+& $nvim @rest `
   --cmd "lua vim.opt.runtimepath:prepend([[$here]])" `
-  -c "lua require('jadxnvim').open([[$proj]])"
+  -c "lua require('jadxnvim').open([[$proj]], { temp = $temp })"

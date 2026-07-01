@@ -7,11 +7,20 @@ end
 vim.g.loaded_jadxnvim = true
 
 vim.api.nvim_create_user_command("Jadx", function(opts)
-  require("jadxnvim").open(opts.args)
+  local temp = false
+  local path
+  for _, a in ipairs(opts.fargs) do
+    if a == "--temp" then
+      temp = true
+    else
+      path = a
+    end
+  end
+  require("jadxnvim").open(path, { temp = temp })
 end, {
-  nargs = 1,
+  nargs = "+",
   complete = "file",
-  desc = "Open an APK/dex/jar/.jadx project in jadxnvim",
+  desc = "Open an APK/dex/jar/.jadx project (append --temp to not write a .jadx)",
 })
 
 vim.api.nvim_create_user_command("JadxTree", function()
