@@ -88,11 +88,18 @@ local function on_exit(_, code, _)
   for _, cb in pairs(pending) do
     cb({ message = "daemon exited (code " .. tostring(code) .. ")" }, nil)
   end
-  -- Don't report intentional shutdowns (SIGTERM => 143) as errors.
-  if code ~= 0 and not state.stopping then
-    log_err("daemon exited with code " .. tostring(code))
-  end
+  local crashed = code ~= 0 and not state.stopping
+  local on_crash = state.on_crash
   state.stopping = false
+  if crashed then
+    if on_crash then
+      vim.schedule(function()
+        on_crash(code)
+      end)
+    else
+      log_err("daemon exited with code " .. tostring(code))
+    end
+  end
 end
 
 --- Register a handler for an unsolicited notification method.
@@ -119,20 +126,28 @@ function M.is_running()
 end
 
 --- Start the daemon. cmd is a list (e.g. {"java","-jar",jar,project}).
-function M.start(cmd, on_ready)
+--- on_crash(code) is called if the daemon exits unexpectedly (non-zero, not a deliberate stop).
+function M.start(cmd, on_ready, on_crash)
   if state.job then
     M.stop()
   end
   state.stdout_partial = ""
   state.ready = false
-  M.on("ready", function(params)
-    state.ready = true
-    if on_ready then
-      vim.schedule(function()
-        on_ready(params)
-      end)
-    end
-  end)
+  state.on_ready = on_ready
+  state.on_crash = on_crash
+  -- Bind the ready dispatcher once; re-binding per start would accumulate stale handlers.
+  if not state.ready_bound then
+    state.ready_bound = true
+    M.on("ready", function(params)
+      state.ready = true
+      local cb = state.on_ready
+      if cb then
+        vim.schedule(function()
+          cb(params)
+        end)
+      end
+    end)
+  end
   local job = vim.fn.jobstart(cmd, {
     on_stdout = on_stdout,
     on_stderr = on_stderr,

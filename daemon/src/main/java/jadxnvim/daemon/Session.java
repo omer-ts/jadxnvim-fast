@@ -271,7 +271,19 @@ public final class Session {
 		if (total == 0) {
 			return builder.finish(mDir, sig);
 		}
-		int threads = Math.max(2, Runtime.getRuntime().availableProcessors());
+		// Cap concurrency: each in-flight decompile holds a class's transient state, so on a
+		// many-core box too many at once spikes peak memory (a cause of OOM-kills during export on
+		// memory-limited servers). Tunable via -Djadxnvim.indexThreads.
+		int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
+		int threads = Math.max(1, Math.min(cores, 8));
+		try {
+			String prop = System.getProperty("jadxnvim.indexThreads");
+			if (prop != null) {
+				threads = Math.max(1, Integer.parseInt(prop.trim()));
+			}
+		} catch (Exception ignore) {
+			// keep default
+		}
 		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads, r -> {
 			Thread th = new Thread(r, "jadx-index");
 			th.setDaemon(true);

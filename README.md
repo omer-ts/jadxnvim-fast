@@ -33,7 +33,11 @@ communication is local stdio, so there is no network protocol or auth to configu
   (jadxnvim falls back to an in-memory scan if it's missing)
 - No system Gradle needed — the repo ships a Gradle wrapper
 - Enough RAM for very large APKs: parsing + exporting a 400k-class APK needs ~24 GB of JVM heap.
-  jadxnvim sizes the heap to ~70% of your RAM automatically; override via `java_args`.
+  jadxnvim sizes the heap to 70% of available memory automatically (`-XX:MaxRAMPercentage`, so it
+  respects container/cgroup limits). If indexing still gets OOM-killed (daemon exits with code 137),
+  jadxnvim reopens the project **without** the search index so browsing and (slower) in-memory
+  search keep working — give the JVM more memory via `java_args = { "-Xmx24g" }`, lower the export
+  concurrency (`java_args = { "-Djadxnvim.indexThreads=4" }`), or set `export = false` to skip it.
 
 ## Build the daemon
 

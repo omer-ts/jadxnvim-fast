@@ -141,27 +141,24 @@ function M.open(project, opts)
   if temp == nil then
     temp = M.config.temp
   end
-  local will_export = M.config.export and not temp
+  local will_export = M.config.export and not temp and not opts._force_no_export
   local cmd = { M.config.java }
-  -- Give the JVM a large heap by default (parsing + exporting a 400k-class APK needs it). Users
-  -- can override by putting their own -Xmx in java_args. -Xmx only caps the heap; the JVM commits
-  -- lazily, so this is safe for small APKs too.
-  local has_xmx = false
+  -- Size the heap to a fraction of *available* memory. Use MaxRAMPercentage rather than a computed
+  -- -Xmx so the JVM respects a container/cgroup memory limit (computing from physical RAM can
+  -- over-commit a cgroup and get the process OOM-killed with code 137). Users can override with
+  -- their own -Xmx / -XX:MaxRAM* in java_args.
+  local has_heap = false
   for _, a in ipairs(M.config.java_args) do
-    if type(a) == "string" and a:match("^%-Xmx") then
-      has_xmx = true
+    if type(a) == "string" and (a:match("^%-Xmx") or a:match("MaxRAMPercentage") or a:match("MaxRAM=")) then
+      has_heap = true
     end
   end
-  if not has_xmx then
-    local total = (vim.uv or vim.loop).get_total_memory()
-    if total and total > 0 then
-      local mb = math.max(2048, math.min(math.floor(total / 1048576 * 0.7), 49152))
-      table.insert(cmd, "-Xmx" .. mb .. "m")
-    end
+  if not has_heap then
+    table.insert(cmd, "-XX:MaxRAMPercentage=70.0")
   end
   vim.list_extend(cmd, M.config.java_args)
   vim.list_extend(cmd, { "-jar", M.config.jar, project })
-  if not M.config.export then
+  if not will_export then
     table.insert(cmd, "--no-export")
   end
   if temp then
@@ -190,6 +187,24 @@ function M.open(project, opts)
       vim.log.levels.INFO
     )
     tree.open()
+  end, function(code_)
+    -- The daemon died unexpectedly (137 = OOM-killed, usually while indexing a huge APK). If we
+    -- were building the search index, retry once without it so browsing + in-memory search still
+    -- work, and tell the user how to make indexing fit.
+    M._loading = false
+    progress.finish()
+    if will_export and not opts._force_no_export then
+      vim.notify(
+        "[jadxnvim] indexing ran out of memory (daemon exited " .. tostring(code_) .. "). Reopening "
+          .. "without the search index — browsing and (slower) in-memory search still work.\n"
+          .. "To index this APK, give the JVM more memory via java_args (e.g. { '-Xmx24g' }), or set "
+          .. "export = false to skip indexing.",
+        vim.log.levels.WARN
+      )
+      M.open(project, { temp = temp, _force_no_export = true })
+    else
+      vim.notify("[jadxnvim] daemon exited (" .. tostring(code_) .. ")", vim.log.levels.ERROR)
+    end
   end)
 end
 
