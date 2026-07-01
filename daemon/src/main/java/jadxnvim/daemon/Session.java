@@ -24,6 +24,8 @@ import jadx.api.data.impl.JadxCodeComment;
 import jadx.api.data.impl.JadxCodeData;
 import jadx.api.data.impl.JadxCodeRename;
 import jadx.api.data.impl.JadxNodeRef;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.nodes.MethodNode;
 
 /**
  * Holds the live {@link JadxDecompiler} and implements the RPC methods.
@@ -39,6 +41,8 @@ public final class Session {
 	}
 
 	private static final int MAX_USAGES = 5000;
+	// Bump when the on-disk export/name-index format or its index semantics change.
+	private static final long INDEX_FORMAT_VERSION = 2;
 
 	private Emitter emitter = (m, p) -> {
 	};
@@ -238,7 +242,10 @@ public final class Session {
 		File input = this.inputFile;
 		Thread t = new Thread(() -> {
 			try {
-				long sig = input.length();
+				// Signature includes an index-format version so a format change (e.g. the method
+				// index moving from JavaClass.getMethods() order to the raw MethodNode order that
+				// memberPos now uses) invalidates stale caches and forces a rebuild.
+				long sig = input.length() * 31 + INDEX_FORMAT_VERSION;
 				// Reuse the cache only if it also has the name index (older caches predate it, so
 				// they rebuild once to gain fast class/method search).
 				boolean hasNames = new File(nmDir, SearchIndex.classesName(0)).isFile();
@@ -305,10 +312,16 @@ public final class Session {
 					return;
 				}
 				try {
+					// Raw parsed method list: same order memberPos uses, so the stored index maps
+					// back correctly. Skipped (DONT_GENERATE) slots stay as null to keep positions.
 					List<String> methodNames = new ArrayList<>();
 					try {
-						for (JavaMethod mth : cls.getMethods()) {
-							methodNames.add(mth.getName());
+						for (MethodNode mth : cls.getClassNode().getMethods()) {
+							if (mth.contains(AFlag.DONT_GENERATE)) {
+								methodNames.add(null);
+							} else {
+								methodNames.add(mth.getMethodInfo().getAlias());
+							}
 						}
 					} catch (Throwable ignore) {
 						// no methods indexed for this class
@@ -484,13 +497,15 @@ public final class Session {
 		if (cls == null) {
 			throw new IllegalArgumentException("class not found: " + id);
 		}
-		List<JavaMethod> methods = cls.getMethods();
+		// Use the raw core method list (parsed order), matching how the name index/search assign the
+		// index — JavaClass.getMethods() filters + sorts, so its index would not line up.
+		List<MethodNode> methods = cls.getClassNode().getMethods();
 		if (index < 0 || index >= methods.size()) {
 			throw new IllegalArgumentException("method index out of range: " + index);
 		}
-		JavaMethod mth = methods.get(index);
+		MethodNode mth = methods.get(index);
 		ICodeInfo info = freshCodeInfo(cls, id);
-		int pos = mth.getDefPos();
+		int pos = mth.getDefPosition();
 		int[] lc = pos >= 0 ? Positions.toLineCol(info.getCodeStr(), pos) : new int[] { 1, 0 };
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("id", id);

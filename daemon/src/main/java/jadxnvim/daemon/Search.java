@@ -25,6 +25,10 @@ import jadx.api.JavaClass;
 import jadx.api.JavaField;
 import jadx.api.JavaMethod;
 import jadx.api.JavaNode;
+import jadx.core.dex.attributes.AFlag;
+import jadx.core.dex.nodes.ClassNode;
+import jadx.core.dex.nodes.FieldNode;
+import jadx.core.dex.nodes.MethodNode;
 
 /**
  * Background search engine. Searches run on a worker thread and stream results to the client as
@@ -310,59 +314,86 @@ final class Search {
 		if ("method".equals(opts.kind)) {
 			return runMethodNames(jadx, searchId, pattern, opts, cancel);
 		}
+		// "all": class + method + field names. Match against the raw parsed model (no load()), then
+		// decompile only the classes that actually matched to resolve declaration positions.
 		int count = 0;
-		for (JavaClass cls : jadx.getClassesWithInners()) {
+		for (JavaClass cls : jadx.getClasses()) {
 			if (cancel.get()) {
 				return new int[] { count, 0 };
 			}
-			List<JavaNode> matched = new ArrayList<>();
-			if (pattern.matcher(cls.getName()).find() || pattern.matcher(cls.getFullName()).find()) {
-				matched.add(cls);
-			}
-			for (JavaMethod mth : cls.getMethods()) {
-				if (pattern.matcher(mth.getName()).find()) {
-					matched.add(mth);
+			ClassNode cn = cls.getClassNode();
+			boolean clsMatch = pattern.matcher(cls.getName()).find()
+					|| pattern.matcher(cls.getFullName()).find();
+			List<MethodNode> mMatched = new ArrayList<>();
+			List<MethodNode> mths = cn.getMethods();
+			for (MethodNode m : mths) {
+				if (m.contains(AFlag.DONT_GENERATE)) {
+					continue;
+				}
+				if (pattern.matcher(m.getMethodInfo().getAlias()).find()) {
+					mMatched.add(m);
 				}
 			}
-			for (JavaField fld : cls.getFields()) {
-				if (pattern.matcher(fld.getName()).find()) {
-					matched.add(fld);
+			List<FieldNode> fMatched = new ArrayList<>();
+			for (FieldNode f : cn.getFields()) {
+				if (f.contains(AFlag.DONT_GENERATE)) {
+					continue;
+				}
+				if (pattern.matcher(f.getFieldInfo().getAlias()).find()) {
+					fMatched.add(f);
 				}
 			}
-			if (matched.isEmpty()) {
+			if (!clsMatch && mMatched.isEmpty() && fMatched.isEmpty()) {
 				continue;
 			}
-			// Resolve positions by decompiling only the (few) classes that matched.
+			// Decompile once (only matched classes) to resolve positions.
+			String code = null;
+			try {
+				code = cls.getCodeInfo().getCodeStr();
+			} catch (Exception ignore) {
+				// positions fall back to line 1
+			}
 			List<Map<String, Object>> hits = new ArrayList<>();
-			for (JavaNode node : matched) {
-				JavaClass top = node.getTopParentClass();
-				int[] lc = { 1, 0 };
-				try {
-					String code = top.getCodeInfo().getCodeStr();
-					int pos = node.getDefPos();
-					if (pos >= 0) {
-						lc = Positions.toLineCol(code, pos);
-					}
-				} catch (Exception ignore) {
-					// fall back to line 1
-				}
-				Map<String, Object> hit = new LinkedHashMap<>();
-				hit.put("id", top.getRawName());
-				hit.put("fullName", node.getFullName());
-				hit.put("line", lc[0]);
-				hit.put("col", lc[1]);
-				hit.put("kind", kindOf(node));
-				hit.put("text", node.getFullName());
-				hits.add(hit);
+			String id = cls.getRawName();
+			if (clsMatch) {
+				hits.add(nameHit(id, cls.getFullName(), "class", posOf(code, cls.getDefPos())));
 				count++;
-				if (count >= opts.limit) {
-					flush(searchId, hits);
-					return new int[] { count, 1 };
-				}
+			}
+			for (MethodNode m : mMatched) {
+				String label = m.getMethodInfo().getAlias() + "  ·  " + cls.getFullName();
+				hits.add(nameHit(id, label, "method", posOf(code, m.getDefPosition())));
+				count++;
+			}
+			for (FieldNode f : fMatched) {
+				String label = f.getFieldInfo().getAlias() + "  ·  " + cls.getFullName();
+				hits.add(nameHit(id, label, "field", posOf(code, f.getDefPosition())));
+				count++;
+			}
+			if (count >= opts.limit) {
+				flush(searchId, hits);
+				return new int[] { count, 1 };
 			}
 			flush(searchId, hits);
 		}
 		return new int[] { count, 0 };
+	}
+
+	private int[] posOf(String code, int pos) {
+		if (code != null && pos >= 0) {
+			return Positions.toLineCol(code, pos);
+		}
+		return new int[] { 1, 0 };
+	}
+
+	private static Map<String, Object> nameHit(String id, String label, String kind, int[] lc) {
+		Map<String, Object> hit = new LinkedHashMap<>();
+		hit.put("id", id);
+		hit.put("fullName", label);
+		hit.put("line", lc[0]);
+		hit.put("col", lc[1]);
+		hit.put("kind", kind);
+		hit.put("text", label);
+		return hit;
 	}
 
 	// Fast class/method name search: ripgrep the per-shard name files, anchoring the query to the
@@ -475,12 +506,14 @@ final class Search {
 		return sb.toString();
 	}
 
-	// Stream class-name matches (including inner classes). No decompilation.
+	// Stream class-name matches. Reads only the parsed model (ClassInfo names never trigger the
+	// lazy decompile), and iterates top-level classes so no class is loaded during the scan --
+	// getClassesWithInners() would call load() on every class. This is the jadx-gui approach.
 	private int[] runClassNames(JadxDecompiler jadx, int searchId, Pattern pattern, Opts opts,
 			AtomicBoolean cancel) {
 		int count = 0;
 		List<Map<String, Object>> batch = new ArrayList<>();
-		for (JavaClass cls : jadx.getClassesWithInners()) {
+		for (JavaClass cls : jadx.getClasses()) {
 			if (cancel.get()) {
 				break;
 			}
@@ -507,7 +540,11 @@ final class Search {
 		return new int[] { count, 0 };
 	}
 
-	// Stream method-name matches from top-level classes, carrying the method index for navigation.
+	// Stream method-name matches from top-level classes. Reads the raw core MethodNode list
+	// (cls.getClassNode().getMethods()) instead of cls.getMethods(): the latter calls load() (lazy
+	// decompile of every class -> minutes and huge memory on a 400k-class APK) and also sorts/filters
+	// so its indices wouldn't match memberPos. The index carried here is the position in the raw
+	// list, which memberPos resolves the same way. Matches jadx-gui's MethodSearchProvider.
 	private int[] runMethodNames(JadxDecompiler jadx, int searchId, Pattern pattern, Opts opts,
 			AtomicBoolean cancel) {
 		int count = 0;
@@ -516,18 +553,25 @@ final class Search {
 			if (cancel.get()) {
 				break;
 			}
-			List<JavaMethod> methods = cls.getMethods();
+			String clsFull = cls.getFullName();
+			String id = cls.getRawName();
+			List<MethodNode> methods = cls.getClassNode().getMethods();
 			for (int i = 0; i < methods.size(); i++) {
-				JavaMethod mth = methods.get(i);
-				if (pattern.matcher(mth.getName()).find()) {
+				MethodNode m = methods.get(i);
+				if (m.contains(AFlag.DONT_GENERATE)) {
+					continue;
+				}
+				String nm = m.getMethodInfo().getAlias();
+				if (pattern.matcher(nm).find()) {
+					String label = nm + "  ·  " + clsFull;
 					Map<String, Object> hit = new LinkedHashMap<>();
-					hit.put("id", cls.getRawName());
+					hit.put("id", id);
 					hit.put("index", i);
 					hit.put("kind", "method");
-					hit.put("fullName", mth.getName() + "  ·  " + cls.getFullName());
+					hit.put("fullName", label);
 					hit.put("line", 1);
 					hit.put("col", 0);
-					hit.put("text", mth.getName() + "  ·  " + cls.getFullName());
+					hit.put("text", label);
 					batch.add(hit);
 					count++;
 					if (batch.size() >= 500) {
