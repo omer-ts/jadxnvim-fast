@@ -49,6 +49,10 @@ public final class Session {
 	private boolean export = true;
 	private boolean temp = false;
 	private boolean noUsage = false;
+	// Lean mode: after the export finishes, drop the in-memory jadx model and serve browse/search/
+	// navigate from the on-disk export. The model is rebuilt on demand for semantic ops (rename,
+	// comment, smali). Implies noUsage.
+	private boolean lean = false;
 	private java.util.concurrent.atomic.AtomicBoolean exportCancel;
 	private File exportDir;
 	private File indexDir;
@@ -92,6 +96,13 @@ public final class Session {
 
 	public void setNoUsage(boolean noUsage) {
 		this.noUsage = noUsage;
+	}
+
+	public void setLean(boolean lean) {
+		this.lean = lean;
+		if (lean) {
+			this.noUsage = true; // the graph would be wasted work if we drop the model anyway
+		}
 	}
 
 	public Object dispatch(String method, JsonObject params) throws Exception {
@@ -170,22 +181,7 @@ public final class Session {
 			projFile = defaultProjectFile(input);
 		}
 
-		JadxArgs args = new JadxArgs();
-		args.getInputFiles().add(input);
-		args.setCodeData(cd);
-		// Don't retain decompiled code in memory. On huge APKs (e.g. 400k classes) the default
-		// in-memory cache exhausts the heap and GC-thrashes during the full export; without it the
-		// export streams to disk at low, constant memory. Browsing re-decompiles per class (cheap,
-		// and the plugin caches the buffer), and search reads the exported files via ripgrep.
-		args.setCodeCache(NoOpCodeCache.INSTANCE);
-		// Optionally skip building the global usage/xref graph at load (a large, permanent heap cost
-		// on huge APKs). find-usages then falls back to a ripgrep scan of the exported sources.
-		if (noUsage) {
-			args.setUsageInfoCache(new UsageOff.Cache());
-		}
-
-		JadxDecompiler decompiler = new JadxDecompiler(args);
-		decompiler.load();
+		JadxDecompiler decompiler = buildModel(input, cd);
 
 		JadxDecompiler previous = this.jadx;
 		this.jadx = decompiler;
@@ -263,12 +259,18 @@ public final class Session {
 					searchIndex = SearchIndex.load(idxDir, nmDir, mDir);
 					sourcesReady = true;
 					emitter.emit("loadDone", Map.of("total", 0, "cached", true));
+					if (lean) {
+						unloadModel();
+					}
 					return;
 				}
 				searchIndex = buildIndex(d, idxDir, nmDir, mDir, sig, cancel);
 				if (searchIndex != null && !cancel.get()) {
 					sourcesReady = true;
 					emitter.emit("loadDone", Map.of("total", 1));
+					if (lean) {
+						unloadModel();
+					}
 				}
 			} catch (Throwable err) {
 				System.err.println("[jadxd] export error: " + err);
@@ -407,6 +409,17 @@ public final class Session {
 	 * APKs, so the tree can render instantly and expand packages lazily via {@link #getClasses}.
 	 */
 	public Map<String, Object> getPackages() {
+		if (servingFromDisk()) {
+			Map<String, List<String[]>> index = diskPackages();
+			List<Map<String, Object>> packages = new ArrayList<>(index.size());
+			for (Map.Entry<String, List<String[]>> e : index.entrySet()) {
+				Map<String, Object> pkg = new LinkedHashMap<>();
+				pkg.put("name", e.getKey());
+				pkg.put("count", e.getValue().size());
+				packages.add(pkg);
+			}
+			return Map.of("packages", packages);
+		}
 		ensureLoaded();
 		Map<String, List<JavaClass>> index = packageIndex();
 		List<Map<String, Object>> packages = new ArrayList<>(index.size());
@@ -423,22 +436,49 @@ public final class Session {
 
 	/** Return the top-level classes of a single package (lazy tree expansion). */
 	public Map<String, Object> getClasses(String pkgName) {
-		ensureLoaded();
 		String key = pkgName == null ? "" : pkgName;
-		List<JavaClass> classes = packageIndex().getOrDefault(key, List.of());
-		List<Map<String, Object>> out = new ArrayList<>(classes.size());
-		for (JavaClass cls : classes) {
-			Map<String, Object> entry = new LinkedHashMap<>();
-			entry.put("id", cls.getRawName());
-			entry.put("name", cls.getName());
-			entry.put("fullName", cls.getFullName());
-			out.add(entry);
+		List<Map<String, Object>> out = new ArrayList<>();
+		if (servingFromDisk()) {
+			for (String[] e : diskPackages().getOrDefault(key, List.of())) {
+				Map<String, Object> entry = new LinkedHashMap<>();
+				entry.put("id", e[0]);
+				entry.put("name", e[1]);
+				entry.put("fullName", e[2]);
+				out.add(entry);
+			}
+		} else {
+			ensureLoaded();
+			for (JavaClass cls : packageIndex().getOrDefault(key, List.of())) {
+				Map<String, Object> entry = new LinkedHashMap<>();
+				entry.put("id", cls.getRawName());
+				entry.put("name", cls.getName());
+				entry.put("fullName", cls.getFullName());
+				out.add(entry);
+			}
 		}
 		out.sort(Comparator.comparing(m -> (String) m.get("name")));
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("package", key);
 		result.put("classes", out);
 		return result;
+	}
+
+	private Map<String, List<String[]>> diskPkgIndex;
+
+	/** Package -> [{id, name, fullName}] built from the export index (no model needed). */
+	private Map<String, List<String[]>> diskPackages() {
+		if (diskPkgIndex == null) {
+			Map<String, List<String[]>> idx = new TreeMap<>();
+			for (String[] e : searchIndex.classEntries()) {
+				String fullName = e[1];
+				int dot = fullName.lastIndexOf('.');
+				String pkg = dot >= 0 ? fullName.substring(0, dot) : "";
+				String name = dot >= 0 ? fullName.substring(dot + 1) : fullName;
+				idx.computeIfAbsent(pkg, k -> new ArrayList<>()).add(new String[] { e[0], name, fullName });
+			}
+			diskPkgIndex = idx;
+		}
+		return diskPkgIndex;
 	}
 
 	/** Lazily built, cached map of package name -> top-level classes; invalidated on (re)load. */
@@ -526,6 +566,19 @@ public final class Session {
 	}
 
 	public Map<String, Object> getCode(String id) {
+		// Lean mode: read the exported copy straight off disk (no model, no re-decompile) as long as
+		// the project is unedited. This is also exactly the text the search index was built from, so
+		// search line numbers land precisely.
+		if (servingFromDisk() && codeDataVersion == 0 && searchIndex.hasCode(id)) {
+			String code = searchIndex.codeOf(id);
+			if (code != null) {
+				Map<String, Object> result = new LinkedHashMap<>();
+				result.put("id", id);
+				result.put("fullName", diskFullName(id));
+				result.put("code", code);
+				return result;
+			}
+		}
 		JadxDecompiler d = ensureLoaded();
 		JavaClass cls = findClass(id);
 		if (cls == null) {
@@ -537,6 +590,20 @@ public final class Session {
 		result.put("fullName", cls.getFullName());
 		result.put("code", code.getCodeStr());
 		return result;
+	}
+
+	private Map<String, String> diskNames;
+
+	/** id -> fullName from the export index (for disk-served results). */
+	private String diskFullName(String id) {
+		if (diskNames == null) {
+			Map<String, String> m = new java.util.HashMap<>();
+			for (String[] e : searchIndex.classEntries()) {
+				m.put(e[0], e[1]);
+			}
+			diskNames = m;
+		}
+		return diskNames.getOrDefault(id, id);
 	}
 
 	/** Resolve the jadx node referenced at (line, col) inside class {@code id}, or null. */
@@ -728,7 +795,10 @@ public final class Session {
 	}
 
 	private Map<String, Object> startSearch(String kind, JsonObject params) {
-		JadxDecompiler d = ensureLoaded();
+		// When the on-disk index can serve the search (ripgrep over shards/name files), don't touch
+		// the model — in lean mode that avoids re-materializing it. The in-memory fallback only runs
+		// when the index isn't ready, in which case the model is still loaded.
+		JadxDecompiler d = servingFromDisk() ? null : ensureLoaded();
 		String query = reqStr(params, "query");
 		Search.Opts opts = new Search.Opts();
 		if (params.has("limit") && !params.get("limit").isJsonNull()) {
@@ -803,8 +873,66 @@ public final class Session {
 
 	// --- helpers -------------------------------------------------------------
 
+	// Build (parse + load) a jadx model for the given input and code data.
+	private JadxDecompiler buildModel(File input, JadxCodeData cd) {
+		JadxArgs args = new JadxArgs();
+		args.getInputFiles().add(input);
+		args.setCodeData(cd);
+		// Don't retain decompiled code in memory. On huge APKs (e.g. 400k classes) the default
+		// in-memory cache exhausts the heap and GC-thrashes during the full export; without it the
+		// export streams to disk at low, constant memory. Browsing re-decompiles per class (cheap,
+		// and the plugin caches the buffer), and search reads the exported files via ripgrep.
+		args.setCodeCache(NoOpCodeCache.INSTANCE);
+		// Optionally skip building the global usage/xref graph at load (a large, permanent heap cost
+		// on huge APKs). find-usages then falls back to a ripgrep scan of the exported sources.
+		if (noUsage) {
+			args.setUsageInfoCache(new UsageOff.Cache());
+		}
+		JadxDecompiler d = new JadxDecompiler(args);
+		d.load();
+		return d;
+	}
+
+	/** Lean mode: drop the in-memory model once the export can serve browse/search/navigate. */
+	private synchronized void unloadModel() {
+		JadxDecompiler d = this.jadx;
+		if (d == null) {
+			return;
+		}
+		this.jadx = null;
+		this.packageIndex = null;
+		this.classList = null;
+		this.methodList = null;
+		try {
+			d.close();
+		} catch (Exception ignore) {
+			// best effort
+		}
+		System.gc();
+		emitter.emit("modelUnloaded", Map.of("lean", true));
+	}
+
+	/** Rebuild the model on demand (lean mode) for an op that needs jadx semantics. */
+	private synchronized JadxDecompiler reloadModel() {
+		if (jadx != null) {
+			return jadx;
+		}
+		emitter.emit("modelReloading", Map.of("reason", "semantic op needs the jadx model"));
+		this.jadx = buildModel(this.inputFile, this.codeData);
+		this.packageIndex = null;
+		return jadx;
+	}
+
+	/** True when running lean with the model currently dropped (serve from disk). */
+	private boolean servingFromDisk() {
+		return jadx == null && sourcesReady && searchIndex != null;
+	}
+
 	private JadxDecompiler ensureLoaded() {
 		if (jadx == null) {
+			if (lean && inputFile != null) {
+				return reloadModel();
+			}
 			throw new IllegalStateException("project not loaded");
 		}
 		return jadx;

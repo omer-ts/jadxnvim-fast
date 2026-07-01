@@ -40,16 +40,23 @@ communication is local stdio, so there is no network protocol or auth to configu
 
   Rough memory floor (measured, a large APK — 540 MB / 396k classes, idle after load):
 
-  | mode | live heap | load time |
+  | mode | live heap (idle) | notes |
   | --- | --- | --- |
-  | default (`usage = true`) | ~6.9 GB | ~72 s |
-  | `usage = false` | ~4.6 GB | ~52 s |
+  | default (`usage = true`) | ~6.9 GB | full jadx-gui-quality output + precise `gr` |
+  | `usage = false` | ~4.6 GB | skips jadx's ~2.3 GB xref graph (see below) |
+  | `lean = true` | **~120 MB** | model dropped after export; served from disk |
 
   jadx builds a global cross-reference (usage) graph at load — ~2.3 GB of it for a large APK — that powers
-  precise find-usages (`gr`) and single-use anonymous-class inlining. On a memory-constrained server
-  set `usage = false` to skip it: `gr` then falls back to a fast name-based text search, and anonymous
-  classes aren't inlined. The rest of the floor is jadx's parsed model + dex buffers, which must stay
-  in RAM for on-demand decompilation.
+  precise find-usages (`gr`) and single-use anonymous-class inlining. Set `usage = false` to skip it:
+  `gr` then falls back to a fast name-based text search, and anonymous classes aren't inlined.
+
+  **Lean mode (`lean = true`)** goes further: once the on-load export is written, jadxnvim drops jadx's
+  entire in-memory model and serves the class tree, code view and search straight from the on-disk
+  export — steady-state RAM falls to a few hundred MB. The model is rebuilt on demand (one-time, and
+  you'll see a notice) the first time you go-to-def, find-usages, view smali, or rename. Browsing and
+  search never trigger a reload. Note: the *export itself* still needs the full model in memory, so
+  peak memory during the one-time indexing is unchanged — lean mode wins on steady state, and pairs
+  well with a cached export. Implies `usage = false`; requires `export = true`.
 
 ## Build the daemon
 

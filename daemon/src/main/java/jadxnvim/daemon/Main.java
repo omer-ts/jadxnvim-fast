@@ -27,6 +27,7 @@ public final class Main {
 		boolean export = true;
 		boolean temp = false;
 		boolean noUsage = false;
+		boolean lean = false;
 		String rgPath = null;
 		for (int i = 0; i < argv.length; i++) {
 			String a = argv[i];
@@ -36,6 +37,8 @@ public final class Main {
 				temp = true;
 			} else if ("--no-usage".equals(a)) {
 				noUsage = true;
+			} else if ("--lean".equals(a)) {
+				lean = true;
 			} else if ("--rg".equals(a) && i + 1 < argv.length) {
 				rgPath = argv[++i];
 			} else if (a != null && a.startsWith("--rg=")) {
@@ -53,6 +56,7 @@ public final class Main {
 			session.setExport(export);
 			session.setTemp(temp);
 			session.setNoUsage(noUsage);
+			session.setLean(lean);
 			try {
 				session.loadProject(null);
 			} catch (Exception e) {

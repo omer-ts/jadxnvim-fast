@@ -43,6 +43,11 @@ M.config = {
   -- and ~20 s of load time. Set false to save that memory on constrained servers; find-usages then
   -- falls back to a name-based text search and anonymous classes aren't inlined.
   usage = true,
+  -- Lean mode: after the on-load export finishes, drop jadx's in-memory model and serve browsing,
+  -- search and the class tree entirely from the on-disk export — RAM falls to a few hundred MB on a
+  -- 400k-class APK. The model is rebuilt on demand (one-time) the first time you go-to-def, find
+  -- usages, view smali, or edit. Implies usage = false. Requires export = true.
+  lean = false,
   -- Global keymaps for the fuzzy finders. Set a value to false to skip mapping it.
   -- Bound to literal <Space> by default (works regardless of your mapleader).
   keys = {
@@ -104,6 +109,18 @@ local function setup_load_handlers()
         vim.notify("[jadxnvim] load failed: " .. tostring(p and p.message), vim.log.levels.ERROR)
       end)
     end
+  end)
+  -- Lean mode lifecycle: the daemon dropped its in-memory model (low RAM), or is rebuilding it for a
+  -- semantic op (go-to-def / usages / smali / edit) — the latter can take a while on a huge APK.
+  rpc.on("modelUnloaded", function()
+    vim.schedule(function()
+      vim.notify("[jadxnvim] lean mode: model unloaded, serving from disk (low memory)", vim.log.levels.INFO)
+    end)
+  end)
+  rpc.on("modelReloading", function()
+    vim.schedule(function()
+      vim.notify("[jadxnvim] re-materializing the jadx model (one-time) for a semantic operation…", vim.log.levels.WARN)
+    end)
   end)
 end
 
@@ -241,6 +258,11 @@ function M.open(project, opts)
   if not has_heap then
     table.insert(cmd, "-XX:MaxRAMPercentage=70.0")
   end
+  if M.config.lean == true then
+    -- Lean mode's whole point is a small steady-state footprint, so tell G1 to actually hand the
+    -- big export-time heap back to the OS once the model is dropped (default ratios keep it mapped).
+    vim.list_extend(cmd, { "-XX:MinHeapFreeRatio=5", "-XX:MaxHeapFreeRatio=25", "-XX:G1PeriodicGCInterval=5000" })
+  end
   vim.list_extend(cmd, M.config.java_args)
   vim.list_extend(cmd, { "-jar", M.config.jar, project })
   if not will_export then
@@ -251,6 +273,9 @@ function M.open(project, opts)
   end
   if M.config.usage == false then
     table.insert(cmd, "--no-usage")
+  end
+  if M.config.lean == true then
+    table.insert(cmd, "--lean")
   end
   local rg = M.config.rg
   if not rg or rg == "" then

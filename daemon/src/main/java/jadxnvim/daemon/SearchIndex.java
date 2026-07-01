@@ -52,6 +52,17 @@ final class SearchIndex {
 		return codeLoc.containsKey(id);
 	}
 
+	/** All indexed top-level classes as {id, fullName} — lets the tree be built without the model. */
+	List<String[]> classEntries() {
+		List<String[]> out = new java.util.ArrayList<>();
+		for (ShardMeta m : shards) {
+			for (int j = 0; j < m.size; j++) {
+				out.add(new String[] { m.id[j], m.fullName[j] });
+			}
+		}
+		return out;
+	}
+
 	/** Read a class's exported decompiled code straight from its shard (seek + read), or null. */
 	String codeOf(String id) {
 		long[] loc = codeLoc.get(id);
