@@ -128,6 +128,7 @@ Extra args after the project are passed through to `nvim`.
 | `:JadxTree`            | Focus the project tree                                          |
 | `:JadxGotoPackage {p}` | Jump the tree to a package (Tab-completes package names)         |
 | `:JadxGotoSource [f]`  | Jump a stack-trace frame `Class(File.java:line)` to its smali source line |
+| `:JadxGotoSourceJava [f]` | Same, but open the decompiled Java at the nearest position (the method) |
 | `:JadxDef`             | Go to definition of the symbol under the cursor                 |
 | `:JadxUsages`          | Find usages of the symbol under the cursor (xref, browsable + preview) |
 | `:JadxSearch [text]`   | Full-text search across decompiled code (streamed → quickfix)   |
@@ -174,7 +175,7 @@ In a **code** buffer (`jadx://<class>`, read-only `java`):
 
 | Key          | Action                         |
 | ------------ | ------------------------------ |
-| `gd`         | Go to definition               |
+| `gd`         | Go to definition (falls back to class/method name search if unresolved) |
 | `gr`         | Find usages (xref) — browsable list with preview |
 | `<Tab>`      | Toggle Java ⟷ Smali (syncs to the same method; remembers each pane's cursor) |
 | `<leader>jr` | Rename                         |

@@ -99,7 +99,14 @@ vim.api.nvim_create_user_command("JadxGotoSource", function(opts)
   require("jadxnvim.stack").goto_source(opts.args)
 end, {
   nargs = "?",
-  desc = "jadxnvim: jump to a stack-trace frame's source line (Class(File.java:line))",
+  desc = "jadxnvim: jump a stack-trace frame to its smali source line (Class(File.java:line))",
+})
+
+vim.api.nvim_create_user_command("JadxGotoSourceJava", function(opts)
+  require("jadxnvim.stack").goto_source_java(opts.args)
+end, {
+  nargs = "?",
+  desc = "jadxnvim: jump a stack-trace frame to the decompiled Java (nearest position/method)",
 })
 
 vim.api.nvim_create_user_command("JadxRename", function()
