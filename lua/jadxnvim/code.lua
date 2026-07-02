@@ -28,9 +28,9 @@ local function res_filetype(name)
   return nil
 end
 
-local function fetch(method, id)
+local function fetch(method, value, key)
   local done, result, errm = false, nil, nil
-  rpc.request(method, { id = id }, function(err, res)
+  rpc.request(method, { [key or "id"] = value }, function(err, res)
     errm, result, done = err, res, true
   end)
   vim.wait(20000, function()
@@ -142,7 +142,7 @@ local function fill_smali(bufnr, id)
 end
 
 local function fill_resource(bufnr, name)
-  local err, result = fetch("getResource", name)
+  local err, result = fetch("getResource", name, "name")
   vim.bo[bufnr].modifiable = true
   if err then
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
