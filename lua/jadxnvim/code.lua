@@ -475,6 +475,42 @@ function M.cursor_target()
   return id, pos[1], ok and charcol or pos[2]
 end
 
+--- After an edit shifts lines (a rename/comment inserts a `/* renamed from */` etc. comment above
+--- the symbol), move the cursor back onto `word` — the occurrence closest to `near_line` — so a
+--- follow-up action lands on the same symbol instead of the now-shifted comment line.
+function M.recenter(win, bufnr, word, near_line)
+  if not (word and word ~= "" and bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+    return
+  end
+  if not (win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == bufnr) then
+    return
+  end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local best_line, best_col, best_d
+  for i, l in ipairs(lines) do
+    local from = 1
+    while true do
+      local s, e = l:find(word, from, true)
+      if not s then
+        break
+      end
+      local before = s > 1 and l:sub(s - 1, s - 1) or ""
+      local after = l:sub(e + 1, e + 1)
+      if not before:match("[%w_$]") and not after:match("[%w_$]") then
+        local d = math.abs(i - (near_line or i))
+        if not best_d or d < best_d then
+          best_line, best_col, best_d = i, s, d
+        end
+        break -- one (word-bounded) hit per line is enough
+      end
+      from = e + 1
+    end
+  end
+  if best_line then
+    pcall(vim.api.nvim_win_set_cursor, win, { best_line, best_col - 1 })
+  end
+end
+
 --- Reload every open Java code buffer (after a rename/comment changes code data).
 function M.refresh_all()
   for _, b in ipairs(vim.api.nvim_list_bufs()) do

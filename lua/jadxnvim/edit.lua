@@ -19,6 +19,8 @@ function M.rename()
   if not id then
     return
   end
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
   local current = vim.fn.expand("<cword>")
   vim.ui.input({ prompt = "Rename to: ", default = current }, function(new_name)
     if not new_name or new_name == "" or new_name == current then
@@ -31,6 +33,9 @@ function M.rename()
           return
         end
         code.refresh_all()
+        -- the edit inserts a comment above the symbol, shifting it down; follow the new name so a
+        -- second rename doesn't land on the now-stale comment line.
+        code.recenter(win, buf, new_name, line)
         vim.notify("[jadxnvim] renamed to '" .. new_name .. "' (saved to project)", vim.log.levels.INFO)
       end)
     end)
@@ -42,6 +47,9 @@ function M.comment()
   if not id then
     return
   end
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
+  local cword = vim.fn.expand("<cword>")
   vim.ui.input({ prompt = "Comment (empty to clear): " }, function(text)
     if text == nil then
       return
@@ -53,6 +61,7 @@ function M.comment()
           return
         end
         code.refresh_all()
+        code.recenter(win, buf, cword, line) -- the comment shifts lines; stay on the same symbol
         local what = (text == "") and "comment cleared" or "comment saved"
         vim.notify("[jadxnvim] " .. what .. " (saved to project)", vim.log.levels.INFO)
       end)
