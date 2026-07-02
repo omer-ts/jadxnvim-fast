@@ -71,6 +71,10 @@ cd daemon
 
 On Windows: `./gradlew.bat shadowJar`.
 
+After pulling changes that add daemon features, rebuild the jar and restart Neovim (the daemon runs
+for the life of a Neovim session). If the plugin ever warns that *"the jadxd daemon is out of date"*,
+it means a running daemon predates a method the plugin needs — rebuild as above and restart.
+
 ## Install the plugin (optional)
 
 You only need this if you want the `:Jadx` commands available in your normal Neovim sessions — the
@@ -152,6 +156,12 @@ is bound to these global keys when a project is open:
 | `<Space>fc` | classes                                                       |
 | `<Space>fd` | methods (jumps to the declaration)                            |
 | `<Space>fv` | everything — classes + methods + text in one list (jadx-gui-style) |
+| `<Space>fs` | **search history** — reopen or delete past searches / xrefs (also `:JadxHistory`) |
+
+**Search history:** every text search, xref (find-usages), class/method search is recorded. `<Space>fs`
+opens a history list — each entry shows its type icon, query + count, and age, with a preview of its
+results. `<CR>` reopens the full result set (after you closed it), `<C-x>` / `dd` deletes an entry,
+`<C-l>` clears all.
 
 In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` (`<C-d>`/`<C-u>` to page) to move,
 `<CR>` to open, `<Esc>` to cancel. A **syntax-highlighted preview** of the highlighted result is
@@ -223,7 +233,8 @@ All v1 milestones are implemented and tested against real APKs (incl. a 136 MB /
 - [x] Cross-references (go-to-definition, find-usages)
 - [x] Search (class/method/field names, and ripgrep full-text over an on-load export — fast on
       400k-class APKs, cached, with results re-located onto the live decompiled line)
-- [x] Saved searches ("search tabs"): reopen or close past text searches / xrefs (`<Space>fs`)
+- [x] Search history: reopen (with results) or delete past text searches / xrefs / name searches,
+      with per-entry result previews (`<Space>fs` / `:JadxHistory`)
 - [x] Class / method finders stream matches server-side (query-driven), scanning the raw parsed
       model (`getClassNode().getMethods()`, like jadx-gui) so no class is decompiled during a name
       search — sub-second on a 400k-class APK with no OOM, even without the export. Once the on-load
