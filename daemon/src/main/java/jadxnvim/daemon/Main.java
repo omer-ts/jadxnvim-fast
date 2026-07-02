@@ -66,6 +66,8 @@ public final class Main {
 		}
 
 		rpc.loop(System.in);
+		// stdin closed (client gone) — exit promptly rather than lingering on any non-daemon thread.
+		System.exit(0);
 	}
 
 	private Main() {

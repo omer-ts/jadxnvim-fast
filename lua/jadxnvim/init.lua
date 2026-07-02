@@ -201,7 +201,13 @@ local function ensure_setup()
     M._session_autocmd = true
     vim.api.nvim_create_autocmd("VimLeavePre", {
       group = vim.api.nvim_create_augroup("jadxnvim_session", { clear = true }),
-      callback = save_session,
+      callback = function()
+        save_session()
+        -- Terminate the daemon ourselves so Nvim doesn't stall its exit sequence reaping a still-
+        -- running child (the cause of a hang on :q after a big index).
+        progress.finish()
+        pcall(rpc.stop)
+      end,
     })
   end
 end
