@@ -16,3 +16,6 @@ samples/
 # Editor / OS
 *.swp
 .DS_Store
+
+# git-bash crash dumps
+*.stackdump

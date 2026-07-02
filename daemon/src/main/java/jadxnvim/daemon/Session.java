@@ -144,6 +144,16 @@ public final class Session {
 	}
 
 	public Object dispatch(String method, JsonObject params) throws Exception {
+		// RPC dispatch is single-threaded, so this lock only serializes ops against the background
+		// export thread's unloadModel()/reloadModel() (also synchronized) — preventing a model
+		// use-after-close race at the export->unload transition in lean mode. Reentrant, so nested
+		// ensureLoaded()/reloadModel() calls are fine.
+		synchronized (this) {
+			return dispatch0(method, params);
+		}
+	}
+
+	private Object dispatch0(String method, JsonObject params) throws Exception {
 		switch (method) {
 			case "loadProject":
 				return loadProject(str(params, "path"));
