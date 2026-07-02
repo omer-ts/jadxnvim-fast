@@ -45,35 +45,114 @@ local function collect_names(kind, term, cb)
   end)
 end
 
--- gd fallback: some symbols don't resolve via getJavaNodeAtPosition, but the identifier under the
--- cursor can still be found by name. Try an exact class match, then an exact method match, and jump.
-local function goto_def_fallback(word)
+-- The identifier under the cursor plus the dotted qualifier before it on the same chain:
+-- `Foo.bar` -> ("bar","Foo"); `com.pkg.Foo` -> ("Foo","com.pkg"); bare `x` -> ("x","").
+local function qualified_at_cursor()
+  local word = vim.fn.expand("<cword>")
+  local line = vim.api.nvim_get_current_line()
+  local n = #line
+  local ci = vim.api.nvim_win_get_cursor(0)[2] + 1 -- 1-based byte col at cursor
+  if n == 0 or word == "" or ci > n or not line:sub(ci, ci):match("[%w_$.]") then
+    return word, ""
+  end
+  local a = ci
+  while a > 1 and line:sub(a - 1, a - 1):match("[%w_$.]") do
+    a = a - 1
+  end
+  local chain = line:sub(a):match("^[%w_$.]+") or ""
+  local rel = ci - a + 1 -- cursor position within the chain
+  local acc, idx = {}, 1
+  while idx <= #chain + 1 do
+    local dot = chain:find("%.", idx) or (#chain + 1)
+    if rel >= idx and rel <= dot then
+      return chain:sub(idx, dot - 1), table.concat(acc, ".")
+    end
+    acc[#acc + 1] = chain:sub(idx, dot - 1)
+    idx = dot + 1
+  end
+  return word, ""
+end
+
+local function short_name(fn)
+  return (fn or ""):match("[^.]+$")
+end
+local function method_name(it)
+  return (it.fullName or ""):match("^%s*(.-)%s*·")
+end
+local function method_class(it)
+  return (it.fullName or ""):match("·%s*(.+)$")
+end
+local function open_class(it, why)
+  notify("gd: resolved " .. why .. " by name search", vim.log.levels.INFO)
+  code.open(it.id)
+end
+local function open_method(it, why, name)
+  notify("gd: resolved " .. why .. " by name search", vim.log.levels.INFO)
+  rpc.request("memberPos", { id = it.id, index = it.index }, function(e, r)
+    vim.schedule(function()
+      code.open(it.id, { line = r and r.line or 1, col = r and r.col or 0, find_method = name })
+    end)
+  end)
+end
+
+-- Bare resolution: exact short class name, then exact method name (any class).
+local function bare_resolve(word, classes)
+  for _, it in ipairs(classes) do
+    if short_name(it.fullName) == word then
+      return open_class(it, "class '" .. word .. "'")
+    end
+  end
+  collect_names("method", word, function(methods)
+    for _, it in ipairs(methods) do
+      if method_name(it) == word then
+        return open_method(it, "method '" .. word .. "'", word)
+      end
+    end
+    notify("no definition for '" .. word .. "' (try <Space>fv)", vim.log.levels.WARN)
+  end)
+end
+
+-- gd fallback: the symbol didn't resolve via getJavaNodeAtPosition, so find it by name — using the
+-- qualified context (Class.member / pkg.Class) to pick the right class/member rather than any match.
+local function goto_def_fallback(word, qualifier)
   if not word or word == "" then
     notify("no definition under cursor", vim.log.levels.WARN)
     return
   end
+  local prefix = (qualifier ~= "") and (qualifier .. "." .. word) or word
   collect_names("class", word, function(classes)
+    -- 1. fully-qualified class name (com.pkg.Foo)
     for _, it in ipairs(classes) do
-      if ((it.fullName or ""):match("[^.]+$")) == word then -- exact short class name
-        notify("gd: resolved '" .. word .. "' by class-name search", vim.log.levels.INFO)
-        code.open(it.id)
-        return
+      if it.fullName == prefix then
+        return open_class(it, "class '" .. prefix .. "'")
       end
     end
-    collect_names("method", word, function(methods)
-      for _, it in ipairs(methods) do
-        local mname = (it.fullName or ""):match("^%s*(.-)%s*·")
-        if mname == word then -- exact method name
-          notify("gd: resolved '" .. word .. "' by method-name search", vim.log.levels.INFO)
-          rpc.request("memberPos", { id = it.id, index = it.index }, function(e, r)
-            vim.schedule(function()
-              code.open(it.id, { line = r and r.line or 1, col = r and r.col or 0, find_method = word })
-            end)
-          end)
-          return
+    if qualifier == "" then
+      return bare_resolve(word, classes)
+    end
+    -- 2. qualified member: resolve the qualifier as a class, then find `word` inside it
+    local qs = short_name(qualifier)
+    collect_names("class", qs, function(qclasses)
+      local qcls
+      for _, it in ipairs(qclasses) do
+        if it.fullName == qualifier or short_name(it.fullName) == qs then
+          qcls = it
+          break
         end
       end
-      notify("no definition for '" .. word .. "' (try <Space>fv)", vim.log.levels.WARN)
+      if not qcls then
+        return bare_resolve(word, classes) -- qualifier isn't a class (e.g. a local variable)
+      end
+      collect_names("method", word, function(methods)
+        for _, it in ipairs(methods) do
+          if method_name(it) == word and it.id == qcls.id then -- `word` method of the qualifier class
+            return open_method(it, "method '" .. qualifier .. "." .. word .. "'", word)
+          end
+        end
+        -- `word` is a field/other member -> open the qualifier class positioned at it
+        notify("gd: opened class '" .. qualifier .. "' for member '" .. word .. "'", vim.log.levels.INFO)
+        code.open(qcls.id, { find_method = word })
+      end)
     end)
   end)
 end
@@ -84,7 +163,7 @@ function M.goto_def()
     notify("not in a jadx code buffer", vim.log.levels.WARN)
     return
   end
-  local word = vim.fn.expand("<cword>")
+  local word, qualifier = qualified_at_cursor()
   rpc.request("gotoDef", { id = id, line = line, col = col }, function(err, res)
     if err then
       vim.schedule(function()
@@ -94,7 +173,7 @@ function M.goto_def()
     end
     vim.schedule(function()
       if not res.found then
-        goto_def_fallback(word) -- couldn't resolve semantically; fall back to name search
+        goto_def_fallback(word, qualifier) -- couldn't resolve semantically; fall back to name search
         return
       end
       code.open(res.id, { line = res.line, col = res.col })
