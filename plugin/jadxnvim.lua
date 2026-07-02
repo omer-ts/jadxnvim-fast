@@ -75,6 +75,11 @@ vim.api.nvim_create_user_command("JadxSearches", function()
   require("jadxnvim.searches").manager()
 end, { desc = "jadxnvim: reopen/close saved searches (search tabs)" })
 
+-- Discoverable alias for the same search-history manager.
+vim.api.nvim_create_user_command("JadxHistory", function()
+  require("jadxnvim.searches").manager()
+end, { desc = "jadxnvim: search history — reopen or delete past searches/xrefs" })
+
 vim.api.nvim_create_user_command("JadxSearchesClear", function()
   require("jadxnvim.searches").clear()
 end, { desc = "jadxnvim: close all saved searches" })

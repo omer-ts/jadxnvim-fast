@@ -93,6 +93,7 @@ local function name_finder(kind, title, prompt, on_select, previewer)
               handle.done()
               if #collected > 0 then
                 searches.record({
+                  kind = kind,
                   title = string.format(" %s '%s' (%d) ", vim.trim(title), term, #collected),
                   items = collected,
                   previewer = previewer,
@@ -186,6 +187,7 @@ function M.text()
               handle.done()
               if #collected > 0 then
                 searches.record({
+                  kind = "text",
                   title = string.format(" Text: %s (%d) ", term, #collected),
                   items = collected,
                   previewer = preview.class(),
@@ -311,6 +313,7 @@ function M.combined()
             handle.done()
             if #collected > 0 then
               searches.record({
+                kind = "text",
                 title = string.format(" Search '%s' (%d) ", term, #collected),
                 items = collected,
                 previewer = combined_previewer(),
