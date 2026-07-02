@@ -228,6 +228,27 @@ local function locate_line(bufnr, snippet, approx)
   return best or approx
 end
 
+-- Locate a method declaration line by name (nearest `approx`): `name(` at a word boundary that
+-- isn't a call. Keeps navigation on the real declaration even if this buffer's copy decompiled
+-- slightly differently from the position the daemon computed.
+local function locate_method_line(bufnr, name, approx)
+  if not name or name == "" then
+    return approx
+  end
+  local esc = vim.pesc(name)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local best, best_dist
+  for i, l in ipairs(lines) do
+    if l:find("[^%w_.]" .. esc .. "%s*%(") or l:find("^%s*" .. esc .. "%s*%(") then
+      local d = math.abs(i - (approx or i))
+      if not best_dist or d < best_dist then
+        best, best_dist = i, d
+      end
+    end
+  end
+  return best or approx
+end
+
 local function open_named(name, opts)
   opts = opts or {}
   local win = M.target_win()
@@ -236,6 +257,9 @@ local function open_named(name, opts)
   local bufnr = vim.api.nvim_get_current_buf()
   if opts.find then
     opts.line = locate_line(bufnr, opts.find, opts.line)
+  end
+  if opts.find_method then
+    opts.line = locate_method_line(bufnr, opts.find_method, opts.line)
   end
   if opts.line then
     local lnum = math.max(1, opts.line)

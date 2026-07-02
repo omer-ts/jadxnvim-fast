@@ -57,24 +57,52 @@ function M.class()
   end
 end
 
---- Previewer for methods: resolves the declaration line via memberPos (cached on the item).
+-- Find the declaration line of method `name` nearest `approx`: a line with `name(` at a word
+-- boundary that isn't a call (`obj.name(`). memberPos gives a good approx; this snaps onto the
+-- actual declaration in the *shown* code, so the preview is right even if that copy was decompiled
+-- slightly differently from the one memberPos measured.
+local function locate_method(lines, name, approx)
+  if not name or name == "" then
+    return approx or 1
+  end
+  local esc = vim.pesc(name)
+  local best, best_dist
+  for i, l in ipairs(lines) do
+    local at = l:find("[^%w_.]" .. esc .. "%s*%(") or l:find("^%s*" .. esc .. "%s*%(")
+    if at then
+      local d = math.abs(i - (approx or i))
+      if not best_dist or d < best_dist then
+        best, best_dist = i, d
+      end
+    end
+  end
+  return best or approx or 1
+end
+
+--- Previewer for methods: shows the class code centered on the method's declaration. Uses memberPos
+--- as an approximate line, then relocates onto the declaration within the shown code.
 function M.method()
   local cache = {}
   return function(item, render)
     if not item or not item.id then
       return
     end
+    -- method name is the part before the "  ·  " class separator in the label
+    local name = item.name or (item.text and item.text:match("^%s*(.-)%s*·"))
     M.class_lines(cache, item.id, function(lines)
       if not lines then
         return
       end
+      local function show(approx)
+        render({ lines = lines, filetype = "java", line = locate_method(lines, name, approx) })
+      end
       if item._line then
-        render({ lines = lines, filetype = "java", line = item._line })
+        show(item._line)
         return
       end
       rpc.request("memberPos", { id = item.id, index = item.index }, function(e, r)
         item._line = (not e and r) and r.line or 1
-        render({ lines = lines, filetype = "java", line = item._line })
+        show(item._line)
       end)
     end)
   end

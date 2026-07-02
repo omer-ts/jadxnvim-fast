@@ -54,6 +54,7 @@ M.config = {
     find_text = "<Space>ff",
     find_classes = "<Space>fc",
     find_methods = "<Space>fd",
+    find_combined = "<Space>fg",
     saved_searches = "<Space>fs",
   },
 }
@@ -81,6 +82,7 @@ local function map_finders()
   map(keys.find_text, function() require("jadxnvim.find").text() end, "jadx: fuzzy find text")
   map(keys.find_classes, function() require("jadxnvim.find").classes() end, "jadx: fuzzy find classes")
   map(keys.find_methods, function() require("jadxnvim.find").methods() end, "jadx: fuzzy find methods")
+  map(keys.find_combined, function() require("jadxnvim.find").combined() end, "jadx: combined search")
   map(keys.saved_searches, function() require("jadxnvim.searches").manager() end, "jadx: saved searches")
 end
 

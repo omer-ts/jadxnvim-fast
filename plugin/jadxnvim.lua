@@ -71,6 +71,10 @@ vim.api.nvim_create_user_command("JadxFindText", function(opts)
   require("jadxnvim.find").text(opts.args)
 end, { nargs = "?", desc = "jadxnvim: fuzzy-find across full-text search results" })
 
+vim.api.nvim_create_user_command("JadxFindAll", function()
+  require("jadxnvim.find").combined()
+end, { desc = "jadxnvim: combined search (classes + methods + text)" })
+
 vim.api.nvim_create_user_command("JadxRename", function()
   require("jadxnvim.edit").rename()
 end, { desc = "jadxnvim: rename symbol under cursor (persists to .jadx)" })
