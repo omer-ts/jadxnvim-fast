@@ -258,14 +258,30 @@ final class SearchIndex {
 			shardsDir.mkdirs();
 			namesDir.mkdirs();
 			xrefDir.mkdirs();
+			try {
+				for (int i = 0; i < SHARDS; i++) {
+					writers[i] = open(new File(shardsDir, shardName(i)), append);
+					clsWriters[i] = open(new File(namesDir, classesName(i)), append);
+					mthWriters[i] = open(new File(namesDir, methodsName(i)), append);
+					refWriters[i] = open(new File(xrefDir, refsName(i)), append);
+					declWriters[i] = open(new File(xrefDir, declsName(i)), append);
+					locks[i] = new Object();
+					meta[i] = new ShardMeta();
+				}
+			} catch (IOException e) {
+				// don't leak the writers already opened if one open() fails mid-construction
+				closeWriters();
+				throw e;
+			}
+		}
+
+		private void closeWriters() {
 			for (int i = 0; i < SHARDS; i++) {
-				writers[i] = open(new File(shardsDir, shardName(i)), append);
-				clsWriters[i] = open(new File(namesDir, classesName(i)), append);
-				mthWriters[i] = open(new File(namesDir, methodsName(i)), append);
-				refWriters[i] = open(new File(xrefDir, refsName(i)), append);
-				declWriters[i] = open(new File(xrefDir, declsName(i)), append);
-				locks[i] = new Object();
-				meta[i] = new ShardMeta();
+				closeQuietly(writers[i]);
+				closeQuietly(clsWriters[i]);
+				closeQuietly(mthWriters[i]);
+				closeQuietly(refWriters[i]);
+				closeQuietly(declWriters[i]);
 			}
 		}
 
@@ -404,13 +420,7 @@ final class SearchIndex {
 
 		/** Close shard files and write the persisted line index + signature; returns the index. */
 		SearchIndex finish(File metaDir, long signature) throws IOException {
-			for (int i = 0; i < SHARDS; i++) {
-				closeQuietly(writers[i]);
-				closeQuietly(clsWriters[i]);
-				closeQuietly(mthWriters[i]);
-				closeQuietly(refWriters[i]);
-				closeQuietly(declWriters[i]);
-			}
+			closeWriters();
 			writeIdx(metaDir);
 			atomicWrite(new File(metaDir, ".sig"), Long.toString(signature).getBytes(StandardCharsets.UTF_8));
 			return new SearchIndex(shardsDir, namesDir, xrefDir, meta);
