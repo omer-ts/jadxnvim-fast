@@ -559,8 +559,10 @@ public final class Session {
 		SearchIndex.Builder builder = null;
 		if (checkpointMatches(progressFile, sig) && new File(mDir, ".pos").isFile()) {
 			try {
-				loadDoneSet(doneFile, doneAll);
 				builder = SearchIndex.Builder.resume(idxDir, nmDir, xrDir, mDir);
+				// The committed index (resumed from the atomic .pos) IS the done set — a single source
+				// of truth, so .pos and "what to skip" can never disagree after a crash.
+				doneAll.addAll(builder.committedIds());
 				emitter.emit("loadProgress", Map.of("done", doneAll.size(), "total", total, "percent",
 						total == 0 ? 0 : (int) ((long) doneAll.size() * 100 / total), "resumed", true));
 			} catch (Exception e) {
@@ -576,6 +578,7 @@ public final class Session {
 			deleteDir(mDir);
 			builder = new SearchIndex.Builder(idxDir, nmDir, xrDir);
 		}
+		mDir.mkdirs(); // .progress/.pos/.idx live here; ensure it exists before the first checkpoint write
 		if (total == 0) {
 			return builder.finish(mDir, sig);
 		}
@@ -651,11 +654,12 @@ public final class Session {
 				if (cancel.get()) {
 					return null;
 				}
-				// checkpoint: no workers active now, so positions match what's on disk
+				// checkpoint: no workers active now, so positions match what's on disk. Write the
+				// (cosmetic) progress gate first, then checkpoint() commits atomically via .pos last —
+				// so the last durable write is always the authoritative one.
 				doneAll.addAll(batchIds);
-				b.checkpoint(mDir);
-				writeDoneSet(doneFile, doneAll);
 				writeProgress(progressFile, doneAll.size(), total, sig);
+				b.checkpoint(mDir);
 			}
 		} finally {
 			pool.shutdown();
@@ -681,25 +685,6 @@ public final class Session {
 		} catch (Exception e) {
 			return false;
 		}
-	}
-
-	private static void loadDoneSet(File f, java.util.Set<String> out) throws IOException {
-		if (!f.isFile()) {
-			return;
-		}
-		for (String ln : Files.readAllLines(f.toPath(), StandardCharsets.UTF_8)) {
-			if (!ln.isEmpty()) {
-				out.add(ln);
-			}
-		}
-	}
-
-	private static void writeDoneSet(File f, java.util.Set<String> ids) throws IOException {
-		StringBuilder sb = new StringBuilder(ids.size() * 24);
-		for (String id : ids) {
-			sb.append(id).append('\n');
-		}
-		Files.write(f.toPath(), sb.toString().getBytes(StandardCharsets.UTF_8));
 	}
 
 	private static void writeProgress(File f, int done, int total, long sig) throws IOException {

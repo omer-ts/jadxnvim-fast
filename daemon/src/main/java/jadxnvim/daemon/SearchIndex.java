@@ -7,6 +7,7 @@ import java.io.RandomAccessFile;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -160,6 +161,16 @@ final class SearchIndex {
 			size++;
 		}
 
+		// Drop trailing entries whose bytes fall beyond maxBytes. Entries are appended in ascending
+		// byteStart order, so trimming from the end is exact. Used on resume: a crash mid-checkpoint
+		// can leave the .idx snapshot one batch ahead of the committed .pos position; those extra
+		// entries point past the truncated shard data and must be dropped (else codeOf reads garbage).
+		void truncateToByte(long maxBytes) {
+			while (size > 0 && byteStart[size - 1] + byteLen[size - 1] > maxBytes) {
+				size--;
+			}
+		}
+
 		// Largest index whose startLine <= line, or -1.
 		int find(int line) {
 			int lo = 0;
@@ -293,8 +304,23 @@ final class SearchIndex {
 				b.byteCount[i] = codeB[i];
 				b.lineCount[i] = codeL[i];
 				loadMeta(new File(metaDir, String.format("s%03d.idx", i)), b.meta[i]);
+				// .idx may be one checkpoint ahead of .pos if a crash landed mid-checkpoint; keep only
+				// entries within the committed shard data so meta and the truncated shards agree.
+				b.meta[i].truncateToByte(codeB[i]);
 			}
 			return b;
+		}
+
+		/** The class ids currently committed to the (possibly resumed) index — the resume "done" set. */
+		java.util.Set<String> committedIds() {
+			java.util.Set<String> out = new java.util.HashSet<>();
+			for (int i = 0; i < SHARDS; i++) {
+				ShardMeta m = meta[i];
+				for (int j = 0; j < m.size; j++) {
+					out.add(m.id[j]);
+				}
+			}
+			return out;
 		}
 
 		private static void truncate(File f, long len) {
@@ -386,8 +412,7 @@ final class SearchIndex {
 				closeQuietly(declWriters[i]);
 			}
 			writeIdx(metaDir);
-			Files.write(new File(metaDir, ".sig").toPath(),
-					Long.toString(signature).getBytes(StandardCharsets.UTF_8));
+			atomicWrite(new File(metaDir, ".sig"), Long.toString(signature).getBytes(StandardCharsets.UTF_8));
 			return new SearchIndex(shardsDir, namesDir, xrefDir, meta);
 		}
 
@@ -404,6 +429,10 @@ final class SearchIndex {
 				refWriters[i].flush();
 				declWriters[i].flush();
 			}
+			// .idx snapshots first (each written atomically), then .pos LAST as the single commit
+			// point: resume only trusts what .pos records, and drops any .idx entries beyond it. A
+			// crash before .pos lands leaves the previous .pos intact, so the interrupted batch is
+			// simply re-indexed — never duplicated, never read at a stale offset.
 			writeIdx(metaDir);
 			StringBuilder pos = new StringBuilder();
 			for (int i = 0; i < SHARDS; i++) {
@@ -414,7 +443,7 @@ final class SearchIndex {
 						.append(new File(xrefDir, refsName(i)).length()).append('\t')
 						.append(new File(xrefDir, declsName(i)).length()).append('\n');
 			}
-			Files.write(new File(metaDir, ".pos").toPath(), pos.toString().getBytes(StandardCharsets.UTF_8));
+			atomicWrite(new File(metaDir, ".pos"), pos.toString().getBytes(StandardCharsets.UTF_8));
 		}
 
 		private void writeIdx(File metaDir) throws IOException {
@@ -428,8 +457,20 @@ final class SearchIndex {
 							.append(m.byteLen[j]).append('\t').append(m.id[j]).append('\t')
 							.append(m.fullName[j]).append('\n');
 				}
-				Files.write(new File(metaDir, String.format("s%03d.idx", i)).toPath(),
-						sb.toString().getBytes(StandardCharsets.UTF_8));
+				atomicWrite(new File(metaDir, String.format("s%03d.idx", i)), sb.toString().getBytes(StandardCharsets.UTF_8));
+			}
+		}
+
+		// Write via a temp file + atomic rename, so a crash mid-write never leaves a partial file: a
+		// reader sees either the old contents or the new, never a truncated line.
+		private static void atomicWrite(File f, byte[] data) throws IOException {
+			File tmp = new File(f.getParentFile(), f.getName() + ".tmp");
+			Files.write(tmp.toPath(), data);
+			try {
+				Files.move(tmp.toPath(), f.toPath(),
+						StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+			} catch (java.nio.file.AtomicMoveNotSupportedException e) {
+				Files.move(tmp.toPath(), f.toPath(), StandardCopyOption.REPLACE_EXISTING);
 			}
 		}
 
