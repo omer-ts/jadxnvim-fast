@@ -53,6 +53,9 @@ public final class Session {
 	private static final int MAX_USAGES = 5000;
 	// Bump when the on-disk export/name-index format or its index semantics change.
 	private static final long INDEX_FORMAT_VERSION = 5;
+	// RPC protocol/feature version, reported in the ready message. Bump when adding methods the
+	// plugin depends on (e.g. getResources) so an out-of-date daemon is detected on connect.
+	static final int PROTOCOL_VERSION = 2;
 
 	// Cache signature: changes if the input, the index format, OR the code data (renames/comments)
 	// change — a rename doesn't touch the input but must invalidate the export so it's rebuilt with
@@ -298,6 +301,7 @@ public final class Session {
 			info.put("renames", cd.getRenames() == null ? 0 : cd.getRenames().size());
 			info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
 			info.put("lean", true);
+			info.put("protocol", PROTOCOL_VERSION);
 			emitter.emit("ready", info);
 			emitter.emit("loadDone", Map.of("total", 0, "cached", true));
 			emitter.emit("modelUnloaded", Map.of("lean", true));
@@ -346,6 +350,7 @@ public final class Session {
 		info.put("classes", decompiler.getClassesWithInners().size());
 		info.put("renames", cd.getRenames() == null ? 0 : cd.getRenames().size());
 		info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
+		info.put("protocol", PROTOCOL_VERSION);
 		emitter.emit("ready", info);
 
 		if (export && !temp) {

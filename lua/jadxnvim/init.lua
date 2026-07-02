@@ -10,6 +10,10 @@ local session = require("jadxnvim.session")
 
 local M = {}
 
+-- Minimum daemon RPC protocol version this plugin needs. Must match Session.PROTOCOL_VERSION in the
+-- daemon; bump both together when the plugin starts depending on a new daemon method.
+M.PROTOCOL_VERSION = 2
+
 -- Plugin root: .../lua/jadxnvim/init.lua -> three levels up.
 local function plugin_root()
   local src = debug.getinfo(1, "S").source:sub(2)
@@ -306,6 +310,19 @@ function M.open(project, opts)
   M._loading_name = name
   progress.start("Loading " .. name)
   rpc.start(cmd, function(info)
+    -- Detect an out-of-date daemon (e.g. an old jadxd.jar that predates newer methods) up front,
+    -- so features like Resources fail with a clear message instead of a cryptic "unknown method".
+    if (info.protocol or 0) < M.PROTOCOL_VERSION then
+      vim.notify(
+        "[jadxnvim] the jadxd daemon is out of date (protocol "
+          .. tostring(info.protocol or "none")
+          .. ", this plugin needs "
+          .. M.PROTOCOL_VERSION
+          .. ").\nRebuild it:  cd daemon && ./gradlew shadowJar   (gradlew.bat on Windows)\n"
+          .. "then restart Neovim (or :JadxClose and reopen). Some features may not work until then.",
+        vim.log.levels.WARN
+      )
+    end
     -- Parse finished and the tree is ready. While exporting, keep the bar (it now shows the
     -- background decompile/export %); otherwise we're done loading.
     if not will_export then
