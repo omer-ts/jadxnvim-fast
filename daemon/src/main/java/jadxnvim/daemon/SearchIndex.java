@@ -26,13 +26,15 @@ final class SearchIndex {
 
 	private final File shardsDir;
 	private final File namesDir;
+	private final File xrefDir;
 	private final ShardMeta[] shards;
 	// class id -> {shardIndex, byteStart, byteLen} for reading a class's exported code off disk.
 	private final Map<String, long[]> codeLoc;
 
-	private SearchIndex(File shardsDir, File namesDir, ShardMeta[] shards) {
+	private SearchIndex(File shardsDir, File namesDir, File xrefDir, ShardMeta[] shards) {
 		this.shardsDir = shardsDir;
 		this.namesDir = namesDir;
+		this.xrefDir = xrefDir;
 		this.shards = shards;
 		this.codeLoc = new HashMap<>();
 		for (int i = 0; i < shards.length; i++) {
@@ -89,6 +91,15 @@ final class SearchIndex {
 		return namesDir;
 	}
 
+	/**
+	 * Directory of the cross-reference index ({@code ref_s*.txt} usages, {@code decl_s*.txt}
+	 * declarations), each line {@code key\tclassId\tline\tcol}. Backs disk go-to-def / find-usages
+	 * so lean mode answers them without the model. Null/absent means fall back to the model.
+	 */
+	File xrefDir() {
+		return xrefDir;
+	}
+
 	static String shardName(int i) {
 		return String.format("s%03d.txt", i);
 	}
@@ -99,6 +110,14 @@ final class SearchIndex {
 
 	static String methodsName(int i) {
 		return String.format("mth_s%03d.txt", i);
+	}
+
+	static String refsName(int i) {
+		return String.format("ref_s%03d.txt", i);
+	}
+
+	static String declsName(int i) {
+		return String.format("decl_s%03d.txt", i);
 	}
 
 	private static int shardOf(String id) {
@@ -201,19 +220,24 @@ final class SearchIndex {
 	static final class Builder {
 		private final File shardsDir;
 		private final File namesDir;
+		private final File xrefDir;
 		private final Writer[] writers = new Writer[SHARDS];
 		private final Writer[] clsWriters = new Writer[SHARDS];
 		private final Writer[] mthWriters = new Writer[SHARDS];
+		private final Writer[] refWriters = new Writer[SHARDS];
+		private final Writer[] declWriters = new Writer[SHARDS];
 		private final Object[] locks = new Object[SHARDS];
 		private final int[] lineCount = new int[SHARDS];
 		private final long[] byteCount = new long[SHARDS];
 		private final ShardMeta[] meta = new ShardMeta[SHARDS];
 
-		Builder(File shardsDir, File namesDir) throws IOException {
+		Builder(File shardsDir, File namesDir, File xrefDir) throws IOException {
 			this.shardsDir = shardsDir;
 			this.namesDir = namesDir;
+			this.xrefDir = xrefDir;
 			shardsDir.mkdirs();
 			namesDir.mkdirs();
+			xrefDir.mkdirs();
 			for (int i = 0; i < SHARDS; i++) {
 				writers[i] = Files.newBufferedWriter(new File(shardsDir, shardName(i)).toPath(),
 						StandardCharsets.UTF_8);
@@ -221,14 +245,19 @@ final class SearchIndex {
 						StandardCharsets.UTF_8);
 				mthWriters[i] = Files.newBufferedWriter(new File(namesDir, methodsName(i)).toPath(),
 						StandardCharsets.UTF_8);
+				refWriters[i] = Files.newBufferedWriter(new File(xrefDir, refsName(i)).toPath(),
+						StandardCharsets.UTF_8);
+				declWriters[i] = Files.newBufferedWriter(new File(xrefDir, declsName(i)).toPath(),
+						StandardCharsets.UTF_8);
 				locks[i] = new Object();
 				meta[i] = new ShardMeta();
 			}
 		}
 
-		// methodNames.get(i) is the name of the method at index i in JavaClass.getMethods(), so the
-		// index can be carried through the name files for lazy navigation (memberPos) on select.
-		void add(String id, String fullName, String code, List<String> methodNames) throws IOException {
+		// refLines/declLines are pre-formatted "key\tid\tline\tcol" cross-reference edges for this
+		// class (usages and declaration sites), written to the class's shard for rg to query later.
+		void add(String id, String fullName, String code, List<String> methodNames,
+				List<String> refLines, List<String> declLines) throws IOException {
 			if (code == null) {
 				code = "";
 			}
@@ -273,6 +302,20 @@ final class SearchIndex {
 						mw.write('\n');
 					}
 				}
+				if (refLines != null) {
+					Writer rw = refWriters[shard];
+					for (String ln : refLines) {
+						rw.write(ln);
+						rw.write('\n');
+					}
+				}
+				if (declLines != null) {
+					Writer dw = declWriters[shard];
+					for (String ln : declLines) {
+						dw.write(ln);
+						dw.write('\n');
+					}
+				}
 			}
 		}
 
@@ -282,6 +325,8 @@ final class SearchIndex {
 				closeQuietly(writers[i]);
 				closeQuietly(clsWriters[i]);
 				closeQuietly(mthWriters[i]);
+				closeQuietly(refWriters[i]);
+				closeQuietly(declWriters[i]);
 			}
 			metaDir.mkdirs();
 			for (int i = 0; i < SHARDS; i++) {
@@ -298,7 +343,7 @@ final class SearchIndex {
 			}
 			Files.write(new File(metaDir, ".sig").toPath(),
 					Long.toString(signature).getBytes(StandardCharsets.UTF_8));
-			return new SearchIndex(shardsDir, namesDir, meta);
+			return new SearchIndex(shardsDir, namesDir, xrefDir, meta);
 		}
 
 		private static void closeQuietly(Writer w) {
@@ -327,7 +372,7 @@ final class SearchIndex {
 		}
 	}
 
-	static SearchIndex load(File shardsDir, File namesDir, File metaDir) throws IOException {
+	static SearchIndex load(File shardsDir, File namesDir, File xrefDir, File metaDir) throws IOException {
 		ShardMeta[] shards = new ShardMeta[SHARDS];
 		for (int i = 0; i < SHARDS; i++) {
 			ShardMeta m = new ShardMeta();
@@ -356,6 +401,6 @@ final class SearchIndex {
 			}
 			shards[i] = m;
 		}
-		return new SearchIndex(shardsDir, namesDir, shards);
+		return new SearchIndex(shardsDir, namesDir, xrefDir, shards);
 	}
 }

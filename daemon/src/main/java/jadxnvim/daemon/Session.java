@@ -1,7 +1,10 @@
 package jadxnvim.daemon;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -24,6 +27,10 @@ import jadx.api.data.impl.JadxCodeComment;
 import jadx.api.data.impl.JadxCodeData;
 import jadx.api.data.impl.JadxCodeRename;
 import jadx.api.data.impl.JadxNodeRef;
+import jadx.api.metadata.ICodeAnnotation;
+import jadx.api.metadata.ICodeMetadata;
+import jadx.api.metadata.ICodeNodeRef;
+import jadx.api.metadata.annotations.NodeDeclareRef;
 import jadx.core.dex.attributes.AFlag;
 import jadx.core.dex.nodes.MethodNode;
 
@@ -42,7 +49,7 @@ public final class Session {
 
 	private static final int MAX_USAGES = 5000;
 	// Bump when the on-disk export/name-index format or its index semantics change.
-	private static final long INDEX_FORMAT_VERSION = 3;
+	private static final long INDEX_FORMAT_VERSION = 4;
 
 	private Emitter emitter = (m, p) -> {
 	};
@@ -57,6 +64,7 @@ public final class Session {
 	private File exportDir;
 	private File indexDir;
 	private File namesDir;
+	private File xrefDir;
 	private File metaDir;
 	private volatile SearchIndex searchIndex;
 	private volatile boolean sourcesReady = false;
@@ -185,6 +193,7 @@ public final class Session {
 		this.exportDir = new File(projFile.getAbsoluteFile().getParentFile(), stripExt(projFile.getName()) + ".jadxnvim");
 		this.indexDir = new File(exportDir, "index");
 		this.namesDir = new File(exportDir, "index-names");
+		this.xrefDir = new File(exportDir, "index-xref");
 		this.metaDir = new File(exportDir, "index-meta");
 		long sig = input.length() * 31 + INDEX_FORMAT_VERSION;
 
@@ -205,7 +214,7 @@ public final class Session {
 			this.diskNames = null;
 			this.codeDataVersion = 0;
 			this.freshCode.clear();
-			this.searchIndex = SearchIndex.load(indexDir, namesDir, metaDir);
+			this.searchIndex = SearchIndex.load(indexDir, namesDir, xrefDir, metaDir);
 			this.sourcesReady = true;
 			if (prev != null) {
 				try {
@@ -297,6 +306,7 @@ public final class Session {
 		this.exportCancel = cancel;
 		File idxDir = this.indexDir;
 		File nmDir = this.namesDir;
+		File xrDir = this.xrefDir;
 		File mDir = this.metaDir;
 		File input = this.inputFile;
 		Thread t = new Thread(() -> {
@@ -309,7 +319,7 @@ public final class Session {
 				// they rebuild once to gain fast class/method search).
 				boolean hasNames = new File(nmDir, SearchIndex.classesName(0)).isFile();
 				if (SearchIndex.isValid(mDir, sig) && hasNames) {
-					searchIndex = SearchIndex.load(idxDir, nmDir, mDir);
+					searchIndex = SearchIndex.load(idxDir, nmDir, xrDir, mDir);
 					sourcesReady = true;
 					emitter.emit("loadDone", Map.of("total", 0, "cached", true));
 					if (lean) {
@@ -317,7 +327,7 @@ public final class Session {
 					}
 					return;
 				}
-				searchIndex = buildIndex(d, idxDir, nmDir, mDir, sig, cancel);
+				searchIndex = buildIndex(d, idxDir, nmDir, xrDir, mDir, sig, cancel);
 				if (searchIndex != null && !cancel.get()) {
 					sourcesReady = true;
 					emitter.emit("loadDone", Map.of("total", 1));
@@ -339,17 +349,110 @@ public final class Session {
 	 * Decompile every top-level class and stream it into the ripgrep shard index. Each class is
 	 * unloaded right after writing so peak memory stays bounded even on 400k-class APKs.
 	 */
-	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File nmDir, File mDir, long sig,
+	// A stable cross-reference key for an annotation's node: type tag + node identity. The same node
+	// yields the same key whether it appears as a reference (CLASS/METHOD/FIELD) or a DECLARATION.
+	private static String edgeKey(ICodeAnnotation ann) {
+		ICodeAnnotation.AnnType t = ann.getAnnType();
+		if (t == ICodeAnnotation.AnnType.CLASS || t == ICodeAnnotation.AnnType.METHOD
+				|| t == ICodeAnnotation.AnnType.FIELD) {
+			return t.name().charAt(0) + ":" + ann;
+		}
+		if (t == ICodeAnnotation.AnnType.DECLARATION && ann instanceof NodeDeclareRef) {
+			ICodeNodeRef node = ((NodeDeclareRef) ann).getNode();
+			if (node != null) {
+				return node.getAnnType().name().charAt(0) + ":" + node;
+			}
+		}
+		return null;
+	}
+
+	// Turn a class's code metadata into rg-searchable edge lines "key\tclassId\tline\toffset":
+	// references go to refOut (find-usages results / go-to-def sources), declarations to declOut
+	// (go-to-def targets). Offsets are char positions in the exported code (canonical for matching).
+	private static void extractEdges(String code, ICodeMetadata md, String classId,
+			List<String> refOut, List<String> declOut) {
+		if (md == null) {
+			return;
+		}
+		Map<Integer, ICodeAnnotation> map = md.getAsMap();
+		if (map == null || map.isEmpty()) {
+			return;
+		}
+		int[] starts = lineStarts(code);
+		for (Map.Entry<Integer, ICodeAnnotation> e : map.entrySet()) {
+			Integer offObj = e.getKey();
+			ICodeAnnotation ann = e.getValue();
+			if (offObj == null || ann == null) {
+				continue;
+			}
+			ICodeAnnotation.AnnType t = ann.getAnnType();
+			boolean decl = t == ICodeAnnotation.AnnType.DECLARATION;
+			boolean ref = t == ICodeAnnotation.AnnType.CLASS || t == ICodeAnnotation.AnnType.METHOD
+					|| t == ICodeAnnotation.AnnType.FIELD;
+			if (!decl && !ref) {
+				continue;
+			}
+			String key = edgeKey(ann);
+			if (key == null || key.indexOf('\t') >= 0 || key.indexOf('\n') >= 0) {
+				continue;
+			}
+			int off = offObj;
+			int line = lineOf(starts, off);
+			String ln = key + "\t" + classId + "\t" + line + "\t" + off;
+			(decl ? declOut : refOut).add(ln);
+		}
+	}
+
+	private static int[] lineStarts(String code) {
+		int count = 1;
+		for (int i = 0; i < code.length(); i++) {
+			if (code.charAt(i) == '\n') {
+				count++;
+			}
+		}
+		int[] starts = new int[count];
+		int idx = 1;
+		for (int i = 0; i < code.length(); i++) {
+			if (code.charAt(i) == '\n') {
+				starts[idx++] = i + 1;
+			}
+		}
+		return starts;
+	}
+
+	// 1-based line containing char offset (largest starts[i] <= off).
+	private static int lineOf(int[] starts, int off) {
+		int lo = 0;
+		int hi = starts.length - 1;
+		int res = 0;
+		while (lo <= hi) {
+			int mid = (lo + hi) >>> 1;
+			if (starts[mid] <= off) {
+				res = mid;
+				lo = mid + 1;
+			} else {
+				hi = mid - 1;
+			}
+		}
+		return res + 1;
+	}
+
+	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File nmDir, File xrDir, File mDir, long sig,
 			java.util.concurrent.atomic.AtomicBoolean cancel) throws Exception {
 		deleteDir(idxDir);
 		deleteDir(nmDir);
+		deleteDir(xrDir);
 		deleteDir(mDir);
-		SearchIndex.Builder builder = new SearchIndex.Builder(idxDir, nmDir);
+		SearchIndex.Builder builder = new SearchIndex.Builder(idxDir, nmDir, xrDir);
 		List<JavaClass> all = d.getClasses();
 		int total = all.size();
 		if (total == 0) {
 			return builder.finish(mDir, sig);
 		}
+		// Build the disk cross-reference index only in lean mode: that's the case where the model is
+		// dropped and gd/gr must be answered from disk. The code metadata is available regardless of
+		// the usage graph, so this works even though lean implies usage = false.
+		boolean withXref = lean;
 		// Cap concurrency: each in-flight decompile holds a class's transient state, so on a
 		// many-core box too many at once spikes peak memory (a cause of OOM-kills during export on
 		// memory-limited servers). Tunable via -Djadxnvim.indexThreads.
@@ -391,7 +494,21 @@ public final class Session {
 					} catch (Throwable ignore) {
 						// no methods indexed for this class
 					}
-					builder.add(cls.getRawName(), cls.getFullName(), cls.getCode(), methodNames);
+					String id = cls.getRawName();
+					ICodeInfo ci = cls.getCodeInfo();
+					String code = ci.getCodeStr();
+					List<String> refLines = null;
+					List<String> declLines = null;
+					if (withXref) {
+						refLines = new ArrayList<>();
+						declLines = new ArrayList<>();
+						try {
+							extractEdges(code, ci.getCodeMetadata(), id, refLines, declLines);
+						} catch (Throwable ignore) {
+							// no xref for this class
+						}
+					}
+					builder.add(id, cls.getFullName(), code, methodNames, refLines, declLines);
 				} catch (Throwable ignore) {
 					// keep going; a failed class just isn't indexed
 				} finally {
@@ -659,6 +776,186 @@ public final class Session {
 		return diskNames.getOrDefault(id, id);
 	}
 
+	// --- disk cross-reference (lean mode go-to-def / find-usages, no model) -------------------
+
+	private boolean xrefReady() {
+		return servingFromDisk() && searchIndex.xrefDir() != null && searchIndex.xrefDir().isDirectory();
+	}
+
+	// Escape a literal for a ripgrep (Rust) regex.
+	private static String rgRegex(String s) {
+		StringBuilder sb = new StringBuilder(s.length() + 8);
+		for (int i = 0; i < s.length(); i++) {
+			char c = s.charAt(i);
+			if ("\\.+*?()|[]{}^$".indexOf(c) >= 0) {
+				sb.append('\\');
+			}
+			sb.append(c);
+		}
+		return sb.toString();
+	}
+
+	// Run ripgrep over the xref dir with a glob + pattern; return matched lines (bounded).
+	private List<String> rgXref(String glob, String pattern) {
+		List<String> out = new ArrayList<>();
+		File dir = searchIndex.xrefDir();
+		if (dir == null || !dir.isDirectory()) {
+			return out;
+		}
+		List<String> cmd = new ArrayList<>();
+		cmd.add(rgPath != null && !rgPath.isEmpty() ? rgPath : "rg");
+		cmd.add("--no-filename");
+		cmd.add("--no-line-number");
+		cmd.add("--no-heading");
+		cmd.add("--no-ignore");
+		cmd.add("-g");
+		cmd.add(glob);
+		cmd.add("-e");
+		cmd.add(pattern);
+		cmd.add(dir.getAbsolutePath());
+		Process p = null;
+		try {
+			p = new ProcessBuilder(cmd).redirectErrorStream(false).start();
+			p.getOutputStream().close();
+			try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+				String ln;
+				int n = 0;
+				while ((ln = r.readLine()) != null) {
+					out.add(ln);
+					if (++n >= MAX_USAGES) {
+						break;
+					}
+				}
+			}
+		} catch (Exception e) {
+			System.err.println("[jadxd] xref rg failed: " + e);
+		} finally {
+			if (p != null) {
+				p.destroy();
+			}
+		}
+		return out;
+	}
+
+	// Resolve the cross-reference key of the token at (line, col) in class id, from the edge index.
+	private String resolveKeyAt(String id, int line, int col) {
+		String code = searchIndex.codeOf(id);
+		if (code == null) {
+			return null;
+		}
+		int cursor = Positions.toOffset(code, line, col);
+		String pat = "\t" + rgRegex(id) + "\t" + line + "\t";
+		List<String> lines = rgXref("ref_s*.txt", pat);
+		lines.addAll(rgXref("decl_s*.txt", pat));
+		String bestKey = null;
+		int bestOff = -1;
+		for (String ln : lines) {
+			int t = ln.lastIndexOf('\t');
+			if (t < 0) {
+				continue;
+			}
+			int off;
+			try {
+				off = Integer.parseInt(ln.substring(t + 1));
+			} catch (NumberFormatException e) {
+				continue;
+			}
+			// token at/just before the cursor on this line
+			if (off <= cursor && off > bestOff) {
+				bestOff = off;
+				bestKey = ln.substring(0, ln.indexOf('\t'));
+			}
+		}
+		return bestKey;
+	}
+
+	private static String keyName(String key) {
+		if (key == null) {
+			return "symbol";
+		}
+		String s = key.startsWith("C:") || key.startsWith("M:") || key.startsWith("F:") ? key.substring(2) : key;
+		int paren = s.indexOf('(');
+		if (paren >= 0) {
+			s = s.substring(0, paren);
+		}
+		int dot = s.lastIndexOf('.');
+		return dot >= 0 && dot < s.length() - 1 ? s.substring(dot + 1) : s;
+	}
+
+	private Map<String, Object> diskGotoDef(String id, int line, int col) {
+		Map<String, Object> result = new LinkedHashMap<>();
+		String key = resolveKeyAt(id, line, col);
+		if (key != null) {
+			List<String> decls = rgXref("decl_s*.txt", "^" + rgRegex(key) + "\t");
+			if (!decls.isEmpty()) {
+				// key \t classId \t line \t offset
+				String[] f = decls.get(0).split("\t", -1);
+				if (f.length >= 3) {
+					result.put("found", true);
+					result.put("id", f[1]);
+					result.put("fullName", diskFullName(f[1]));
+					result.put("name", keyName(key));
+					result.put("line", parseIntSafe(f[2], 1));
+					result.put("col", 0);
+					return result;
+				}
+			}
+		}
+		result.put("found", false);
+		return result;
+	}
+
+	private Map<String, Object> diskFindUsages(String id, int line, int col) {
+		Map<String, Object> result = new LinkedHashMap<>();
+		List<Map<String, Object>> usages = new ArrayList<>();
+		result.put("usages", usages);
+		result.put("usageFallback", false);
+		String key = resolveKeyAt(id, line, col);
+		result.put("name", key != null ? keyName(key) : null);
+		if (key == null) {
+			return result;
+		}
+		Map<String, String[]> lineCache = new java.util.HashMap<>();
+		boolean truncated = false;
+		for (String ln : rgXref("ref_s*.txt", "^" + rgRegex(key) + "\t")) {
+			String[] f = ln.split("\t", -1);
+			if (f.length < 3) {
+				continue;
+			}
+			String useId = f[1];
+			int useLine = parseIntSafe(f[2], 1);
+			String text = "";
+			String[] codeLines = lineCache.computeIfAbsent(useId, k -> {
+				String c = searchIndex.codeOf(k);
+				return c == null ? null : c.split("\n", -1);
+			});
+			if (codeLines != null && useLine >= 1 && useLine <= codeLines.length) {
+				text = codeLines[useLine - 1].strip();
+			}
+			Map<String, Object> u = new LinkedHashMap<>();
+			u.put("id", useId);
+			u.put("fullName", diskFullName(useId));
+			u.put("line", useLine);
+			u.put("col", 0);
+			u.put("text", text);
+			usages.add(u);
+			if (usages.size() >= MAX_USAGES) {
+				truncated = true;
+				break;
+			}
+		}
+		result.put("truncated", truncated);
+		return result;
+	}
+
+	private static int parseIntSafe(String s, int fallback) {
+		try {
+			return Integer.parseInt(s.trim());
+		} catch (Exception e) {
+			return fallback;
+		}
+	}
+
 	/** Resolve the jadx node referenced at (line, col) inside class {@code id}, or null. */
 	private JavaNode nodeAt(String id, int line, int col) {
 		JadxDecompiler d = ensureLoaded();
@@ -672,6 +969,9 @@ public final class Session {
 	}
 
 	public Map<String, Object> gotoDef(String id, int line, int col) {
+		if (xrefReady()) {
+			return diskGotoDef(id, line, col);
+		}
 		JavaNode node = nodeAt(id, line, col);
 		Map<String, Object> result = new LinkedHashMap<>();
 		if (node == null) {
@@ -692,6 +992,9 @@ public final class Session {
 	}
 
 	public Map<String, Object> findUsages(String id, int line, int col) {
+		if (xrefReady()) {
+			return diskFindUsages(id, line, col);
+		}
 		JavaNode node = nodeAt(id, line, col);
 		Map<String, Object> result = new LinkedHashMap<>();
 		List<Map<String, Object>> usages = new ArrayList<>();
