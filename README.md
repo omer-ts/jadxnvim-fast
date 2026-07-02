@@ -58,7 +58,9 @@ communication is local stdio, so there is no network protocol or auth to configu
   once the export is **cached**, opening the project skips building the model entirely — it serves from
   disk immediately, so there's no multi-GB parse peak at all (a large APK opens in ~0 s at a few hundred
   MB). Only the *first* indexing of an APK needs the full model in memory. Implies `usage = false`;
-  requires `export = true`.
+  requires `export = true`. Cost: the cross-reference index adds disk (≈2 GB for a large APK, on top of
+  the ~1 GB of decompiled shards) — it's queried with ripgrep and never loaded into RAM, and lives in
+  the gitignored `<name>.jadxnvim/` cache.
 
 ## Build the daemon
 
