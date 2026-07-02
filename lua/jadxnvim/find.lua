@@ -5,6 +5,12 @@ local code = require("jadxnvim.code")
 local fuzzy = require("jadxnvim.fuzzy")
 local preview = require("jadxnvim.preview")
 local searches = require("jadxnvim.searches")
+local icons = require("jadxnvim.icons")
+
+local function icon(name)
+  local g = icons.get(name)
+  return g ~= "" and (g .. " ") or ""
+end
 
 local M = {}
 
@@ -65,8 +71,9 @@ local function name_finder(kind, title, prompt, on_select, previewer)
             return
           end
           local batch = {}
+          local ikind = (kind == "method") and "method" or "class"
           for _, it in ipairs(p.items or {}) do
-            local item = { text = it.fullName, id = it.id, index = it.index, kind = it.kind }
+            local item = { text = icon(ikind) .. (it.fullName or ""), id = it.id, index = it.index, kind = it.kind }
             batch[#batch + 1] = item
             collected[#collected + 1] = item
           end
@@ -230,19 +237,41 @@ local function combined_previewer()
   end
 end
 
+-- jadx-gui's "search everywhere" lists a type icon, the primary name, then a dimmer location.
+-- We render the same shape in one line: "<icon> <name>   <location>".
 local function combined_item(kind, it)
   if kind == "class" then
-    return { kind = "class", id = it.id, fullName = it.fullName, text = "class   " .. it.fullName }
+    local full = it.fullName or it.id or ""
+    local short = full:match("[^.]+$") or full
+    local pkg = full:sub(1, math.max(0, #full - #short - 1))
+    return {
+      kind = "class",
+      id = it.id,
+      fullName = full,
+      text = string.format("%s%s   %s", icon("class"), short, pkg),
+    }
   elseif kind == "method" then
-    return { kind = "method", id = it.id, index = it.index, text = "method  " .. it.fullName }
+    local full = it.fullName or "" -- daemon sends "methodName  ·  owner.Class"
+    local mname, owner = full:match("^(.-)%s*·%s*(.+)$")
+    mname = mname and vim.trim(mname) or full
+    owner = owner and vim.trim(owner) or ""
+    return {
+      kind = "method",
+      id = it.id,
+      index = it.index,
+      name = mname,
+      fullName = full,
+      text = string.format("%s%s   %s", icon("method"), mname, owner),
+    }
   else
+    local loc = string.format("%s:%d", it.fullName or it.id or "?", it.line or 0)
     return {
       kind = "text",
       id = it.id,
       line = it.line,
       col = it.col,
       snippet = it.text,
-      text = string.format("text    %s:%d  %s", it.fullName, it.line or 0, it.text or ""),
+      text = string.format("%s%s   %s", icon("text"), (it.text or ""):gsub("%s+", " "), loc),
     }
   end
 end
@@ -253,7 +282,8 @@ function M.combined()
     return
   end
   fuzzy.pick({
-    title = " Search (class · method · text) ",
+    title = string.format(" Search everywhere  %sclass  %smethod  %stext ",
+      icon("class"), icon("method"), icon("text")),
     items = {},
     previewer = combined_previewer(),
     query_phase = {
