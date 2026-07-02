@@ -52,6 +52,35 @@ public final class Session {
 	// Bump when the on-disk export/name-index format or its index semantics change.
 	private static final long INDEX_FORMAT_VERSION = 5;
 
+	// Cache signature: changes if the input, the index format, OR the code data (renames/comments)
+	// change — a rename doesn't touch the input but must invalidate the export so it's rebuilt with
+	// the new names (otherwise the stale export/xref would be reused on reopen and xrefs break).
+	private static long signature(File input, JadxCodeData cd) {
+		long h = input.length() * 31 + INDEX_FORMAT_VERSION;
+		h = h * 1000003 + codeDataHash(cd);
+		return h;
+	}
+
+	private static long codeDataHash(JadxCodeData cd) {
+		if (cd == null) {
+			return 0;
+		}
+		long h = 1;
+		if (cd.getRenames() != null) {
+			h = h * 1315423911 + cd.getRenames().size();
+			for (ICodeRename r : cd.getRenames()) {
+				h = h * 31 + (r == null ? 0 : r.toString().hashCode());
+			}
+		}
+		if (cd.getComments() != null) {
+			h = h * 1315423911 + cd.getComments().size();
+			for (ICodeComment c : cd.getComments()) {
+				h = h * 31 + (c == null ? 0 : c.toString().hashCode());
+			}
+		}
+		return h;
+	}
+
 	private Emitter emitter = (m, p) -> {
 	};
 	private boolean export = true;
@@ -81,7 +110,7 @@ public final class Session {
 	private File projectFile;
 	// Bumped whenever code data changes; classes decompiled at an older version need a reload.
 	private int codeDataVersion = 0;
-	private final java.util.Set<String> freshCode = new java.util.HashSet<>();
+	private final Map<String, ICodeInfo> freshInfo = new java.util.HashMap<>();
 
 	public void setEmitter(Emitter emitter) {
 		this.emitter = emitter;
@@ -186,8 +215,18 @@ public final class Session {
 			projFile = given.getAbsoluteFile();
 		} else {
 			input = given;
-			cd = new JadxCodeData();
 			projFile = defaultProjectFile(input);
+			// If a sidecar .jadx already exists, load its renames/comments so they persist across
+			// reopens of the APK (opening the APK is equivalent to opening its project).
+			JadxCodeData loaded = null;
+			if (!temp && projFile.exists()) {
+				try {
+					loaded = ProjectIO.load(projFile).codeData;
+				} catch (Exception e) {
+					System.err.println("[jadxd] could not load sidecar project " + projFile.getName() + ": " + e);
+				}
+			}
+			cd = loaded != null ? loaded : new JadxCodeData();
 		}
 
 		// Export paths (used by the cached fast-open check below and by startExport).
@@ -196,7 +235,7 @@ public final class Session {
 		this.namesDir = new File(exportDir, "index-names");
 		this.xrefDir = new File(exportDir, "index-xref");
 		this.metaDir = new File(exportDir, "index-meta");
-		long sig = input.length() * 31 + INDEX_FORMAT_VERSION;
+		long sig = signature(input, cd);
 
 		// Lean fast-open: with a valid cached export, skip building the jadx model entirely (no
 		// multi-GB parse peak) and serve browse/search/tree from disk right away. The model is built
@@ -214,7 +253,7 @@ public final class Session {
 			this.diskPkgIndex = null;
 			this.diskNames = null;
 			this.codeDataVersion = 0;
-			this.freshCode.clear();
+			this.freshInfo.clear();
 			this.searchIndex = SearchIndex.load(indexDir, namesDir, xrefDir, metaDir);
 			this.sourcesReady = true;
 			if (prev != null) {
@@ -259,7 +298,7 @@ public final class Session {
 		this.diskPkgIndex = null;
 		this.diskNames = null;
 		this.codeDataVersion = 0;
-		this.freshCode.clear();
+		this.freshInfo.clear();
 		this.searchIndex = null;
 		this.sourcesReady = false;
 		if (previous != null) {
@@ -312,10 +351,9 @@ public final class Session {
 		File input = this.inputFile;
 		Thread t = new Thread(() -> {
 			try {
-				// Signature includes an index-format version so a format change (e.g. the method
-				// index moving from JavaClass.getMethods() order to the raw MethodNode order that
-				// memberPos now uses) invalidates stale caches and forces a rebuild.
-				long sig = input.length() * 31 + INDEX_FORMAT_VERSION;
+				// Signature includes the index format version and the code data, so a format change or
+				// a rename/comment (which changes names but not the input) invalidates the cache.
+				long sig = signature(input, codeData);
 				// Reuse the cache only if it also has the name index (older caches predate it, so
 				// they rebuild once to gain fast class/method search).
 				boolean hasNames = new File(nmDir, SearchIndex.classesName(0)).isFile();
@@ -1268,9 +1306,18 @@ public final class Session {
 	 * regenerated via {@link JavaClass#reload()} for changes to appear.
 	 */
 	private ICodeInfo freshCodeInfo(JavaClass cls, String id) {
-		if (codeDataVersion > 0 && !freshCode.contains(id)) {
+		if (codeDataVersion > 0) {
+			// After an edit, reload once and CACHE the ICodeInfo. With NoOpCodeCache, getCodeInfo()
+			// re-decompiles on every call and jadx's parallel decompile isn't deterministic, so
+			// re-fetching would hand getCode and gd/gr different line/offset layouts -> broken xrefs.
+			// Caching the reloaded copy keeps every access to a class consistent. Bounded to classes
+			// touched since the last edit; cleared on the next edit.
+			ICodeInfo cached = freshInfo.get(id);
+			if (cached != null) {
+				return cached;
+			}
 			ICodeInfo info = cls.reload();
-			freshCode.add(id);
+			freshInfo.put(id, info);
 			return info;
 		}
 		return cls.getCodeInfo();
@@ -1280,7 +1327,7 @@ public final class Session {
 	private void applyCodeData() throws IOException {
 		jadx.reloadCodeData();
 		this.codeDataVersion++;
-		this.freshCode.clear();
+		this.freshInfo.clear();
 		this.packageIndex = null;
 		this.classList = null;
 		this.methodList = null;
@@ -1315,11 +1362,10 @@ public final class Session {
 		if (params.has("kind") && !params.get("kind").isJsonNull()) {
 			opts.kind = params.get("kind").getAsString();
 		}
-		// Text search uses the ripgrep shard index once it's ready; name search and the
-		// not-yet-indexed case use the in-memory scan.
 		// Pass the index for both text (shard scan) and name (class/method name files) searches once
 		// the export is ready; Search decides how to use it and falls back to the in-memory scan.
-		SearchIndex idx = sourcesReady ? searchIndex : null;
+		// After an edit (codeDataVersion > 0) the export is stale, so search the live model instead.
+		SearchIndex idx = (sourcesReady && codeDataVersion == 0) ? searchIndex : null;
 		int searchId = search().start(d, kind, query, opts, idx, rgPath);
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("searchId", searchId);
@@ -1427,7 +1473,9 @@ public final class Session {
 
 	/** True when running lean with the model currently dropped (serve from disk). */
 	private boolean servingFromDisk() {
-		return jadx == null && sourcesReady && searchIndex != null;
+		// After an in-session edit (rename/comment) the on-disk export is stale, so stop serving from
+		// it and use the (now-loaded) model instead.
+		return jadx == null && sourcesReady && searchIndex != null && codeDataVersion == 0;
 	}
 
 	private JadxDecompiler ensureLoaded() {
