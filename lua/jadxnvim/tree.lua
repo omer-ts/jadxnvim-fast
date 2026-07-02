@@ -123,9 +123,9 @@ end
 
 -- ---- render ------------------------------------------------------------------
 
-local function pkg_label(p)
+local function pkg_label(p, expanded)
   local name = p.name ~= "" and p.name or "(default package)"
-  local marker = p.expanded and "▾" or "▸"
+  local marker = expanded and "▾" or "▸"
   return string.format("%s %s%s  (%d)", marker, ic("package"), name, p.count)
 end
 
@@ -162,9 +162,9 @@ local function render()
         end
       end
       if f == "" or pkg_match or #shown_classes > 0 then
-        lines[#lines + 1] = "  " .. pkg_label(p)
-        rows[#lines] = { kind = "package", pkg = p }
         local expand = p.expanded or (f ~= "" and #shown_classes > 0)
+        lines[#lines + 1] = "  " .. pkg_label(p, expand)
+        rows[#lines] = { kind = "package", pkg = p }
         if expand then
           for _, c in ipairs(shown_classes) do
             lines[#lines + 1] = "      " .. ic("class") .. c.name
@@ -286,12 +286,43 @@ end
 
 -- ---- filter ------------------------------------------------------------------
 
+-- Cap how many not-yet-loaded packages a filter will pull in, so a broad filter on a huge APK
+-- (thousands of packages) doesn't try to load them all at once.
+local FILTER_LOAD_CAP = 60
+
 local function set_filter(f)
   state.filter = f or ""
-  -- a filter is most useful across resources; make sure they're loaded
-  if state.filter ~= "" and state.resources_open and not state.res_root then
-    load_resources()
-    return
+  if state.filter ~= "" then
+    -- Classes are lazy, so a match inside a collapsed package is invisible until its classes load.
+    -- Load classes for packages whose NAME matches the filter (bounded) so those folds can open and
+    -- reveal their classes; render() then auto-expands them.
+    local loaded = 0
+    for _, p in ipairs(state.packages) do
+      if loaded >= FILTER_LOAD_CAP then
+        break
+      end
+      local pkg_name = p.name ~= "" and p.name or "(default package)"
+      if p.classes == nil and not p.loading and matches(pkg_name, state.filter) then
+        p.loading = true
+        loaded = loaded + 1
+        rpc.request("getClasses", { package = p.name }, function(err, res)
+          vim.schedule(function()
+            p.loading = false
+            if not err then
+              p.classes = res.classes or {}
+            end
+            if state.filter ~= "" then
+              render()
+            end
+          end)
+        end)
+      end
+    end
+    -- the resource tree is fully in memory once loaded; make sure it is, so matches there show too
+    if state.resources_open and not state.res_root then
+      load_resources()
+      return
+    end
   end
   render()
 end
