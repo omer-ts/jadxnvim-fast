@@ -176,7 +176,7 @@ In a **code** buffer (`jadx://<class>`, read-only `java`):
 | ------------ | ------------------------------ |
 | `gd`         | Go to definition               |
 | `gr`         | Find usages (xref) — browsable list with preview |
-| `<Tab>`      | Toggle Java ⟷ Smali view        |
+| `<Tab>`      | Toggle Java ⟷ Smali (syncs to the same method; remembers each pane's cursor) |
 | `<leader>jr` | Rename                         |
 | `<leader>jc` | Comment                        |
 

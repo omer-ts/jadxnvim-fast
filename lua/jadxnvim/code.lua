@@ -299,18 +299,93 @@ function M.open_smali(id, opts)
   return open_named(SMALI_PREFIX .. id, opts)
 end
 
---- Toggle the current class buffer between the Java and Smali views.
+-- Per-class Java/Smali view state: last cursor line in each pane + which pane we last synced INTO
+-- and where we landed (to tell "the user moved" from "just toggled back").
+local view_mem = {}
+
+-- Nearest method name at/above `upto` in a buffer (the enclosing method).
+local function nearest_method_name(bufnr, upto, is_smali)
+  local last = math.min(upto, vim.api.nvim_buf_line_count(bufnr))
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, last, false)
+  local kw = { ["if"] = 1, ["for"] = 1, ["while"] = 1, ["switch"] = 1, ["catch"] = 1,
+    ["return"] = 1, ["synchronized"] = 1, ["new"] = 1, ["else"] = 1, ["do"] = 1 }
+  for i = #lines, 1, -1 do
+    local l = lines[i]
+    if is_smali then
+      local n = l:match("^%s*%.method%s.-([%w_$<>]+)%(")
+      if n then
+        return n
+      end
+    else
+      -- a declaration-like `name(`: preceded by a type/modifier, not a call (`obj.name(`)
+      local n = l:match("[%s%*&%]>]([%w_$]+)%s*%(")
+      if n and not kw[n] and not l:find("%." .. vim.pesc(n) .. "%s*%(") then
+        return n
+      end
+    end
+  end
+end
+
+-- Declaration line of `name` in a smali buffer (`.method ... name(`), or nil.
+local function smali_method_line(bufnr, name)
+  if not name then
+    return nil
+  end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  for i, l in ipairs(lines) do
+    if l:match("^%s*%.method%s.-([%w_$<>]+)%(") == name then
+      return i
+    end
+  end
+end
+
+--- Toggle the current class buffer between Java and Smali. Remembers each pane's cursor; on switch
+--- it maps to the corresponding method in the other pane, but if you toggle back without moving it
+--- restores the exact previous cursor.
 function M.toggle_view()
   local buf = vim.api.nvim_get_current_buf()
   local id = vim.b[buf].jadx_class_id
   if not id then
     return
   end
-  if vim.b[buf].jadx_view == "smali" then
-    M.open(id)
-  else
-    M.open_smali(id)
+  local cur_is_smali = vim.b[buf].jadx_view == "smali"
+  local cur_view = cur_is_smali and "smali" or "java"
+  local other = cur_is_smali and "java" or "smali"
+  local cur_line = vim.api.nvim_win_get_cursor(0)[1]
+
+  local m = view_mem[id]
+  if not m then
+    m = {}
+    view_mem[id] = m
   end
+  m[cur_view] = cur_line -- remember where we are in this pane
+  -- "moved" unless we're still exactly where we last landed when syncing INTO this pane
+  local moved = not (m.from_view == cur_view and m.from_line == cur_line)
+  local method = moved and nearest_method_name(buf, cur_line, cur_is_smali) or nil
+
+  -- open the other view (synchronous load), then position
+  local tbuf = other == "smali" and M.open_smali(id) or M.open(id)
+  local win = vim.api.nvim_get_current_win()
+
+  local target
+  if not moved and m[other] then
+    target = m[other] -- toggled back without moving -> exact restore
+  elseif method then
+    target = other == "smali" and smali_method_line(tbuf, method)
+      or locate_method_line(tbuf, method, m[other])
+  end
+  target = target or m[other] or 1
+  pcall(vim.api.nvim_win_set_cursor, win, { math.max(1, target), 0 })
+  vim.cmd("normal! zz")
+
+  m[other] = target
+  m.from_view = other
+  m.from_line = target
+end
+
+--- Clear remembered Java/Smali positions (on project close/reopen).
+function M.reset_views()
+  view_mem = {}
 end
 
 --- The window to show code in: prefer a non-tree window, else open a vertical split.
@@ -363,6 +438,7 @@ end
 
 --- Wipe all decompiled-code buffers (e.g. when switching projects).
 function M.reset()
+  view_mem = {}
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(b) then
       local name = vim.api.nvim_buf_get_name(b)
