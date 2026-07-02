@@ -145,7 +145,8 @@ final class Search {
 
 		Process proc;
 		try {
-			proc = new ProcessBuilder(cmd).redirectErrorStream(false).start();
+			// discard rg's stderr at the OS level so it can never fill the pipe buffer and block
+			proc = new ProcessBuilder(cmd).redirectError(ProcessBuilder.Redirect.DISCARD).start();
 		} catch (Exception e) {
 			System.err.println("[jadxd] ripgrep unavailable, using in-memory search: " + e);
 			return null;
@@ -241,7 +242,13 @@ final class Search {
 				return i;
 			}
 			char c = lineText.charAt(i);
-			bytes += (c < 0x80) ? 1 : (c < 0x800) ? 2 : 3;
+			if (Character.isHighSurrogate(c) && i + 1 < lineText.length()
+					&& Character.isLowSurrogate(lineText.charAt(i + 1))) {
+				bytes += 4; // supplementary code point: 4 UTF-8 bytes across the surrogate pair
+				i++; // the low surrogate is consumed here too
+			} else {
+				bytes += (c < 0x80) ? 1 : (c < 0x800) ? 2 : 3;
+			}
 		}
 		return lineText.length();
 	}
@@ -419,7 +426,8 @@ final class Search {
 
 		Process proc;
 		try {
-			proc = new ProcessBuilder(cmd).redirectErrorStream(false).start();
+			// discard rg's stderr at the OS level so it can never fill the pipe buffer and block
+			proc = new ProcessBuilder(cmd).redirectError(ProcessBuilder.Redirect.DISCARD).start();
 		} catch (Exception e) {
 			System.err.println("[jadxd] ripgrep unavailable for name search: " + e);
 			return null;

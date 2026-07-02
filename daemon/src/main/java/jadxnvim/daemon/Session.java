@@ -56,7 +56,10 @@ public final class Session {
 	// change — a rename doesn't touch the input but must invalidate the export so it's rebuilt with
 	// the new names (otherwise the stale export/xref would be reused on reopen and xrefs break).
 	private static long signature(File input, JadxCodeData cd) {
+		// Fold in length AND mtime so replacing the input with different content of the same byte
+		// length (e.g. a rebuilt APK) invalidates the cache instead of serving a stale export.
 		long h = input.length() * 31 + INDEX_FORMAT_VERSION;
+		h = h * 1000003 + input.lastModified();
 		h = h * 1000003 + codeDataHash(cd);
 		return h;
 	}
@@ -992,7 +995,7 @@ public final class Session {
 		cmd.add(dir.getAbsolutePath());
 		Process p = null;
 		try {
-			p = new ProcessBuilder(cmd).redirectErrorStream(false).start();
+			p = new ProcessBuilder(cmd).redirectError(ProcessBuilder.Redirect.DISCARD).start();
 			p.getOutputStream().close();
 			try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
 				String ln;
