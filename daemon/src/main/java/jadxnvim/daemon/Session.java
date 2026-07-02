@@ -50,7 +50,7 @@ public final class Session {
 
 	private static final int MAX_USAGES = 5000;
 	// Bump when the on-disk export/name-index format or its index semantics change.
-	private static final long INDEX_FORMAT_VERSION = 4;
+	private static final long INDEX_FORMAT_VERSION = 5;
 
 	private Emitter emitter = (m, p) -> {
 	};

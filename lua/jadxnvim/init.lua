@@ -54,7 +54,7 @@ M.config = {
     find_text = "<Space>ff",
     find_classes = "<Space>fc",
     find_methods = "<Space>fd",
-    find_combined = "<Space>fg",
+    find_combined = "<Space>fv",
     saved_searches = "<Space>fs",
   },
 }

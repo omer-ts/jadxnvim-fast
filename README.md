@@ -148,7 +148,7 @@ is bound to these global keys when a project is open:
 | `<Space>ff` | text — enter a term, watch results stream in, then fuzzy them |
 | `<Space>fc` | classes                                                       |
 | `<Space>fd` | methods (jumps to the declaration)                            |
-| `<Space>fg` | everything — classes + methods + text in one list (jadx-gui-style) |
+| `<Space>fv` | everything — classes + methods + text in one list (jadx-gui-style) |
 
 In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` (`<C-d>`/`<C-u>` to page) to move,
 `<CR>` to open, `<Esc>` to cancel. A **syntax-highlighted preview** of the highlighted result is
