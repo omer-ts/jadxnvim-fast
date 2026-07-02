@@ -1,10 +1,11 @@
--- Project explorer: a lazy package/class tree in a left split.
---
--- Packages are fetched up front (names + counts, cheap even for huge APKs). A package's classes
--- are fetched on first expand and cached, so the tree stays responsive on 150k-class projects.
+-- Project explorer: a lazy tree in a left split, split into two sections —
+--   Sources   : packages (fetched up front, cheap) → classes (fetched on first expand, cached)
+--   Resources : the APK's resource files, arranged as a directory tree (fetched on first expand)
+-- Each row carries a type icon (see jadxnvim.icons). Press `/` to filter the visible tree.
 
 local rpc = require("jadxnvim.rpc")
 local code = require("jadxnvim.code")
+local icons = require("jadxnvim.icons")
 
 local M = {}
 
@@ -12,31 +13,183 @@ local state = {
   bufnr = nil,
   winid = nil,
   packages = {}, -- { {name, count, expanded, classes=nil|{...}} }
-  rows = {}, -- line index -> { kind, pkg, class }
+  res_root = nil, -- resource directory tree (nil until Resources first expanded)
+  res_loading = false,
+  sources_open = true,
+  resources_open = false,
+  filter = "", -- active filter ("" = none)
+  rows = {}, -- line index -> row descriptor
 }
+
+local function ic(name)
+  local g = icons.get(name)
+  return g ~= "" and (g .. " ") or ""
+end
+
+local function matches(text, f)
+  return f == "" or (text or ""):lower():find(f:lower(), 1, true) ~= nil
+end
+
+-- ---- resource directory tree -------------------------------------------------
+
+local function new_dir(name)
+  return { name = name, expanded = false, dirs = {}, files = {} }
+end
+
+local function res_insert(root, path, rtype)
+  local node = root
+  local parts = vim.split(path, "/", { plain = true })
+  for i = 1, #parts do
+    local part = parts[i]
+    if part ~= "" then
+      if i == #parts then
+        node.files[#node.files + 1] = { name = part, fullname = path, type = rtype }
+      else
+        if not node.dirs[part] then
+          node.dirs[part] = new_dir(part)
+        end
+        node = node.dirs[part]
+      end
+    end
+  end
+end
+
+local function build_res_tree(list)
+  local root = new_dir("")
+  for _, r in ipairs(list) do
+    res_insert(root, r.name, r.type)
+  end
+  return root
+end
+
+local function sorted_dir_names(node)
+  local names = {}
+  for k in pairs(node.dirs) do
+    names[#names + 1] = k
+  end
+  table.sort(names)
+  return names
+end
+
+-- Does this dir (or any descendant) contain a name matching the filter?
+local function dir_has_match(node, f)
+  if f == "" then
+    return true
+  end
+  for _, file in ipairs(node.files) do
+    if matches(file.name, f) then
+      return true
+    end
+  end
+  for _, dn in ipairs(sorted_dir_names(node)) do
+    if matches(dn, f) or dir_has_match(node.dirs[dn], f) then
+      return true
+    end
+  end
+  return false
+end
+
+local function render_res(node, depth, lines, rows, f)
+  local pad = string.rep("  ", depth)
+  for _, dn in ipairs(sorted_dir_names(node)) do
+    local d = node.dirs[dn]
+    local self_match = matches(dn, f)
+    if f == "" or self_match or dir_has_match(d, f) then
+      local expanded = d.expanded or (f ~= "" and not self_match)
+      local marker = expanded and "▾" or "▸"
+      local folder = expanded and ic("folder_open") or ic("folder")
+      lines[#lines + 1] = string.format("%s%s %s%s", pad, marker, folder, dn)
+      rows[#lines] = { kind = "resdir", node = d }
+      if expanded then
+        render_res(d, depth + 1, lines, rows, self_match and "" or f)
+      end
+    end
+  end
+  local files = node.files
+  local names = {}
+  for _, file in ipairs(files) do
+    names[#names + 1] = file
+  end
+  table.sort(names, function(a, b)
+    return a.name < b.name
+  end)
+  for _, file in ipairs(names) do
+    if matches(file.name, f) then
+      lines[#lines + 1] = string.format("%s  %s%s", pad, ic("file"), file.name)
+      rows[#lines] = { kind = "resfile", file = file }
+    end
+  end
+end
+
+-- ---- render ------------------------------------------------------------------
 
 local function pkg_label(p)
   local name = p.name ~= "" and p.name or "(default package)"
   local marker = p.expanded and "▾" or "▸"
-  return string.format("%s %s  (%d)", marker, name, p.count)
+  return string.format("%s %s%s  (%d)", marker, ic("package"), name, p.count)
 end
 
 local function render()
   if not (state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr)) then
     return
   end
+  local f = state.filter
   local lines = {}
   local rows = {}
-  for _, p in ipairs(state.packages) do
-    lines[#lines + 1] = pkg_label(p)
-    rows[#lines] = { kind = "package", pkg = p }
-    if p.expanded and p.classes then
-      for _, c in ipairs(p.classes) do
-        lines[#lines + 1] = "    " .. c.name
-        rows[#lines] = { kind = "class", pkg = p, class = c }
+
+  if f ~= "" then
+    lines[#lines + 1] = "/" .. f
+    rows[#lines] = { kind = "filter" }
+  end
+
+  -- Sources section
+  do
+    local marker = state.sources_open and "▾" or "▸"
+    lines[#lines + 1] = string.format("%s %s%s", marker, ic("sources"), "Sources")
+    rows[#lines] = { kind = "sources" }
+  end
+  if state.sources_open then
+    for _, p in ipairs(state.packages) do
+      local pkg_name = p.name ~= "" and p.name or "(default package)"
+      local classes = p.classes or {}
+      local pkg_match = matches(pkg_name, f)
+      local shown_classes = {}
+      if p.expanded or f ~= "" then
+        for _, c in ipairs(classes) do
+          if pkg_match or matches(c.name, f) then
+            shown_classes[#shown_classes + 1] = c
+          end
+        end
+      end
+      if f == "" or pkg_match or #shown_classes > 0 then
+        lines[#lines + 1] = "  " .. pkg_label(p)
+        rows[#lines] = { kind = "package", pkg = p }
+        local expand = p.expanded or (f ~= "" and #shown_classes > 0)
+        if expand then
+          for _, c in ipairs(shown_classes) do
+            lines[#lines + 1] = "      " .. ic("class") .. c.name
+            rows[#lines] = { kind = "class", pkg = p, class = c }
+          end
+        end
       end
     end
   end
+
+  -- Resources section
+  do
+    local marker = state.resources_open and "▾" or "▸"
+    lines[#lines + 1] = string.format("%s %s%s", marker, ic("resources"), "Resources")
+    rows[#lines] = { kind = "resources" }
+  end
+  if state.resources_open then
+    if state.res_loading then
+      lines[#lines + 1] = "    loading…"
+      rows[#lines] = { kind = "info" }
+    elseif state.res_root then
+      render_res(state.res_root, 1, lines, rows, f)
+    end
+  end
+
   state.rows = rows
   vim.bo[state.bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(state.bufnr, 0, -1, false, lines)
@@ -48,28 +201,81 @@ local function current_row()
   return state.rows[lnum]
 end
 
+-- ---- data loading ------------------------------------------------------------
+
+local function load_resources(cb)
+  if state.res_root or state.res_loading then
+    if cb then
+      cb()
+    end
+    return
+  end
+  state.res_loading = true
+  rpc.request("getResources", nil, function(err, result)
+    vim.schedule(function()
+      state.res_loading = false
+      if err then
+        vim.notify("[jadxnvim] getResources failed: " .. (err.message or "?"), vim.log.levels.ERROR)
+      else
+        state.res_root = build_res_tree(result.resources or {})
+      end
+      render()
+      if cb then
+        cb()
+      end
+    end)
+  end)
+end
+
+local function expand_package(p, cb)
+  if p.classes then
+    if cb then
+      cb()
+    end
+    return
+  end
+  rpc.request("getClasses", { package = p.name }, function(err, result)
+    vim.schedule(function()
+      if err then
+        vim.notify("[jadxnvim] getClasses failed: " .. (err.message or "?"), vim.log.levels.ERROR)
+      else
+        p.classes = result.classes or {}
+      end
+      if cb then
+        cb()
+      end
+    end)
+  end)
+end
+
 local function on_enter()
   local row = current_row()
   if not row then
     return
   end
-  if row.kind == "class" then
+  if row.kind == "sources" then
+    state.sources_open = not state.sources_open
+    render()
+  elseif row.kind == "resources" then
+    state.resources_open = not state.resources_open
+    if state.resources_open and not state.res_root then
+      load_resources()
+    else
+      render()
+    end
+  elseif row.kind == "class" then
     code.open(row.class.id)
+  elseif row.kind == "resfile" then
+    code.open_resource(row.file.fullname)
+  elseif row.kind == "resdir" then
+    row.node.expanded = not row.node.expanded
+    render()
   elseif row.kind == "package" then
     local p = row.pkg
     if not p.expanded and not p.classes then
-      rpc.request("getClasses", { package = p.name }, function(err, result)
-        if err then
-          vim.schedule(function()
-            vim.notify("[jadxnvim] getClasses failed: " .. (err.message or "?"), vim.log.levels.ERROR)
-          end)
-          return
-        end
-        vim.schedule(function()
-          p.classes = result.classes or {}
-          p.expanded = true
-          render()
-        end)
+      expand_package(p, function()
+        p.expanded = true
+        render()
       end)
     else
       p.expanded = not p.expanded
@@ -77,6 +283,35 @@ local function on_enter()
     end
   end
 end
+
+-- ---- filter ------------------------------------------------------------------
+
+local function set_filter(f)
+  state.filter = f or ""
+  -- a filter is most useful across resources; make sure they're loaded
+  if state.filter ~= "" and state.resources_open and not state.res_root then
+    load_resources()
+    return
+  end
+  render()
+end
+
+local function prompt_filter()
+  vim.ui.input({ prompt = "Filter tree: ", default = state.filter }, function(input)
+    if input == nil then
+      return
+    end
+    set_filter(vim.trim(input))
+  end)
+end
+
+local function clear_filter()
+  if state.filter ~= "" then
+    set_filter("")
+  end
+end
+
+-- ---- window / buffer ---------------------------------------------------------
 
 local function setup_buffer()
   local bufnr = vim.api.nvim_create_buf(false, true)
@@ -91,6 +326,8 @@ local function setup_buffer()
   local opts = { buffer = bufnr, nowait = true, silent = true }
   vim.keymap.set("n", "<CR>", on_enter, opts)
   vim.keymap.set("n", "o", on_enter, opts)
+  vim.keymap.set("n", "/", prompt_filter, opts)
+  vim.keymap.set("n", "<Esc>", clear_filter, opts)
   return bufnr
 end
 
@@ -166,26 +403,17 @@ function M.goto_package(name)
   else
     vim.api.nvim_set_current_win(state.winid)
   end
+  state.filter = "" -- a stale filter would hide the target
+  state.sources_open = true
   local target = (name == "(default package)") and "" or name
   local function go()
     for _, p in ipairs(state.packages) do
       if p.name == target then
-        if not p.expanded and not p.classes then
-          rpc.request("getClasses", { package = p.name }, function(err, res)
-            vim.schedule(function()
-              if not err then
-                p.classes = res.classes or {}
-                p.expanded = true
-                render()
-                focus_package(p)
-              end
-            end)
-          end)
-        else
+        expand_package(p, function()
           p.expanded = true
           render()
           focus_package(p)
-        end
+        end)
         return true
       end
     end
@@ -204,6 +432,11 @@ end
 function M.reset()
   state.packages = {}
   state.rows = {}
+  state.res_root = nil
+  state.res_loading = false
+  state.resources_open = false
+  state.sources_open = true
+  state.filter = ""
   if state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr) then
     vim.bo[state.bufnr].modifiable = true
     vim.api.nvim_buf_set_lines(state.bufnr, 0, -1, false, {})

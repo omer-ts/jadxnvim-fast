@@ -10,6 +10,23 @@ local M = {}
 
 local JAVA_PREFIX = "jadx://"
 local SMALI_PREFIX = "jadxsmali://"
+local RES_PREFIX = "jadxres://"
+
+-- Map a resource path's extension to a Neovim filetype for syntax highlighting.
+local RES_FT = {
+  xml = "xml", json = "json", html = "html", htm = "html", txt = "text",
+  properties = "jproperties", smali = "smali", java = "java", kt = "kotlin",
+  js = "javascript", css = "css", md = "markdown", yml = "yaml", yaml = "yaml",
+  gradle = "groovy", pro = "text", cfg = "dosini", ini = "dosini", sql = "sql",
+}
+
+local function res_filetype(name)
+  local ext = name:match("%.([%w]+)$")
+  if ext then
+    return RES_FT[ext:lower()]
+  end
+  return nil
+end
 
 local function fetch(method, id)
   local done, result, errm = false, nil, nil
@@ -124,6 +141,29 @@ local function fill_smali(bufnr, id)
   common_keymaps(bufnr)
 end
 
+local function fill_resource(bufnr, name)
+  local err, result = fetch("getResource", name)
+  vim.bo[bufnr].modifiable = true
+  if err then
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+      "// jadxnvim: failed to load resource " .. name,
+      "// " .. (err.message or "unknown error"),
+    })
+    vim.bo[bufnr].modifiable = false
+    return
+  end
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, to_lines(result.text))
+  vim.bo[bufnr].modifiable = false
+  vim.bo[bufnr].modified = false
+  vim.b[bufnr].jadx_resource = name
+  local ft = res_filetype(name)
+  if ft then
+    vim.bo[bufnr].filetype = ft
+    highlight(bufnr, ft)
+  end
+  common_keymaps(bufnr)
+end
+
 -- On a bare Neovim (no colorscheme) the default theme leaves keywords/types/functions at the
 -- normal foreground, so code looks flat. Give the common syntax groups a readable VS Code-like
 -- palette (with 256-color fallbacks). Skipped entirely if the user has a colorscheme.
@@ -202,6 +242,20 @@ function M.setup()
       vim.bo[ev.buf].bufhidden = "hide"
       vim.bo[ev.buf].swapfile = false
       fill_smali(ev.buf, id)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufReadCmd", {
+    group = group,
+    pattern = RES_PREFIX .. "*",
+    callback = function(ev)
+      local name = ev.match:sub(#RES_PREFIX + 1)
+      if name == "" then
+        return
+      end
+      vim.bo[ev.buf].buftype = "nofile"
+      vim.bo[ev.buf].bufhidden = "hide"
+      vim.bo[ev.buf].swapfile = false
+      fill_resource(ev.buf, name)
     end,
   })
 end
@@ -297,6 +351,11 @@ end
 --- Open (or focus) the Smali buffer for class `id`.
 function M.open_smali(id, opts)
   return open_named(SMALI_PREFIX .. id, opts)
+end
+
+--- Open (or focus) the decoded-text buffer for a resource by its path/name.
+function M.open_resource(name, opts)
+  return open_named(RES_PREFIX .. name, opts)
 end
 
 -- Per-class Java/Smali view state: last cursor line in each pane + which pane we last synced INTO
@@ -442,7 +501,8 @@ function M.reset()
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(b) then
       local name = vim.api.nvim_buf_get_name(b)
-      if (name:find(JAVA_PREFIX, 1, true) or name:find(SMALI_PREFIX, 1, true))
+      if (name:find(JAVA_PREFIX, 1, true) or name:find(SMALI_PREFIX, 1, true)
+            or name:find(RES_PREFIX, 1, true))
           and not name:match("jadx://tree$") then
         pcall(vim.api.nvim_buf_delete, b, { force = true })
       end

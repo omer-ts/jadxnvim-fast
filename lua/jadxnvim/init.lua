@@ -48,6 +48,10 @@ M.config = {
   -- 400k-class APK. The model is rebuilt on demand (one-time) the first time you go-to-def, find
   -- usages, view smali, or edit. Implies usage = false. Requires export = true.
   lean = false,
+  -- Icons for the tree and combined search. Defaults use Nerd Font glyphs; override any key with
+  -- plain text if you don't run a Nerd Font, e.g. icons = { class = "C", package = "pkg" }.
+  -- See lua/jadxnvim/icons.lua for the full list of keys.
+  icons = {},
   -- Global keymaps for the fuzzy finders. Set a value to false to skip mapping it.
   -- Bound to literal <Space> by default (works regardless of your mapleader).
   keys = {
@@ -68,6 +72,7 @@ function M.setup(opts)
   if not M.config.jar then
     M.config.jar = default_jar()
   end
+  require("jadxnvim.icons").setup(M.config.icons)
   code.setup()
   search.setup()
 end

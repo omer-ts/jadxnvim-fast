@@ -22,6 +22,8 @@ import jadx.api.impl.NoOpCodeCache;
 import jadx.api.JavaClass;
 import jadx.api.JavaMethod;
 import jadx.api.JavaNode;
+import jadx.api.ResourceFile;
+import jadx.core.xmlgen.ResContainer;
 import jadx.api.data.ICodeComment;
 import jadx.api.data.ICodeRename;
 import jadx.api.data.impl.JadxCodeComment;
@@ -164,6 +166,10 @@ public final class Session {
 				return getPackages();
 			case "getClasses":
 				return getClasses(reqStr(params, "package"));
+			case "getResources":
+				return getResources();
+			case "getResource":
+				return getResource(reqStr(params, "name"));
 			case "listClasses":
 				return listClasses(optInt(params, "limit", 100000));
 			case "listMethods":
@@ -373,6 +379,9 @@ public final class Session {
 				if (SearchIndex.isValid(mDir, sig) && hasNames) {
 					searchIndex = SearchIndex.load(idxDir, nmDir, xrDir, mDir);
 					sourcesReady = true;
+					if (!resourcesFile().isFile()) {
+						writeResourceList(d); // older caches predate the resource list; backfill it once
+					}
 					emitter.emit("loadDone", Map.of("total", 0, "cached", true));
 					if (lean) {
 						unloadModel();
@@ -382,6 +391,7 @@ public final class Session {
 				searchIndex = buildIndex(d, idxDir, nmDir, xrDir, mDir, sig, cancel);
 				if (searchIndex != null && !cancel.get()) {
 					sourcesReady = true;
+					writeResourceList(d); // so lean mode can list resources without reloading the model
 					emitter.emit("loadDone", Map.of("total", 1));
 					if (lean) {
 						unloadModel();
@@ -759,6 +769,108 @@ public final class Session {
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("packages", packages);
 		return result;
+	}
+
+	private File resourcesFile() {
+		return new File(exportDir, "resources.txt");
+	}
+
+	// Persist the resource list ("deepName \t TYPE" per line) so lean mode can list resources from
+	// disk without reloading the jadx model (loading a resource's content still needs the model).
+	private void writeResourceList(JadxDecompiler d) {
+		if (d == null) {
+			return;
+		}
+		try {
+			List<ResourceFile> res = d.getResources();
+			StringBuilder sb = new StringBuilder();
+			if (res != null) {
+				for (ResourceFile rf : res) {
+					if (rf == null) {
+						continue;
+					}
+					String name = rf.getOriginalName();
+					if (name == null) {
+						name = String.valueOf(rf);
+					}
+					sb.append(name.replace('\t', ' ').replace('\n', ' ')).append('\t')
+							.append(rf.getType()).append('\n');
+				}
+			}
+			Files.write(resourcesFile().toPath(), sb.toString().getBytes(StandardCharsets.UTF_8));
+		} catch (Throwable ignore) {
+			// resources are best-effort; a failure here just means no Resources section
+		}
+	}
+
+	private static Map<String, Object> resEntry(String name, String type) {
+		Map<String, Object> m = new LinkedHashMap<>();
+		m.put("name", name);
+		m.put("type", type);
+		return m;
+	}
+
+	/** The APK's resource files (deep name + type). Served from disk in lean mode. */
+	public Map<String, Object> getResources() throws IOException {
+		List<Map<String, Object>> out = new ArrayList<>();
+		File rf = resourcesFile();
+		if (rf.isFile() && (servingFromDisk() || jadx == null)) {
+			for (String ln : Files.readAllLines(rf.toPath(), StandardCharsets.UTF_8)) {
+				if (ln.isEmpty()) {
+					continue;
+				}
+				int t = ln.lastIndexOf('\t');
+				out.add(resEntry(t < 0 ? ln : ln.substring(0, t), t < 0 ? "" : ln.substring(t + 1)));
+			}
+		} else {
+			ensureLoaded();
+			List<ResourceFile> res = jadx.getResources();
+			if (res != null) {
+				for (ResourceFile r : res) {
+					if (r != null) {
+						out.add(resEntry(r.getOriginalName(), String.valueOf(r.getType())));
+					}
+				}
+			}
+		}
+		return Map.of("resources", out);
+	}
+
+	/** Decoded text of a resource by deep name (reloads the model in lean mode). */
+	public Map<String, Object> getResource(String name) {
+		ensureLoaded();
+		ResourceFile match = null;
+		List<ResourceFile> res = jadx.getResources();
+		if (res != null) {
+			for (ResourceFile r : res) {
+				if (r != null && name.equals(r.getOriginalName())) {
+					match = r;
+					break;
+				}
+			}
+		}
+		if (match == null) {
+			throw new IllegalArgumentException("resource not found: " + name);
+		}
+		Map<String, Object> out = new LinkedHashMap<>();
+		out.put("name", name);
+		out.put("type", String.valueOf(match.getType()));
+		try {
+			ResContainer rc = match.loadContent();
+			ICodeInfo text = rc == null ? null : rc.getText();
+			String code = text == null ? null : text.getCodeStr();
+			if (code != null) {
+				out.put("text", code);
+				out.put("binary", false);
+			} else {
+				out.put("binary", true);
+				out.put("text", "// binary resource (" + match.getType() + ") — cannot show as text");
+			}
+		} catch (Throwable e) {
+			out.put("binary", true);
+			out.put("text", "// could not decode resource: " + e);
+		}
+		return out;
 	}
 
 	/** Return the top-level classes of a single package (lazy tree expansion). */
