@@ -254,10 +254,11 @@ final class SearchIndex {
 			}
 		}
 
-		// refLines/declLines are pre-formatted "key\tid\tline\tcol" cross-reference edges for this
-		// class (usages and declaration sites), written to the class's shard for rg to query later.
+		// methodLines.get(i) is method i's declaration line in the exported code (or null), stored so
+		// lean-mode memberPos resolves without the model. refLines/declLines are pre-formatted
+		// "key\tid\tline\toffset" cross-reference edges (usages and declaration sites).
 		void add(String id, String fullName, String code, List<String> methodNames,
-				List<String> refLines, List<String> declLines) throws IOException {
+				List<String> methodLines, List<String> refLines, List<String> declLines) throws IOException {
 			if (code == null) {
 				code = "";
 			}
@@ -299,6 +300,9 @@ final class SearchIndex {
 						mw.write(id);
 						mw.write('\t');
 						mw.write(Integer.toString(i));
+						mw.write('\t');
+						String mline = (methodLines != null && i < methodLines.size()) ? methodLines.get(i) : null;
+						mw.write(mline == null ? "1" : mline);
 						mw.write('\n');
 					}
 				}

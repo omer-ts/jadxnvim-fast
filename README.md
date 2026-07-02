@@ -51,13 +51,14 @@ communication is local stdio, so there is no network protocol or auth to configu
   `gr` then falls back to a fast name-based text search, and anonymous classes aren't inlined.
 
   **Lean mode (`lean = true`)** goes further: once the on-load export is written, jadxnvim drops jadx's
-  entire in-memory model and serves the class tree, code view and search straight from the on-disk
-  export — steady-state RAM falls to a few hundred MB (~420 MB RSS on a large APK). The model is rebuilt on
-  demand (one-time, with a notice) the first time you go-to-def, find-usages, view smali, or rename;
-  browsing and search never trigger a reload. And once the export is **cached**, opening the project
-  skips building the model entirely — it serves from disk immediately, so there's no multi-GB parse
-  peak at all (a large APK opens in ~0 s at a few hundred MB). Only the *first* indexing of an APK needs
-  the full model in memory. Implies `usage = false`; requires `export = true`.
+  entire in-memory model and serves the class tree, code view, search, the fuzzy finders, **go-to-def
+  and find-usages** straight from the on-disk export (the export also writes an rg-searchable
+  cross-reference index) — steady-state RAM falls to a few hundred MB (~420 MB RSS on a large APK). Only
+  smali view and editing (rename/comment) rebuild the model on demand (one-time, with a notice). And
+  once the export is **cached**, opening the project skips building the model entirely — it serves from
+  disk immediately, so there's no multi-GB parse peak at all (a large APK opens in ~0 s at a few hundred
+  MB). Only the *first* indexing of an APK needs the full model in memory. Implies `usage = false`;
+  requires `export = true`.
 
 ## Build the daemon
 

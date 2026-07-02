@@ -369,7 +369,7 @@ public final class Session {
 	// Turn a class's code metadata into rg-searchable edge lines "key\tclassId\tline\toffset":
 	// references go to refOut (find-usages results / go-to-def sources), declarations to declOut
 	// (go-to-def targets). Offsets are char positions in the exported code (canonical for matching).
-	private static void extractEdges(String code, ICodeMetadata md, String classId,
+	private static void extractEdges(String code, int[] starts, ICodeMetadata md, String classId,
 			List<String> refOut, List<String> declOut) {
 		if (md == null) {
 			return;
@@ -378,7 +378,6 @@ public final class Session {
 		if (map == null || map.isEmpty()) {
 			return;
 		}
-		int[] starts = lineStarts(code);
 		for (Map.Entry<Integer, ICodeAnnotation> e : map.entrySet()) {
 			Integer offObj = e.getKey();
 			ICodeAnnotation ann = e.getValue();
@@ -480,35 +479,42 @@ public final class Session {
 					return;
 				}
 				try {
+					String id = cls.getRawName();
+					ICodeInfo ci = cls.getCodeInfo();
+					String code = ci.getCodeStr();
+					int[] starts = lineStarts(code);
 					// Raw parsed method list: same order memberPos uses, so the stored index maps
-					// back correctly. Skipped (DONT_GENERATE) slots stay as null to keep positions.
+					// back correctly. Skipped (DONT_GENERATE) slots stay null to keep positions. The
+					// method's declaration line (from getDefPosition in this exported code) is stored
+					// so lean-mode memberPos can jump to it without the model.
 					List<String> methodNames = new ArrayList<>();
+					List<String> methodLines = new ArrayList<>();
 					try {
 						for (MethodNode mth : cls.getClassNode().getMethods()) {
 							if (mth.contains(AFlag.DONT_GENERATE)) {
 								methodNames.add(null);
+								methodLines.add(null);
 							} else {
 								methodNames.add(mth.getMethodInfo().getAlias());
+								int dp = mth.getDefPosition();
+								methodLines.add(dp >= 0 ? Integer.toString(lineOf(starts, dp)) : null);
 							}
 						}
 					} catch (Throwable ignore) {
 						// no methods indexed for this class
 					}
-					String id = cls.getRawName();
-					ICodeInfo ci = cls.getCodeInfo();
-					String code = ci.getCodeStr();
 					List<String> refLines = null;
 					List<String> declLines = null;
 					if (withXref) {
 						refLines = new ArrayList<>();
 						declLines = new ArrayList<>();
 						try {
-							extractEdges(code, ci.getCodeMetadata(), id, refLines, declLines);
+							extractEdges(code, starts, ci.getCodeMetadata(), id, refLines, declLines);
 						} catch (Throwable ignore) {
 							// no xref for this class
 						}
 					}
-					builder.add(id, cls.getFullName(), code, methodNames, refLines, declLines);
+					builder.add(id, cls.getFullName(), code, methodNames, methodLines, refLines, declLines);
 				} catch (Throwable ignore) {
 					// keep going; a failed class just isn't indexed
 				} finally {
@@ -712,6 +718,26 @@ public final class Session {
 
 	/** Resolve the declaration position of a method (by class id + index from {@link #listMethods}). */
 	public Map<String, Object> memberPos(String id, int index) {
+		// Lean mode: the method's declaration line was stored in the name index at export time
+		// ("name\tfullName\tid\tindex\tline"), so we can resolve it without the model.
+		if (servingFromDisk()) {
+			int line = 1;
+			for (String ln : rgLines(searchIndex.namesDir(), "mth_s*.txt",
+					"\t" + rgRegex(id) + "\t" + index + "\t")) {
+				String[] f = ln.split("\t", -1);
+				// name, fullName, id, index, line
+				if (f.length >= 5 && f[2].equals(id) && f[3].equals(Integer.toString(index))) {
+					line = parseIntSafe(f[4], 1);
+					break;
+				}
+			}
+			Map<String, Object> result = new LinkedHashMap<>();
+			result.put("id", id);
+			result.put("fullName", diskFullName(id));
+			result.put("line", line);
+			result.put("col", 0);
+			return result;
+		}
 		JadxDecompiler d = ensureLoaded();
 		JavaClass cls = findClass(id);
 		if (cls == null) {
@@ -795,10 +821,13 @@ public final class Session {
 		return sb.toString();
 	}
 
-	// Run ripgrep over the xref dir with a glob + pattern; return matched lines (bounded).
 	private List<String> rgXref(String glob, String pattern) {
+		return rgLines(searchIndex.xrefDir(), glob, pattern);
+	}
+
+	// Run ripgrep over an index dir with a glob + pattern; return matched lines (bounded).
+	private List<String> rgLines(File dir, String glob, String pattern) {
 		List<String> out = new ArrayList<>();
-		File dir = searchIndex.xrefDir();
 		if (dir == null || !dir.isDirectory()) {
 			return out;
 		}
