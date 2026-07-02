@@ -169,7 +169,22 @@ require("jadxnvim").setup({
 })
 ```
 
-In the **tree** window: `<CR>` / `o` expand/collapse a package or open a class.
+In the **tree** window the project is split into two sections, each row tagged with a type icon:
+
+- **Sources** — packages → classes (`<CR>` / `o` expands a package or opens a class).
+- **Resources** — the APK's resource files as a directory tree; opening one (`AndroidManifest.xml`,
+  `res/values/strings.xml`, …) shows its **decoded** text, syntax-highlighted by extension. In lean
+  mode the resource *list* is served from disk; opening a resource's *content* rebuilds the model
+  once (like smali).
+
+Press `/` to **filter** the tree (case-insensitive; `<Esc>` clears). The icons default to Nerd Font
+glyphs — override them (or switch to plain ASCII) via `icons` in `setup()`:
+
+```lua
+require("jadxnvim").setup({
+  icons = { class = "C", package = "pkg", folder = "/", file = "-" }, -- any subset; see lua/jadxnvim/icons.lua
+})
+```
 
 In a **code** buffer (`jadx://<class>`, read-only `java`):
 
@@ -218,6 +233,9 @@ All v1 milestones are implemented and tested against real APKs (incl. a 136 MB /
 - [x] Java ⟷ Smali toggle (`<Tab>`) and a load progress bar (animated, or real % with `prefetch`)
 - [x] Syntax highlighting for Java and Smali (applies a readable palette on a bare Neovim; a
       colorscheme you set is respected)
+- [x] Resource browser: a Resources section in the tree (directory tree of the APK's resources),
+      with decoded, syntax-highlighted viewing of `AndroidManifest.xml`, `res/**`, etc.
+- [x] Tree type icons (Nerd Font, configurable) and a `/` tree filter
 
-Roadmap toward broader jadx-gui parity: resource/`AndroidManifest` viewer, certificate info, smali
-view, bookmarks, deobfuscation toggle, mappings import/export, and instruction-level comments.
+Roadmap toward broader jadx-gui parity: certificate info, bookmarks, deobfuscation toggle,
+mappings import/export, and instruction-level comments.
