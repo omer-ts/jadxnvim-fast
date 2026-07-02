@@ -237,6 +237,10 @@ final class SearchIndex {
 		private final ShardMeta[] meta = new ShardMeta[SHARDS];
 
 		Builder(File shardsDir, File namesDir, File xrefDir) throws IOException {
+			this(shardsDir, namesDir, xrefDir, false);
+		}
+
+		private Builder(File shardsDir, File namesDir, File xrefDir, boolean append) throws IOException {
 			this.shardsDir = shardsDir;
 			this.namesDir = namesDir;
 			this.xrefDir = xrefDir;
@@ -244,18 +248,62 @@ final class SearchIndex {
 			namesDir.mkdirs();
 			xrefDir.mkdirs();
 			for (int i = 0; i < SHARDS; i++) {
-				writers[i] = Files.newBufferedWriter(new File(shardsDir, shardName(i)).toPath(),
-						StandardCharsets.UTF_8);
-				clsWriters[i] = Files.newBufferedWriter(new File(namesDir, classesName(i)).toPath(),
-						StandardCharsets.UTF_8);
-				mthWriters[i] = Files.newBufferedWriter(new File(namesDir, methodsName(i)).toPath(),
-						StandardCharsets.UTF_8);
-				refWriters[i] = Files.newBufferedWriter(new File(xrefDir, refsName(i)).toPath(),
-						StandardCharsets.UTF_8);
-				declWriters[i] = Files.newBufferedWriter(new File(xrefDir, declsName(i)).toPath(),
-						StandardCharsets.UTF_8);
+				writers[i] = open(new File(shardsDir, shardName(i)), append);
+				clsWriters[i] = open(new File(namesDir, classesName(i)), append);
+				mthWriters[i] = open(new File(namesDir, methodsName(i)), append);
+				refWriters[i] = open(new File(xrefDir, refsName(i)), append);
+				declWriters[i] = open(new File(xrefDir, declsName(i)), append);
 				locks[i] = new Object();
 				meta[i] = new ShardMeta();
+			}
+		}
+
+		private static Writer open(File f, boolean append) throws IOException {
+			if (append) {
+				return Files.newBufferedWriter(f.toPath(), StandardCharsets.UTF_8,
+						java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+			}
+			return Files.newBufferedWriter(f.toPath(), StandardCharsets.UTF_8);
+		}
+
+		/**
+		 * Reopen a partially-built index to continue where a checkpoint left off: truncate every
+		 * shard file back to its checkpointed length (dropping any partial tail from the interrupted
+		 * batch), reopen writers in append mode, and restore the line index + byte/line counters.
+		 */
+		static Builder resume(File shardsDir, File namesDir, File xrefDir, File metaDir) throws IOException {
+			List<String> pos = Files.readAllLines(new File(metaDir, ".pos").toPath(), StandardCharsets.UTF_8);
+			long[] codeB = new long[SHARDS];
+			int[] codeL = new int[SHARDS];
+			for (int i = 0; i < SHARDS && i < pos.size(); i++) {
+				String[] f = pos.get(i).split("\t", -1);
+				if (f.length < 6) {
+					continue;
+				}
+				codeB[i] = Long.parseLong(f[0]);
+				codeL[i] = Integer.parseInt(f[1]);
+				truncate(new File(shardsDir, shardName(i)), codeB[i]);
+				truncate(new File(namesDir, classesName(i)), Long.parseLong(f[2]));
+				truncate(new File(namesDir, methodsName(i)), Long.parseLong(f[3]));
+				truncate(new File(xrefDir, refsName(i)), Long.parseLong(f[4]));
+				truncate(new File(xrefDir, declsName(i)), Long.parseLong(f[5]));
+			}
+			Builder b = new Builder(shardsDir, namesDir, xrefDir, true);
+			for (int i = 0; i < SHARDS; i++) {
+				b.byteCount[i] = codeB[i];
+				b.lineCount[i] = codeL[i];
+				loadMeta(new File(metaDir, String.format("s%03d.idx", i)), b.meta[i]);
+			}
+			return b;
+		}
+
+		private static void truncate(File f, long len) {
+			try (RandomAccessFile raf = new RandomAccessFile(f, "rw")) {
+				if (raf.length() > len) {
+					raf.setLength(len);
+				}
+			} catch (Exception ignore) {
+				// best effort; a missing/short file just gets appended to
 			}
 		}
 
@@ -328,7 +376,7 @@ final class SearchIndex {
 			}
 		}
 
-		/** Close shard files and write the persisted line index; returns the queryable index. */
+		/** Close shard files and write the persisted line index + signature; returns the index. */
 		SearchIndex finish(File metaDir, long signature) throws IOException {
 			for (int i = 0; i < SHARDS; i++) {
 				closeQuietly(writers[i]);
@@ -337,6 +385,39 @@ final class SearchIndex {
 				closeQuietly(refWriters[i]);
 				closeQuietly(declWriters[i]);
 			}
+			writeIdx(metaDir);
+			Files.write(new File(metaDir, ".sig").toPath(),
+					Long.toString(signature).getBytes(StandardCharsets.UTF_8));
+			return new SearchIndex(shardsDir, namesDir, xrefDir, meta);
+		}
+
+		/**
+		 * Persist a consistent checkpoint without closing: flush every writer, then record the line
+		 * index (.idx) and byte/line positions (.pos). Call only when no worker is mid-add (i.e.
+		 * between batches) so the positions match what's on disk. Resume truncates back to these.
+		 */
+		void checkpoint(File metaDir) throws IOException {
+			for (int i = 0; i < SHARDS; i++) {
+				writers[i].flush();
+				clsWriters[i].flush();
+				mthWriters[i].flush();
+				refWriters[i].flush();
+				declWriters[i].flush();
+			}
+			writeIdx(metaDir);
+			StringBuilder pos = new StringBuilder();
+			for (int i = 0; i < SHARDS; i++) {
+				// codeBytes \t lineCount \t clsBytes \t mthBytes \t refBytes \t declBytes
+				pos.append(byteCount[i]).append('\t').append(lineCount[i]).append('\t')
+						.append(new File(namesDir, classesName(i)).length()).append('\t')
+						.append(new File(namesDir, methodsName(i)).length()).append('\t')
+						.append(new File(xrefDir, refsName(i)).length()).append('\t')
+						.append(new File(xrefDir, declsName(i)).length()).append('\n');
+			}
+			Files.write(new File(metaDir, ".pos").toPath(), pos.toString().getBytes(StandardCharsets.UTF_8));
+		}
+
+		private void writeIdx(File metaDir) throws IOException {
 			metaDir.mkdirs();
 			for (int i = 0; i < SHARDS; i++) {
 				ShardMeta m = meta[i];
@@ -350,9 +431,6 @@ final class SearchIndex {
 				Files.write(new File(metaDir, String.format("s%03d.idx", i)).toPath(),
 						sb.toString().getBytes(StandardCharsets.UTF_8));
 			}
-			Files.write(new File(metaDir, ".sig").toPath(),
-					Long.toString(signature).getBytes(StandardCharsets.UTF_8));
-			return new SearchIndex(shardsDir, namesDir, xrefDir, meta);
 		}
 
 		private static void closeQuietly(Writer w) {
@@ -385,31 +463,34 @@ final class SearchIndex {
 		ShardMeta[] shards = new ShardMeta[SHARDS];
 		for (int i = 0; i < SHARDS; i++) {
 			ShardMeta m = new ShardMeta();
-			File f = new File(metaDir, String.format("s%03d.idx", i));
-			if (f.isFile()) {
-				List<String> lines = Files.readAllLines(f.toPath(), StandardCharsets.UTF_8);
-				for (String line : lines) {
-					if (line.isEmpty()) {
-						continue;
-					}
-					// startLine \t byteStart \t byteLen \t id \t fullName
-					int t1 = line.indexOf('\t');
-					int t2 = line.indexOf('\t', t1 + 1);
-					int t3 = line.indexOf('\t', t2 + 1);
-					int t4 = line.indexOf('\t', t3 + 1);
-					if (t1 < 0 || t2 < 0 || t3 < 0 || t4 < 0) {
-						continue;
-					}
-					int start = Integer.parseInt(line.substring(0, t1));
-					long byteStart = Long.parseLong(line.substring(t1 + 1, t2));
-					int byteLen = Integer.parseInt(line.substring(t2 + 1, t3));
-					String id = line.substring(t3 + 1, t4);
-					String fn = line.substring(t4 + 1);
-					m.add(start, byteStart, byteLen, id, fn);
-				}
-			}
+			loadMeta(new File(metaDir, String.format("s%03d.idx", i)), m);
 			shards[i] = m;
 		}
 		return new SearchIndex(shardsDir, namesDir, xrefDir, shards);
+	}
+
+	// Parse a per-shard .idx ("startLine\tbyteStart\tbyteLen\tid\tfullName") into a ShardMeta.
+	private static void loadMeta(File f, ShardMeta m) throws IOException {
+		if (!f.isFile()) {
+			return;
+		}
+		for (String line : Files.readAllLines(f.toPath(), StandardCharsets.UTF_8)) {
+			if (line.isEmpty()) {
+				continue;
+			}
+			int t1 = line.indexOf('\t');
+			int t2 = line.indexOf('\t', t1 + 1);
+			int t3 = line.indexOf('\t', t2 + 1);
+			int t4 = line.indexOf('\t', t3 + 1);
+			if (t1 < 0 || t2 < 0 || t3 < 0 || t4 < 0) {
+				continue;
+			}
+			int start = Integer.parseInt(line.substring(0, t1));
+			long byteStart = Long.parseLong(line.substring(t1 + 1, t2));
+			int byteLen = Integer.parseInt(line.substring(t2 + 1, t3));
+			String id = line.substring(t3 + 1, t4);
+			String fn = line.substring(t4 + 1);
+			m.add(start, byteStart, byteLen, id, fn);
+		}
 	}
 }

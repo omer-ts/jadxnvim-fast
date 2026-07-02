@@ -5,6 +5,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -436,25 +437,10 @@ public final class Session {
 		return res + 1;
 	}
 
-	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File nmDir, File xrDir, File mDir, long sig,
-			java.util.concurrent.atomic.AtomicBoolean cancel) throws Exception {
-		deleteDir(idxDir);
-		deleteDir(nmDir);
-		deleteDir(xrDir);
-		deleteDir(mDir);
-		SearchIndex.Builder builder = new SearchIndex.Builder(idxDir, nmDir, xrDir);
-		List<JavaClass> all = d.getClasses();
-		int total = all.size();
-		if (total == 0) {
-			return builder.finish(mDir, sig);
-		}
-		// Build the disk cross-reference index only in lean mode: that's the case where the model is
-		// dropped and gd/gr must be answered from disk. The code metadata is available regardless of
-		// the usage graph, so this works even though lean implies usage = false.
-		boolean withXref = lean;
-		// Cap concurrency: each in-flight decompile holds a class's transient state, so on a
-		// many-core box too many at once spikes peak memory (a cause of OOM-kills during export on
-		// memory-limited servers). Tunable via -Djadxnvim.indexThreads.
+	// Cap concurrency: each in-flight decompile holds a class's transient state, so too many at once
+	// spikes peak memory (a cause of OOM-kills). Default min(cores, 8); tunable via the OOM-retry
+	// ladder / -Djadxnvim.indexThreads.
+	private int indexThreads() {
 		int cores = Math.max(1, Runtime.getRuntime().availableProcessors());
 		int threads = Math.max(1, Math.min(cores, 8));
 		try {
@@ -465,82 +451,211 @@ public final class Session {
 		} catch (Exception ignore) {
 			// keep default
 		}
-		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads, r -> {
+		return threads;
+	}
+
+	// Index one class into the builder (decompile -> code + names + xref).
+	private void indexClass(SearchIndex.Builder builder, JavaClass cls, boolean withXref) {
+		String id = cls.getRawName();
+		ICodeInfo ci = cls.getCodeInfo();
+		String code = ci.getCodeStr();
+		int[] starts = lineStarts(code);
+		// Raw parsed method list: same order memberPos uses, so the stored index maps back correctly.
+		// Skipped (DONT_GENERATE) slots stay null to keep positions. The method's declaration line
+		// (getDefPosition in this exported code) is stored so lean-mode memberPos resolves off disk.
+		List<String> methodNames = new ArrayList<>();
+		List<String> methodLines = new ArrayList<>();
+		try {
+			for (MethodNode mth : cls.getClassNode().getMethods()) {
+				if (mth.contains(AFlag.DONT_GENERATE)) {
+					methodNames.add(null);
+					methodLines.add(null);
+				} else {
+					methodNames.add(mth.getMethodInfo().getAlias());
+					int dp = mth.getDefPosition();
+					methodLines.add(dp >= 0 ? Integer.toString(lineOf(starts, dp)) : null);
+				}
+			}
+		} catch (Throwable ignore) {
+			// no methods indexed for this class
+		}
+		List<String> refLines = null;
+		List<String> declLines = null;
+		if (withXref) {
+			refLines = new ArrayList<>();
+			declLines = new ArrayList<>();
+			try {
+				extractEdges(code, starts, ci.getCodeMetadata(), id, refLines, declLines);
+			} catch (Throwable ignore) {
+				// no xref for this class
+			}
+		}
+		try {
+			builder.add(id, cls.getFullName(), code, methodNames, methodLines, refLines, declLines);
+		} catch (IOException e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File nmDir, File xrDir, File mDir, long sig,
+			java.util.concurrent.atomic.AtomicBoolean cancel) throws Exception {
+		List<JavaClass> all = d.getClasses();
+		int total = all.size();
+		boolean withXref = lean;
+
+		// Resume a compatible partial checkpoint if one exists; any resume error falls back to a
+		// clean rebuild, so a corrupt checkpoint can never produce a bad index.
+		File progressFile = new File(mDir, ".progress");
+		File doneFile = new File(mDir, ".done");
+		java.util.Set<String> doneAll = new java.util.HashSet<>();
+		SearchIndex.Builder builder = null;
+		if (checkpointMatches(progressFile, sig) && new File(mDir, ".pos").isFile()) {
+			try {
+				loadDoneSet(doneFile, doneAll);
+				builder = SearchIndex.Builder.resume(idxDir, nmDir, xrDir, mDir);
+				emitter.emit("loadProgress", Map.of("done", doneAll.size(), "total", total, "percent",
+						total == 0 ? 0 : (int) ((long) doneAll.size() * 100 / total), "resumed", true));
+			} catch (Exception e) {
+				System.err.println("[jadxd] index resume failed, rebuilding: " + e);
+				builder = null;
+				doneAll.clear();
+			}
+		}
+		if (builder == null) {
+			deleteDir(idxDir);
+			deleteDir(nmDir);
+			deleteDir(xrDir);
+			deleteDir(mDir);
+			builder = new SearchIndex.Builder(idxDir, nmDir, xrDir);
+		}
+		if (total == 0) {
+			return builder.finish(mDir, sig);
+		}
+
+		List<JavaClass> remaining = new ArrayList<>();
+		for (JavaClass c : all) {
+			if (!doneAll.contains(c.getRawName())) {
+				remaining.add(c);
+			}
+		}
+
+		final SearchIndex.Builder b = builder;
+		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(indexThreads(), r -> {
 			Thread th = new Thread(r, "jadx-index");
 			th.setDaemon(true);
 			th.setPriority(Thread.MIN_PRIORITY);
 			return th;
 		});
-		java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
+		java.util.concurrent.atomic.AtomicInteger progress = new java.util.concurrent.atomic.AtomicInteger(doneAll.size());
 		java.util.concurrent.atomic.AtomicInteger lastPct = new java.util.concurrent.atomic.AtomicInteger(-1);
-		for (JavaClass cls : all) {
-			pool.submit(() -> {
+		// Process in batches; checkpoint between batches (no worker active) so a later OOM-kill
+		// resumes from the last checkpoint instead of re-indexing everything.
+		int batch = 20000;
+		try {
+			String bp = System.getProperty("jadxnvim.indexBatch");
+			if (bp != null) {
+				batch = Math.max(1, Integer.parseInt(bp.trim()));
+			}
+		} catch (Exception ignore) {
+			// keep default
+		}
+		final int BATCH = batch;
+		try {
+			for (int s = 0; s < remaining.size(); s += BATCH) {
 				if (cancel.get()) {
-					return;
+					return null;
 				}
-				try {
-					String id = cls.getRawName();
-					ICodeInfo ci = cls.getCodeInfo();
-					String code = ci.getCodeStr();
-					int[] starts = lineStarts(code);
-					// Raw parsed method list: same order memberPos uses, so the stored index maps
-					// back correctly. Skipped (DONT_GENERATE) slots stay null to keep positions. The
-					// method's declaration line (from getDefPosition in this exported code) is stored
-					// so lean-mode memberPos can jump to it without the model.
-					List<String> methodNames = new ArrayList<>();
-					List<String> methodLines = new ArrayList<>();
-					try {
-						for (MethodNode mth : cls.getClassNode().getMethods()) {
-							if (mth.contains(AFlag.DONT_GENERATE)) {
-								methodNames.add(null);
-								methodLines.add(null);
-							} else {
-								methodNames.add(mth.getMethodInfo().getAlias());
-								int dp = mth.getDefPosition();
-								methodLines.add(dp >= 0 ? Integer.toString(lineOf(starts, dp)) : null);
+				int end = Math.min(s + BATCH, remaining.size());
+				List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+				List<String> batchIds = java.util.Collections.synchronizedList(new ArrayList<>());
+				for (int k = s; k < end; k++) {
+					JavaClass cls = remaining.get(k);
+					futures.add(pool.submit(() -> {
+						if (cancel.get()) {
+							return;
+						}
+						try {
+							indexClass(b, cls, withXref);
+							batchIds.add(cls.getRawName());
+						} catch (Throwable ignore) {
+							// keep going; a failed class just isn't indexed
+						} finally {
+							try {
+								cls.unload();
+							} catch (Exception ignore) {
+								// best effort
+							}
+							int c = progress.incrementAndGet();
+							int pct = (int) ((long) c * 100 / total);
+							if (pct != lastPct.getAndSet(pct)) {
+								emitter.emit("loadProgress", Map.of("done", c, "total", total, "percent", pct));
 							}
 						}
-					} catch (Throwable ignore) {
-						// no methods indexed for this class
-					}
-					List<String> refLines = null;
-					List<String> declLines = null;
-					if (withXref) {
-						refLines = new ArrayList<>();
-						declLines = new ArrayList<>();
-						try {
-							extractEdges(code, starts, ci.getCodeMetadata(), id, refLines, declLines);
-						} catch (Throwable ignore) {
-							// no xref for this class
-						}
-					}
-					builder.add(id, cls.getFullName(), code, methodNames, methodLines, refLines, declLines);
-				} catch (Throwable ignore) {
-					// keep going; a failed class just isn't indexed
-				} finally {
+					}));
+				}
+				for (java.util.concurrent.Future<?> f : futures) {
 					try {
-						cls.unload();
+						f.get();
 					} catch (Exception ignore) {
-						// best effort
-					}
-					int c = done.incrementAndGet();
-					int pct = (int) ((long) c * 100 / total);
-					if (pct != lastPct.getAndSet(pct)) {
-						Map<String, Object> m = new LinkedHashMap<>();
-						m.put("done", c);
-						m.put("total", total);
-						m.put("percent", pct);
-						emitter.emit("loadProgress", m);
+						// a worker failure already logged; keep going
 					}
 				}
-			});
+				if (cancel.get()) {
+					return null;
+				}
+				// checkpoint: no workers active now, so positions match what's on disk
+				doneAll.addAll(batchIds);
+				b.checkpoint(mDir);
+				writeDoneSet(doneFile, doneAll);
+				writeProgress(progressFile, doneAll.size(), total, sig);
+			}
+		} finally {
+			pool.shutdown();
 		}
-		pool.shutdown();
-		pool.awaitTermination(6, java.util.concurrent.TimeUnit.HOURS);
 		if (cancel.get()) {
 			return null;
 		}
-		return builder.finish(mDir, sig);
+		SearchIndex idx = b.finish(mDir, sig);
+		// completed — the resume artifacts are no longer needed
+		progressFile.delete();
+		doneFile.delete();
+		new File(mDir, ".pos").delete();
+		return idx;
+	}
+
+	private static boolean checkpointMatches(File f, long sig) {
+		if (!f.isFile()) {
+			return false;
+		}
+		try {
+			String[] p = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8).trim().split("\t");
+			return p.length >= 3 && Long.parseLong(p[2].trim()) == sig;
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
+	private static void loadDoneSet(File f, java.util.Set<String> out) throws IOException {
+		if (!f.isFile()) {
+			return;
+		}
+		for (String ln : Files.readAllLines(f.toPath(), StandardCharsets.UTF_8)) {
+			if (!ln.isEmpty()) {
+				out.add(ln);
+			}
+		}
+	}
+
+	private static void writeDoneSet(File f, java.util.Set<String> ids) throws IOException {
+		StringBuilder sb = new StringBuilder(ids.size() * 24);
+		for (String id : ids) {
+			sb.append(id).append('\n');
+		}
+		Files.write(f.toPath(), sb.toString().getBytes(StandardCharsets.UTF_8));
+	}
+
+	private static void writeProgress(File f, int done, int total, long sig) throws IOException {
+		Files.write(f.toPath(), (done + "\t" + total + "\t" + sig).getBytes(StandardCharsets.UTF_8));
 	}
 
 	private static void deleteDir(File dir) {

@@ -263,6 +263,10 @@ function M.open(project, opts)
     -- big export-time heap back to the OS once the model is dropped (default ratios keep it mapped).
     vim.list_extend(cmd, { "-XX:MinHeapFreeRatio=5", "-XX:MaxHeapFreeRatio=25", "-XX:G1PeriodicGCInterval=5000" })
   end
+  if opts._index_threads then
+    -- OOM-retry ladder: cap indexing concurrency to lower peak memory.
+    table.insert(cmd, "-Djadxnvim.indexThreads=" .. tostring(opts._index_threads))
+  end
   vim.list_extend(cmd, M.config.java_args)
   vim.list_extend(cmd, { "-jar", M.config.jar, project })
   if not will_export then
@@ -302,20 +306,35 @@ function M.open(project, opts)
     tree.open()
     restore_session(project)
   end, function(code_)
-    -- The daemon died unexpectedly (137 = OOM-killed, usually while indexing a huge APK). If we
-    -- were building the search index, retry once without it so browsing + in-memory search still
-    -- work, and tell the user how to make indexing fit.
+    -- The daemon died unexpectedly (137 = OOM-killed, usually while indexing a huge APK). Rather
+    -- than give up on the index, retry with progressively fewer indexing threads (each concurrent
+    -- decompile holds memory, so fewer = lower peak). The daemon resumes from its last checkpoint,
+    -- so little work is redone. Only after 1 thread still OOMs do we fall back to no index.
     M._loading = false
     progress.finish()
     if will_export and not opts._force_no_export then
-      vim.notify(
-        "[jadxnvim] indexing ran out of memory (daemon exited " .. tostring(code_) .. "). Reopening "
-          .. "without the search index — browsing and (slower) in-memory search still work.\n"
-          .. "To index this APK, give the JVM more memory via java_args (e.g. { '-Xmx24g' }), or set "
-          .. "export = false to skip indexing.",
-        vim.log.levels.WARN
-      )
-      M.open(project, { temp = temp, _force_no_export = true })
+      local ladder = { [8] = 4, [4] = 2, [2] = 1 }
+      local cur = opts._index_threads or 8
+      local nxt = ladder[cur]
+      if nxt then
+        vim.notify(
+          string.format(
+            "[jadxnvim] indexing ran out of memory (exit %s). Retrying with %d indexing thread%s "
+              .. "(lower memory), resuming where it left off…",
+            tostring(code_), nxt, nxt == 1 and "" or "s"
+          ),
+          vim.log.levels.WARN
+        )
+        M.open(project, { temp = temp, _index_threads = nxt })
+      else
+        vim.notify(
+          "[jadxnvim] indexing ran out of memory even at 1 thread. Reopening without the search "
+            .. "index — browsing and (slower) in-memory search still work. Give the JVM more memory "
+            .. "via java_args (e.g. { '-Xmx24g' }), or set export = false.",
+          vim.log.levels.WARN
+        )
+        M.open(project, { temp = temp, _force_no_export = true })
+      end
     else
       vim.notify("[jadxnvim] daemon exited (" .. tostring(code_) .. ")", vim.log.levels.ERROR)
     end
