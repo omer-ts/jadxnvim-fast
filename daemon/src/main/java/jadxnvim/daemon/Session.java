@@ -722,7 +722,7 @@ public final class Session {
 		// ("name\tfullName\tid\tindex\tline"), so we can resolve it without the model.
 		if (servingFromDisk()) {
 			int line = 1;
-			for (String ln : rgLines(searchIndex.namesDir(), "mth_s*.txt",
+			for (String ln : rgLines(searchIndex.namesDir(), SearchIndex.methodsName(searchIndex.shardIndexOf(id)),
 					"\t" + rgRegex(id) + "\t" + index + "\t")) {
 				String[] f = ln.split("\t", -1);
 				// name, fullName, id, index, line
@@ -874,8 +874,10 @@ public final class Session {
 		}
 		int cursor = Positions.toOffset(code, line, col);
 		String pat = "\t" + rgRegex(id) + "\t" + line + "\t";
-		List<String> lines = rgXref("ref_s*.txt", pat);
-		lines.addAll(rgXref("decl_s*.txt", pat));
+		// Edges for this class live only in its shard — scan that one file, not all of them.
+		int sh = searchIndex.shardIndexOf(id);
+		List<String> lines = rgXref(SearchIndex.refsName(sh), pat);
+		lines.addAll(rgXref(SearchIndex.declsName(sh), pat));
 		String bestKey = null;
 		int bestOff = -1;
 		for (String ln : lines) {

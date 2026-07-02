@@ -124,6 +124,11 @@ final class SearchIndex {
 		return Math.floorMod(id.hashCode(), SHARDS);
 	}
 
+	/** The shard a class's code/name/xref entries live in — lets a query target one file, not all. */
+	int shardIndexOf(String id) {
+		return shardOf(id);
+	}
+
 	/** Sorted per-shard index: parallel arrays of a class's first line, byte range, id and name. */
 	private static final class ShardMeta {
 		int[] startLine = new int[0];
