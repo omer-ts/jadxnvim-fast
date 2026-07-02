@@ -27,6 +27,26 @@ vim.api.nvim_create_user_command("JadxTree", function()
   require("jadxnvim").tree()
 end, { desc = "Focus the jadxnvim project tree" })
 
+vim.api.nvim_create_user_command("JadxGotoPackage", function(opts)
+  require("jadxnvim.tree").goto_package(opts.args)
+end, {
+  nargs = 1,
+  complete = function(arglead)
+    local names = require("jadxnvim.tree").package_names()
+    if arglead == "" then
+      return names
+    end
+    local out = {}
+    for _, n in ipairs(names) do
+      if n:lower():find(arglead:lower(), 1, true) then
+        out[#out + 1] = n
+      end
+    end
+    return out
+  end,
+  desc = "jadxnvim: jump the tree to a package (with completion)",
+})
+
 vim.api.nvim_create_user_command("JadxClose", function()
   require("jadxnvim").close()
 end, { desc = "Close the jadxnvim project and stop the daemon" })
@@ -74,6 +94,13 @@ end, { nargs = "?", desc = "jadxnvim: fuzzy-find across full-text search results
 vim.api.nvim_create_user_command("JadxFindAll", function()
   require("jadxnvim.find").combined()
 end, { desc = "jadxnvim: combined search (classes + methods + text)" })
+
+vim.api.nvim_create_user_command("JadxGotoSource", function(opts)
+  require("jadxnvim.stack").goto_source(opts.args)
+end, {
+  nargs = "?",
+  desc = "jadxnvim: jump to a stack-trace frame's source line (Class(File.java:line))",
+})
 
 vim.api.nvim_create_user_command("JadxRename", function()
   require("jadxnvim.edit").rename()

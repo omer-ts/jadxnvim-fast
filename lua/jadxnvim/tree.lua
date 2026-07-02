@@ -135,6 +135,72 @@ function M.open()
   end)
 end
 
+-- Package names for command-line completion (empty until the tree has loaded).
+function M.package_names()
+  local names = {}
+  for _, p in ipairs(state.packages) do
+    names[#names + 1] = p.name ~= "" and p.name or "(default package)"
+  end
+  return names
+end
+
+local function focus_package(p)
+  if not (state.winid and vim.api.nvim_win_is_valid(state.winid)) then
+    return
+  end
+  for i, row in pairs(state.rows) do
+    if row.kind == "package" and row.pkg == p then
+      vim.api.nvim_set_current_win(state.winid)
+      pcall(vim.api.nvim_win_set_cursor, state.winid, { i, 0 })
+      vim.cmd("normal! zz")
+      return
+    end
+  end
+end
+
+--- Expand the tree at `name` and put the cursor on it. `name` matches getPackages names
+--- ("(default package)" for the root). Waits briefly if the package list is still loading.
+function M.goto_package(name)
+  if not (state.winid and vim.api.nvim_win_is_valid(state.winid)) then
+    M.open() -- opens the window and loads packages asynchronously
+  else
+    vim.api.nvim_set_current_win(state.winid)
+  end
+  local target = (name == "(default package)") and "" or name
+  local function go()
+    for _, p in ipairs(state.packages) do
+      if p.name == target then
+        if not p.expanded and not p.classes then
+          rpc.request("getClasses", { package = p.name }, function(err, res)
+            vim.schedule(function()
+              if not err then
+                p.classes = res.classes or {}
+                p.expanded = true
+                render()
+                focus_package(p)
+              end
+            end)
+          end)
+        else
+          p.expanded = true
+          render()
+          focus_package(p)
+        end
+        return true
+      end
+    end
+    return false
+  end
+  if not go() then
+    -- packages may still be loading from M.open(); retry once shortly
+    vim.defer_fn(function()
+      if not go() then
+        vim.notify("[jadxnvim] package not found: " .. name, vim.log.levels.WARN)
+      end
+    end, 400)
+  end
+end
+
 function M.reset()
   state.packages = {}
   state.rows = {}

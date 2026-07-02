@@ -126,6 +126,8 @@ Extra args after the project are passed through to `nvim`.
 | ---------------------- | --------------------------------------------------------------- |
 | `:Jadx <path>`         | Open an APK / dex / jar / `.jadx` project and show the tree     |
 | `:JadxTree`            | Focus the project tree                                          |
+| `:JadxGotoPackage {p}` | Jump the tree to a package (Tab-completes package names)         |
+| `:JadxGotoSource [f]`  | Jump a stack-trace frame `Class(File.java:line)` to its smali source line |
 | `:JadxDef`             | Go to definition of the symbol under the cursor                 |
 | `:JadxUsages`          | Find usages of the symbol under the cursor (xref, browsable + preview) |
 | `:JadxSearch [text]`   | Full-text search across decompiled code (streamed → quickfix)   |

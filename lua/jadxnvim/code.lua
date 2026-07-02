@@ -261,6 +261,17 @@ local function open_named(name, opts)
   if opts.find_method then
     opts.line = locate_method_line(bufnr, opts.find_method, opts.line)
   end
+  if opts.source_line then
+    -- smali carries dex debug lines as `.line <n>`; land on that directive
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local want = "^%s*%.line%s+" .. opts.source_line .. "%s*$"
+    for i, l in ipairs(lines) do
+      if l:match(want) then
+        opts.line = i
+        break
+      end
+    end
+  end
   if opts.line then
     local lnum = math.max(1, opts.line)
     local text = (vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false))[1] or ""
