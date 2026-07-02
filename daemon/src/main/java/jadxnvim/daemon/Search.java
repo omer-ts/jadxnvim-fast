@@ -332,13 +332,18 @@ final class Search {
 			boolean clsMatch = pattern.matcher(cls.getName()).find()
 					|| pattern.matcher(cls.getFullName()).find();
 			List<MethodNode> mMatched = new ArrayList<>();
+			List<Integer> mMatchedIdx = new ArrayList<>();
 			List<MethodNode> mths = cn.getMethods();
-			for (MethodNode m : mths) {
+			// The loop index (counting DONT_GENERATE slots too) is the memberPos index, so the finder
+			// can jump straight to the method even before the on-disk name index exists.
+			for (int i = 0; i < mths.size(); i++) {
+				MethodNode m = mths.get(i);
 				if (m.contains(AFlag.DONT_GENERATE)) {
 					continue;
 				}
 				if (pattern.matcher(m.getMethodInfo().getAlias()).find()) {
 					mMatched.add(m);
+					mMatchedIdx.add(i);
 				}
 			}
 			List<FieldNode> fMatched = new ArrayList<>();
@@ -366,9 +371,12 @@ final class Search {
 				hits.add(nameHit(id, cls.getFullName(), "class", posOf(code, cls.getDefPos())));
 				count++;
 			}
-			for (MethodNode m : mMatched) {
+			for (int k = 0; k < mMatched.size(); k++) {
+				MethodNode m = mMatched.get(k);
 				String label = m.getMethodInfo().getAlias() + "  ·  " + cls.getFullName();
-				hits.add(nameHit(id, label, "method", posOf(code, m.getDefPosition())));
+				Map<String, Object> hit = nameHit(id, label, "method", posOf(code, m.getDefPosition()));
+				hit.put("index", mMatchedIdx.get(k));
+				hits.add(hit);
 				count++;
 			}
 			for (FieldNode f : fMatched) {

@@ -73,7 +73,13 @@ local function name_finder(kind, title, prompt, on_select, previewer)
           local batch = {}
           local ikind = (kind == "method") and "method" or "class"
           for _, it in ipairs(p.items or {}) do
-            local item = { text = icon(ikind) .. (it.fullName or ""), id = it.id, index = it.index, kind = it.kind }
+            local full = it.fullName or ""
+            local item = { text = icon(ikind) .. full, id = it.id, index = it.index, kind = it.kind }
+            if ikind == "method" then
+              -- daemon sends "name  ·  owner"; stash the bare name so open_method needn't parse
+              -- (and can't trip over) the icon-prefixed display text.
+              item.name = vim.trim(full:match("^(.-)%s*·") or full)
+            end
             batch[#batch + 1] = item
             collected[#collected + 1] = item
           end
