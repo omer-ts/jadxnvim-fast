@@ -146,7 +146,20 @@ public final class Session {
 	private File projectFile;
 	// Bumped whenever code data changes; classes decompiled at an older version need a reload.
 	private int codeDataVersion = 0;
-	private final Map<String, ICodeInfo> freshInfo = new java.util.HashMap<>();
+	// Per-class decompiled layout cache. With NoOpCodeCache, cls.getCodeInfo() re-decompiles on every
+	// call and jadx's parallel decompile is NOT deterministic, so two calls can return different
+	// line/offset layouts. getCode fills the buffer the user sees; a later gd/gr must resolve the
+	// cursor against the SAME layout, or getJavaNodeAtPosition lands on the wrong offset (or nothing).
+	// Caching the first ICodeInfo per class keeps every access consistent. LRU-bounded (viewed classes
+	// only); cleared on edit/reload.
+	private static final int FRESH_INFO_MAX = 128;
+	private final Map<String, ICodeInfo> freshInfo =
+			new java.util.LinkedHashMap<String, ICodeInfo>(256, 0.75f, true) {
+				@Override
+				protected boolean removeEldestEntry(Map.Entry<String, ICodeInfo> e) {
+					return size() > FRESH_INFO_MAX;
+				}
+			};
 
 	// Method override hierarchy, captured during export. jadx's live override attribute is torn down
 	// by the per-class unload() that bounds export memory (re-decompiling an interface later yields an
@@ -1488,8 +1501,40 @@ public final class Session {
 			throw new IllegalArgumentException("class not found: " + id);
 		}
 		ICodeInfo info = freshCodeInfo(cls, id);
-		int offset = Positions.toOffset(info.getCodeStr(), line, col);
-		return d.getJavaNodeAtPosition(info, offset);
+		String code = info.getCodeStr();
+		int offset = Positions.toOffset(code, line, col);
+		JavaNode n = d.getJavaNodeAtPosition(info, offset);
+		if (n != null) {
+			return n;
+		}
+		// Position-based resolution can miss a method/field DECLARATION inside a nested class (jadx
+		// doesn't always annotate the declaration name — seen for callback impls like
+		// ActionMenuView$ActionMenuPresenterCallback.onOpenSubMenu). Fall back to the member declared on
+		// this line: getDefPos() is in the top class's code coordinates, matching `code`.
+		return declAtLine(cls, lineStarts(code), line);
+	}
+
+	// A method or field whose declaration lands on `line` (searching the class and its inner classes).
+	private JavaNode declAtLine(JavaClass cls, int[] starts, int line) {
+		for (JavaMethod m : cls.getMethods()) {
+			int dp = m.getDefPos();
+			if (dp >= 0 && lineOf(starts, dp) == line) {
+				return m;
+			}
+		}
+		for (jadx.api.JavaField f : cls.getFields()) {
+			int dp = f.getDefPos();
+			if (dp >= 0 && lineOf(starts, dp) == line) {
+				return f;
+			}
+		}
+		for (JavaClass inner : cls.getInnerClasses()) {
+			JavaNode r = declAtLine(inner, starts, line);
+			if (r != null) {
+				return r;
+			}
+		}
+		return null;
 	}
 
 	public Map<String, Object> gotoDef(String id, int line, int col) {
@@ -1760,21 +1805,16 @@ public final class Session {
 	 * regenerated via {@link JavaClass#reload()} for changes to appear.
 	 */
 	private ICodeInfo freshCodeInfo(JavaClass cls, String id) {
-		if (codeDataVersion > 0) {
-			// After an edit, reload once and CACHE the ICodeInfo. With NoOpCodeCache, getCodeInfo()
-			// re-decompiles on every call and jadx's parallel decompile isn't deterministic, so
-			// re-fetching would hand getCode and gd/gr different line/offset layouts -> broken xrefs.
-			// Caching the reloaded copy keeps every access to a class consistent. Bounded to classes
-			// touched since the last edit; cleared on the next edit.
-			ICodeInfo cached = freshInfo.get(id);
-			if (cached != null) {
-				return cached;
-			}
-			ICodeInfo info = cls.reload();
-			freshInfo.put(id, info);
-			return info;
+		ICodeInfo cached = freshInfo.get(id);
+		if (cached != null) {
+			return cached;
 		}
-		return cls.getCodeInfo();
+		// After an edit the cached text is stale (reloadCodeData only updates rename/comment mappings),
+		// so regenerate via reload(); otherwise take the current decompile. Either way cache it so every
+		// subsequent access to this class (getCode, gd, gr) sees the identical layout.
+		ICodeInfo info = codeDataVersion > 0 ? cls.reload() : cls.getCodeInfo();
+		freshInfo.put(id, info);
+		return info;
 	}
 
 	/** Re-apply the code data to the live decompiler and persist the project file. */
