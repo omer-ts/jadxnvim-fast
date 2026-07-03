@@ -48,14 +48,49 @@ function M.record(entry)
   end
 end
 
---- Reopen a recorded search's picker (its full results, with the original preview + open action).
+--- Reopen a recorded search. Entries seeded from the project (no stored results) re-run the search;
+--- entries with results reopen them directly.
 local function reopen(entry)
+  if entry.rerun then
+    require("jadxnvim.search").text(entry.query)
+    return
+  end
   fuzzy.pick({
     title = entry.title,
     items = entry.items,
     previewer = entry.previewer,
     on_select = entry.on_select,
   })
+end
+
+--- The distinct query strings in the history, newest first (for persisting to the .jadx).
+function M.query_history()
+  local seen, out = {}, {}
+  for _, e in ipairs(saved) do
+    local q = e.query
+    if type(q) == "string" and q ~= "" and not seen[q] then
+      seen[q] = true
+      out[#out + 1] = q
+    end
+  end
+  return out
+end
+
+--- Seed re-runnable entries from a project's saved search queries (loaded from the .jadx).
+function M.seed(queries)
+  local have = {}
+  for _, e in ipairs(saved) do
+    if e.query then
+      have[e.query] = true
+    end
+  end
+  for _, q in ipairs(queries or {}) do
+    if type(q) == "string" and q ~= "" and not have[q] then
+      have[q] = true
+      saved[#saved + 1] =
+        { kind = "text", query = q, rerun = true, title = string.format(" Search '%s' (project) ", q), items = {} }
+    end
+  end
 end
 
 function M.clear()

@@ -41,17 +41,13 @@ final class ProjectIO {
 
 	static final int PROJECT_VERSION = 2;
 
-	/** Minimal mirror of jadx-gui's ProjectData (only the fields we read/write). */
-	static final class ProjectFile {
-		int projectVersion = PROJECT_VERSION;
-		List<String> files = new ArrayList<>();
-		JadxCodeData codeData = new JadxCodeData();
-	}
-
-	/** Result of loading a project: the resolved input file and its code data. */
+	/** Result of loading a project: the resolved input file, its code data, and the raw project JSON
+	 *  (so UI-state fields — openTabs, searchHistory, treeExpansionsV2, cacheDir — can be passed
+	 *  through to the plugin, which owns their jadx-gui format). */
 	static final class Loaded {
 		File input;
 		JadxCodeData codeData = new JadxCodeData();
+		JsonObject root = new JsonObject();
 	}
 
 	private static Gson gson() {
@@ -64,21 +60,40 @@ final class ProjectIO {
 	}
 
 	static Loaded load(File jadxFile) throws IOException {
+		Loaded loaded = new Loaded();
+		JsonObject root;
 		try (Reader r = Files.newBufferedReader(jadxFile.toPath(), StandardCharsets.UTF_8)) {
-			ProjectFile pf = gson().fromJson(r, ProjectFile.class);
-			Loaded loaded = new Loaded();
-			if (pf != null && pf.codeData != null) {
-				loaded.codeData = pf.codeData;
-			}
-			Path base = jadxFile.getAbsoluteFile().getParentFile().toPath();
-			if (pf != null && pf.files != null && !pf.files.isEmpty()) {
-				loaded.input = base.resolve(pf.files.get(0)).normalize().toFile();
-			}
-			return loaded;
+			JsonElement parsed = JsonParser.parseReader(r);
+			root = (parsed != null && parsed.isJsonObject()) ? parsed.getAsJsonObject() : new JsonObject();
 		}
+		loaded.root = root;
+		if (root.has("codeData") && root.get("codeData").isJsonObject()) {
+			loaded.codeData = gson().fromJson(root.get("codeData"), JadxCodeData.class);
+		}
+		if (loaded.codeData == null) {
+			loaded.codeData = new JadxCodeData();
+		}
+		Path base = jadxFile.getAbsoluteFile().getParentFile().toPath();
+		if (root.has("files") && root.get("files").isJsonArray()) {
+			JsonArray arr = root.getAsJsonArray("files");
+			if (arr.size() > 0) {
+				loaded.input = base.resolve(arr.get(0).getAsString()).normalize().toFile();
+			}
+		}
+		return loaded;
 	}
 
 	static void save(File jadxFile, File input, JadxCodeData codeData) throws IOException {
+		save(jadxFile, input, codeData, null);
+	}
+
+	/**
+	 * Save the project. {@code extras} (if non-null) supplies UI-state fields the plugin manages —
+	 * {@code openTabs}, {@code searchHistory}, {@code treeExpansionsV2}, {@code cacheDir} — which are
+	 * merged verbatim into the project JSON (the plugin builds them in jadx-gui's format). Any other
+	 * existing fields are preserved.
+	 */
+	static void save(File jadxFile, File input, JadxCodeData codeData, JsonObject extras) throws IOException {
 		Gson gson = gson();
 		Path base = jadxFile.getAbsoluteFile().getParentFile().toPath();
 		Path inputPath = input.getAbsoluteFile().toPath();
@@ -112,6 +127,15 @@ final class ProjectIO {
 		files.add(rel.replace('\\', '/'));
 		root.add("files", files);
 		root.add("codeData", gson.toJsonTree(codeData));
+		if (extras != null) {
+			for (java.util.Map.Entry<String, JsonElement> e : extras.entrySet()) {
+				if (e.getValue() == null || e.getValue().isJsonNull()) {
+					root.remove(e.getKey());
+				} else {
+					root.add(e.getKey(), e.getValue());
+				}
+			}
+		}
 
 		File parent = jadxFile.getAbsoluteFile().getParentFile();
 		if (parent != null) {

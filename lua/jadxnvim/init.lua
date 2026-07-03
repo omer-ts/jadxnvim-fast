@@ -12,7 +12,7 @@ local M = {}
 
 -- Minimum daemon RPC protocol version this plugin needs. Must match Session.PROTOCOL_VERSION in the
 -- daemon; bump both together when the plugin starts depending on a new daemon method.
-M.PROTOCOL_VERSION = 2
+M.PROTOCOL_VERSION = 3
 
 -- Plugin root: .../lua/jadxnvim/init.lua -> three levels up.
 local function plugin_root()
@@ -167,6 +167,11 @@ local function capture_session()
 end
 
 local function save_session()
+  -- Persist the open tabs + search history into the .jadx (jadx-gui interop) regardless of the
+  -- nvim-data session setting.
+  pcall(function()
+    require("jadxnvim.project").push()
+  end)
   if not (M.config.session and M._project) then
     return
   end
@@ -200,6 +205,7 @@ local function restore_session(project)
       end
     end)() })
   end
+  return true
 end
 
 -- Ensure config defaults and autocmds are in place even if the user never called setup().
@@ -341,7 +347,10 @@ function M.open(project, opts)
       vim.log.levels.INFO
     )
     tree.open()
-    restore_session(project)
+    local restored = restore_session(project)
+    -- Seed search history from the project, and reopen its tabs if the local session had none (e.g. a
+    -- project created/edited in jadx-gui).
+    require("jadxnvim.project").restore(info.projectState, not restored)
   end, function(code_)
     -- The daemon died unexpectedly (137 = OOM-killed, usually while indexing a huge APK). Rather
     -- than give up on the index, retry with progressively fewer indexing threads (each concurrent

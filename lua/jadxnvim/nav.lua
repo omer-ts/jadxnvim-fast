@@ -223,7 +223,7 @@ function M.find_usages()
       local on_open = function(it)
         code.open(it.id, { line = it.line, col = it.col })
       end
-      searches.record({ kind = "xref", title = title, items = items, previewer = preview.class(), on_select = on_open })
+      searches.record({ kind = "xref", query = name, title = title, items = items, previewer = preview.class(), on_select = on_open })
       fuzzy.pick({ title = title, items = items, previewer = preview.class(), on_select = on_open })
     end)
   end)

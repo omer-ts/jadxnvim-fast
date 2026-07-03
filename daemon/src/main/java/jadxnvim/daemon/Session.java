@@ -56,7 +56,7 @@ public final class Session {
 	private static final long INDEX_FORMAT_VERSION = 6;
 	// RPC protocol/feature version, reported in the ready message. Bump when adding methods the
 	// plugin depends on (e.g. getResources) so an out-of-date daemon is detected on connect.
-	static final int PROTOCOL_VERSION = 2;
+	static final int PROTOCOL_VERSION = 3;
 
 	// Cache signature: changes if the input, the index format, OR the code data (renames/comments)
 	// change — a rename doesn't touch the input but must invalidate the export so it's rebuilt with
@@ -70,6 +70,24 @@ public final class Session {
 		h = h * 1000003 + (showInconsistentCode ? 1 : 0);
 		h = h * 1000003 + codeDataHash(cd);
 		return h;
+	}
+
+	// The jadx-gui project fields the plugin manages (everything but codeData/files/projectVersion).
+	private static final String[] UI_STATE_KEYS = {
+			"openTabs", "searchHistory", "treeExpansionsV2", "cacheDir",
+			"searchResourcesFilter", "searchResourcesSizeLimit", "enableLiveReload", "mappingsPath"
+	};
+
+	private static com.google.gson.JsonObject extractUiState(com.google.gson.JsonObject root) {
+		com.google.gson.JsonObject out = new com.google.gson.JsonObject();
+		if (root != null) {
+			for (String k : UI_STATE_KEYS) {
+				if (root.has(k)) {
+					out.add(k, root.get(k));
+				}
+			}
+		}
+		return out;
 	}
 
 	private static long codeDataHash(JadxCodeData cd) {
@@ -120,6 +138,9 @@ public final class Session {
 	private List<Map<String, Object>> methodList;
 	private Search searchEngine;
 	private JadxCodeData codeData = new JadxCodeData();
+	// jadx-gui UI-state fields the plugin owns (openTabs, searchHistory, treeExpansionsV2, cacheDir),
+	// kept verbatim and written back into the .jadx so they round-trip with jadx-gui.
+	private com.google.gson.JsonObject projectUiState = new com.google.gson.JsonObject();
 	private File inputFile;
 	private File projectFile;
 	// Bumped whenever code data changes; classes decompiled at an older version need a reload.
@@ -212,6 +233,8 @@ public final class Session {
 						str(params, "comment"));
 			case "saveProject":
 				return saveProject(str(params, "path"));
+			case "setProjectState":
+				return setProjectState(params);
 			case "shutdown":
 				return shutdown();
 			default:
@@ -237,6 +260,7 @@ public final class Session {
 		File input;
 		JadxCodeData cd;
 		File projFile;
+		com.google.gson.JsonObject loadedRoot = null;
 		if (given.getName().toLowerCase().endsWith(".jadx")) {
 			ProjectIO.Loaded loaded = ProjectIO.load(given);
 			if (loaded.input == null || !loaded.input.exists()) {
@@ -244,25 +268,34 @@ public final class Session {
 			}
 			input = loaded.input;
 			cd = loaded.codeData;
+			loadedRoot = loaded.root;
 			projFile = given.getAbsoluteFile();
 		} else {
 			input = given;
 			projFile = defaultProjectFile(input);
-			// If a sidecar .jadx already exists, load its renames/comments so they persist across
-			// reopens of the APK (opening the APK is equivalent to opening its project).
+			// If a sidecar .jadx already exists, load its renames/comments (and UI state) so they
+			// persist across reopens of the APK (opening the APK is equivalent to opening its project).
 			JadxCodeData loaded = null;
 			if (!temp && projFile.exists()) {
 				try {
-					loaded = ProjectIO.load(projFile).codeData;
+					ProjectIO.Loaded l = ProjectIO.load(projFile);
+					loaded = l.codeData;
+					loadedRoot = l.root;
 				} catch (Exception e) {
 					System.err.println("[jadxd] could not load sidecar project " + projFile.getName() + ": " + e);
 				}
 			}
 			cd = loaded != null ? loaded : new JadxCodeData();
 		}
+		this.projectUiState = extractUiState(loadedRoot);
 
 		// Export paths (used by the cached fast-open check below and by startExport).
 		this.exportDir = new File(projFile.getAbsoluteFile().getParentFile(), stripExt(projFile.getName()) + ".jadxnvim");
+		// Declare a cache dir for the project (jadxnvim keeps its own on-disk export index here). Use a
+		// dedicated subdir for jadx-gui's cache so it never manages/clears our index files.
+		if (!projectUiState.has("cacheDir")) {
+			projectUiState.addProperty("cacheDir", new File(exportDir, "gui-cache").getAbsolutePath());
+		}
 		this.indexDir = new File(exportDir, "index");
 		this.namesDir = new File(exportDir, "index-names");
 		this.xrefDir = new File(exportDir, "index-xref");
@@ -298,7 +331,7 @@ public final class Session {
 			System.gc();
 			if (!projFile.exists()) {
 				try {
-					ProjectIO.save(projFile, this.inputFile, this.codeData);
+					ProjectIO.save(projFile, this.inputFile, this.codeData, projectUiState);
 				} catch (IOException e) {
 					System.err.println("[jadxd] could not create project file: " + e);
 				}
@@ -312,6 +345,7 @@ public final class Session {
 			info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
 			info.put("lean", true);
 			info.put("protocol", PROTOCOL_VERSION);
+			info.put("projectState", projectUiState);
 			emitter.emit("ready", info);
 			emitter.emit("loadDone", Map.of("total", 0, "cached", true));
 			emitter.emit("modelUnloaded", Map.of("lean", true));
@@ -347,7 +381,7 @@ public final class Session {
 		// on the first edit) to avoid churn.
 		if (!temp && !projFile.exists()) {
 			try {
-				ProjectIO.save(projFile, this.inputFile, this.codeData);
+				ProjectIO.save(projFile, this.inputFile, this.codeData, projectUiState);
 			} catch (IOException e) {
 				System.err.println("[jadxd] could not create project file: " + e);
 			}
@@ -361,6 +395,7 @@ public final class Session {
 		info.put("renames", cd.getRenames() == null ? 0 : cd.getRenames().size());
 		info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
 		info.put("protocol", PROTOCOL_VERSION);
+		info.put("projectState", projectUiState);
 		emitter.emit("ready", info);
 
 		if (export && !temp) {
@@ -1409,11 +1444,37 @@ public final class Session {
 			throw new IllegalStateException("project not loaded");
 		}
 		File target = (path != null && !path.isEmpty()) ? new File(path) : projectFile;
-		ProjectIO.save(target, inputFile, codeData);
+		ProjectIO.save(target, inputFile, codeData, projectUiState);
 		this.projectFile = target.getAbsoluteFile();
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("ok", true);
 		result.put("project", projectFile.getAbsolutePath());
+		return result;
+	}
+
+	/**
+	 * Update the jadx-gui UI-state the plugin manages (openTabs / searchHistory / treeExpansionsV2 /
+	 * cacheDir, in jadx-gui's own format) and persist it to the .jadx. The plugin calls this as tabs
+	 * open/close and searches are made, so the project round-trips with jadx-gui.
+	 */
+	public Map<String, Object> setProjectState(JsonObject params) throws IOException {
+		if (params != null) {
+			for (String k : UI_STATE_KEYS) {
+				if (params.has(k)) {
+					com.google.gson.JsonElement v = params.get(k);
+					if (v == null || v.isJsonNull()) {
+						projectUiState.remove(k);
+					} else {
+						projectUiState.add(k, v);
+					}
+				}
+			}
+		}
+		if (!temp && inputFile != null && projectFile != null) {
+			ProjectIO.save(projectFile, inputFile, codeData, projectUiState);
+		}
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("ok", true);
 		return result;
 	}
 
