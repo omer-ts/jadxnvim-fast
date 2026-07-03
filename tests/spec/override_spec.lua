@@ -62,6 +62,28 @@ H.spec(function(win)
   -- key resolves through the top class's inner classes, mirroring androidx *.Callback patterns.
   local nu = usages_of("com.example.MenuImpl", "String (onOpen)%s*%(")
   H.check("gr on MenuImpl.onOpen reaches the call through the NESTED interface", nu["com.example.Menu"] == true, vim.inspect(vim.tbl_keys(nu)))
+  H.check("gr on MenuImpl.onOpen also finds the direct concrete call", nu["com.example.Caller"] == true, vim.inspect(vim.tbl_keys(nu)))
+
+  -- The user's exact case: gr on the INTERFACE method itself must reach calls made through a concrete
+  -- implementation type (jadx-gui expands to the whole override-related set, both directions).
+  local menu_lines = select(2, H.open_class(win, "com.example.Menu"))
+  local il, ic
+  for idx, ln in ipairs(menu_lines) do
+    local s = ln:find("onOpen%(")
+    if s and ln:match(";%s*$") then -- the abstract interface declaration
+      il, ic = idx, s
+      break
+    end
+  end
+  H.check("found Menu.Callback.onOpen interface declaration", il ~= nil)
+  vim.api.nvim_win_set_cursor(win, { il, ic - 1 })
+  local ii, iln, ico = H.code.cursor_target()
+  local _, ir = H.req("findUsages", { id = ii, line = iln, col = ico })
+  local iby = {}
+  for _, u in ipairs(ir.usages or {}) do
+    iby[u.id] = true
+  end
+  H.check("gr on the interface method reaches the concrete-typed call (downward expansion)", iby["com.example.Caller"] == true, vim.inspect(vim.tbl_keys(iby)))
 
   -- Frida: hooking the interface method targets every implementation
   local captured
