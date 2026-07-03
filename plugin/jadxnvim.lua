@@ -114,6 +114,10 @@ end, {
   desc = "jadxnvim: jump a stack-trace frame to the decompiled Java (nearest position/method)",
 })
 
+vim.api.nvim_create_user_command("JadxHelp", function()
+  require("jadxnvim.help").menu()
+end, { desc = "jadxnvim: help — list all commands & shortcuts, run the selected one" })
+
 vim.api.nvim_create_user_command("JadxBookmark", function()
   require("jadxnvim.bookmarks").toggle()
 end, { desc = "jadxnvim: toggle a bookmark at the cursor" })

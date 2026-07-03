@@ -142,6 +142,7 @@ Extra args after the project are passed through to `nvim`.
 | Command                | Action                                                          |
 | ---------------------- | --------------------------------------------------------------- |
 | `:Jadx <path>`         | Open an APK / dex / jar / `.jadx` project and show the tree     |
+| `:JadxHelp`            | Command palette: list every command & shortcut, run the selected one |
 | `:JadxTree`            | Focus the project tree                                          |
 | `:JadxGotoPackage {p}` | Jump the tree to a package (Tab-completes package names)         |
 | `:JadxGotoSource [f]`  | Jump a stack-trace frame `Class(File.java:line)` to its smali source line |
@@ -175,6 +176,7 @@ is bound to these global keys when a project is open:
 | `<Space>fv` | everything — classes + methods + text in one list (jadx-gui-style) |
 | `<Space>fs` | **search history** — reopen or delete past searches / xrefs (also `:JadxHistory`) |
 | `<Space>fb` | **bookmarks** — jump to or delete bookmarked positions (also `:JadxBookmarks`) |
+| `<Space>fh` | **help / command palette** — every command & shortcut; Enter runs it (also `:JadxHelp`) |
 
 **Search history:** every text search, xref (find-usages), class/method search is recorded. `<Space>fs`
 opens a history list — each entry shows its type icon, query + count, and age, with a preview of its
