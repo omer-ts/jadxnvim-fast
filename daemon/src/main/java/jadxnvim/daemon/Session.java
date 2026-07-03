@@ -52,7 +52,8 @@ public final class Session {
 
 	private static final int MAX_USAGES = 5000;
 	// Bump when the on-disk export/name-index format or its index semantics change.
-	private static final long INDEX_FORMAT_VERSION = 5;
+	// v6: showInconsistentCode enabled — decompiled output changed, so rebuild any older export.
+	private static final long INDEX_FORMAT_VERSION = 6;
 	// RPC protocol/feature version, reported in the ready message. Bump when adding methods the
 	// plugin depends on (e.g. getResources) so an out-of-date daemon is detected on connect.
 	static final int PROTOCOL_VERSION = 2;
@@ -1541,6 +1542,10 @@ public final class Session {
 		JadxArgs args = new JadxArgs();
 		args.getInputFiles().add(input);
 		args.setCodeData(cd);
+		// Emit partially-decompiled ("inconsistent") code instead of a stub for methods jadx can't
+		// fully decompile (jadx-gui's "show inconsistent code" / --show-bad-code), so obfuscated
+		// classes still show something browsable/searchable rather than a comment.
+		args.setShowInconsistentCode(true);
 		// Don't retain decompiled code in memory. On huge APKs (e.g. 400k classes) the default
 		// in-memory cache exhausts the heap and GC-thrashes during the full export; without it the
 		// export streams to disk at low, constant memory. Browsing re-decompiles per class (cheap,
