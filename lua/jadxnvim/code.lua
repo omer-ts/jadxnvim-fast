@@ -356,7 +356,19 @@ local function open_named(name, opts)
   opts = opts or {}
   local win = M.target_win()
   vim.api.nvim_set_current_win(win)
-  vim.cmd("edit " .. vim.fn.fnameescape(name))
+  -- Record the current spot in the jumplist BEFORE moving, so <C-o> comes back here (go-to-def,
+  -- a search/usage result, a stack frame). This is what LSP go-to-def does; without it there's no
+  -- entry to return to and <C-o> lands on a stale one (E19: Mark has invalid line number).
+  local same_buf = vim.api.nvim_buf_get_name(0) == name
+  local navigating = opts.line or opts.find or opts.find_method or opts.source_line
+  if navigating or not same_buf then
+    pcall(vim.cmd, "normal! m'")
+  end
+  -- Only (re)load when we're not already in the target buffer. Re-`:edit`ing the same jadx buffer
+  -- refetches and replaces every line, which invalidates marks/jumplist entries pointing into it.
+  if not same_buf then
+    vim.cmd("edit " .. vim.fn.fnameescape(name))
+  end
   local bufnr = vim.api.nvim_get_current_buf()
   if opts.find then
     opts.line = locate_line(bufnr, opts.find, opts.line)
