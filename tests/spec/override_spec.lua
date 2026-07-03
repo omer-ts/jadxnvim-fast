@@ -58,6 +58,10 @@ H.spec(function(win)
   -- old abstract-only filter missed
   local du = usages_of("com.example.Upper", "String (describe)%s*%(")
   H.check("gr on Upper.describe reaches the CONCRETE base call via the base type", du["com.example.Caller"] == true, vim.inspect(vim.tbl_keys(du)))
+  -- NESTED base interface (Menu.Callback.onOpen — top class Menu, method in Menu$Callback): the base
+  -- key resolves through the top class's inner classes, mirroring androidx *.Callback patterns.
+  local nu = usages_of("com.example.MenuImpl", "String (onOpen)%s*%(")
+  H.check("gr on MenuImpl.onOpen reaches the call through the NESTED interface", nu["com.example.Menu"] == true, vim.inspect(vim.tbl_keys(nu)))
 
   -- Frida: hooking the interface method targets every implementation
   local captured

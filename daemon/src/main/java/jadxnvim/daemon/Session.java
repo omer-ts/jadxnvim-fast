@@ -338,19 +338,28 @@ public final class Session {
 		targets.add(t);
 	}
 
-	// Resolve a captured method key back to a live JavaMethod (for its getUseIn()).
+	// Resolve a captured method key back to a live JavaMethod (for its getUseIn()). The key's class
+	// part is the TOP-level class, but the method may live in a nested class (very common for callback
+	// interfaces like MenuPresenter.Callback), so search the top class and its inner classes.
 	private JavaMethod resolveMethodKey(String mk) {
 		int h1 = mk.indexOf('#');
 		if (h1 < 0) {
 			return null;
 		}
 		JavaClass c = findClass(mk.substring(0, h1));
-		if (c == null) {
-			return null;
-		}
-		for (JavaMethod jm : c.getMethods()) {
+		return c == null ? null : findMethodInTree(c, mk);
+	}
+
+	private JavaMethod findMethodInTree(JavaClass cls, String mk) {
+		for (JavaMethod jm : cls.getMethods()) {
 			if (methodKey(jm).equals(mk)) {
 				return jm;
+			}
+		}
+		for (JavaClass inner : cls.getInnerClasses()) {
+			JavaMethod r = findMethodInTree(inner, mk);
+			if (r != null) {
+				return r;
 			}
 		}
 		return null;
