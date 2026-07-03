@@ -26,8 +26,28 @@ local function ic(name)
   return g ~= "" and (g .. " ") or ""
 end
 
+-- Filter matching: the term is a Vim regex (case-insensitive), compiled once per distinct filter.
+-- If it isn't a valid regex, fall back to a plain case-insensitive substring so partial input while
+-- typing (e.g. a lone "\") never errors.
+local filter_cache = { key = nil, rx = nil, plain = "" }
 local function matches(text, f)
-  return f == "" or (text or ""):lower():find(f:lower(), 1, true) ~= nil
+  if f == "" then
+    return true
+  end
+  text = text or ""
+  if filter_cache.key ~= f then
+    filter_cache.key = f
+    filter_cache.plain = f:lower()
+    local ok, rx = pcall(vim.regex, "\\c" .. f) -- \c = ignore case
+    filter_cache.rx = ok and rx or nil
+  end
+  if filter_cache.rx then
+    local ok, s = pcall(function()
+      return filter_cache.rx:match_str(text)
+    end)
+    return ok and s ~= nil
+  end
+  return text:lower():find(filter_cache.plain, 1, true) ~= nil
 end
 
 -- ---- resource directory tree -------------------------------------------------
@@ -328,7 +348,7 @@ local function set_filter(f)
 end
 
 local function prompt_filter()
-  vim.ui.input({ prompt = "Filter tree: ", default = state.filter }, function(input)
+  vim.ui.input({ prompt = "Filter tree (regex): ", default = state.filter }, function(input)
     if input == nil then
       return
     end
