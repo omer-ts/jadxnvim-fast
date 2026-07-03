@@ -36,6 +36,10 @@ import jadx.api.metadata.ICodeNodeRef;
 import jadx.api.metadata.annotations.NodeDeclareRef;
 import jadx.core.dex.attributes.AFlag;
 import jadx.core.dex.nodes.MethodNode;
+import jadx.core.dex.nodes.IMethodDetails;
+import jadx.core.dex.info.MethodInfo;
+import jadx.core.dex.attributes.AType;
+import jadx.core.dex.attributes.nodes.MethodOverrideAttr;
 
 /**
  * Holds the live {@link JadxDecompiler} and implements the RPC methods.
@@ -157,6 +161,11 @@ public final class Session {
 	private volatile Map<String, String> overrideRoot; // methodKey -> union-find root
 	private volatile Map<String, java.util.List<String>> overrideGroup; // root -> member method keys
 	private volatile Map<String, java.util.List<String>> overrideByName; // "classId#name" -> member keys (lean/disk)
+	// Directed "overrides" edges [childKey, baseKey] captured during export, and their transitive
+	// closure per method (a method -> every base/ancestor method it overrides). find-usages expands to
+	// these so a call made through a base type is reported, whether the base is abstract or concrete.
+	private final java.util.List<String[]> overrideBaseEdges = java.util.Collections.synchronizedList(new ArrayList<>());
+	private volatile Map<String, java.util.List<String>> overrideBases; // childKey -> all ancestor keys
 
 	private static String methodKey(JavaMethod jm) {
 		JavaClass top = jm.getTopParentClass();
@@ -172,6 +181,26 @@ public final class Session {
 		}
 	}
 
+	// The MethodInfos this method overrides (its direct base declarations, abstract or concrete), from
+	// jadx's override attribute. Empty if the method overrides nothing or the attr isn't present.
+	private static java.util.Set<MethodInfo> baseInfosOf(JavaMethod jm) {
+		java.util.Set<MethodInfo> out = new java.util.HashSet<>();
+		try {
+			MethodOverrideAttr attr = jm.getMethodNode().get(AType.METHOD_OVERRIDE);
+			if (attr != null) {
+				for (IMethodDetails b : attr.getBaseMethods()) {
+					MethodInfo bi = b.getMethodInfo();
+					if (bi != null) {
+						out.add(bi);
+					}
+				}
+			}
+		} catch (Throwable ignore) {
+			// best-effort
+		}
+		return out;
+	}
+
 	// Record a class's override relationships into overrideEdges/overrideAbstract (called per class
 	// during export, while the class is decompiled and its override attribute is intact).
 	private void captureOverrides(JavaClass cls) {
@@ -184,6 +213,7 @@ public final class Session {
 				String k = methodKey(jm);
 				overrideAbstract.putIfAbsent(k, jm.getAccessFlags().isAbstract());
 				overrideRaw.putIfAbsent(k, rawMethodName(jm));
+				java.util.Set<MethodInfo> bases = baseInfosOf(jm); // which related methods jm overrides
 				for (JavaMethod r : rel) {
 					if (r == null) {
 						continue;
@@ -192,6 +222,13 @@ public final class Session {
 					overrideAbstract.putIfAbsent(rk, r.getAccessFlags().isAbstract());
 					overrideRaw.putIfAbsent(rk, rawMethodName(r));
 					overrideEdges.add(new String[] { k, rk });
+					try {
+						if (bases.contains(r.getMethodNode().getMethodInfo())) {
+							overrideBaseEdges.add(new String[] { k, rk }); // k overrides (is below) r
+						}
+					} catch (Throwable ignore) {
+						// best-effort
+					}
 				}
 			}
 		} catch (Throwable ignore) {
@@ -241,6 +278,34 @@ public final class Session {
 		this.overrideRoot = root;
 		this.overrideGroup = group;
 		this.overrideByName = byName;
+
+		// Transitive closure of the directed "overrides" edges: childKey -> every ancestor it overrides
+		// (walks A<-B<-C so gr on C reaches A even when jadx only records the immediate base).
+		Map<String, java.util.List<String>> directBases = new java.util.HashMap<>();
+		String[][] bedges;
+		synchronized (overrideBaseEdges) {
+			bedges = overrideBaseEdges.toArray(new String[0][]);
+		}
+		for (String[] e : bedges) {
+			directBases.computeIfAbsent(e[0], x -> new ArrayList<>()).add(e[1]);
+		}
+		Map<String, java.util.List<String>> bases = new java.util.HashMap<>();
+		for (String k : directBases.keySet()) {
+			java.util.LinkedHashSet<String> acc = new java.util.LinkedHashSet<>();
+			java.util.ArrayDeque<String> stack = new java.util.ArrayDeque<>(directBases.get(k));
+			while (!stack.isEmpty()) {
+				String b = stack.pop();
+				if (b.equals(k) || !acc.add(b)) {
+					continue;
+				}
+				java.util.List<String> next = directBases.get(b);
+				if (next != null) {
+					stack.addAll(next);
+				}
+			}
+			bases.put(k, new ArrayList<>(acc));
+		}
+		this.overrideBases = bases;
 	}
 
 	// The member keys of a method's override group (incl. itself), or null if not captured.
@@ -400,6 +465,7 @@ public final class Session {
 		overrideRoot = null;
 		overrideGroup = null;
 		overrideByName = null;
+		overrideBases = null;
 		File given = new File(this.inputPath);
 		if (!given.exists()) {
 			throw new IllegalArgumentException("input not found: " + given.getAbsolutePath());
@@ -764,11 +830,13 @@ public final class Session {
 		boolean withXref = lean;
 		// fresh override capture for this build
 		overrideEdges.clear();
+		overrideBaseEdges.clear();
 		overrideAbstract.clear();
 		overrideRaw.clear();
 		overrideRoot = null;
 		overrideGroup = null;
 		overrideByName = null;
+		overrideBases = null;
 
 		// Resume a compatible partial checkpoint if one exists; any resume error falls back to a
 		// clean rebuild, so a corrupt checkpoint can never produce a bad index.
@@ -1579,31 +1647,32 @@ public final class Session {
 			result.put("targetRawName", (node instanceof JavaMethod) ? rawMethodName((JavaMethod) node) : node.getName());
 		}
 
-		// For a method, also search the interface/abstract methods it overrides: a call through an
-		// interface/base-typed value is recorded against that abstract method, so find-usages on a
-		// concrete override would otherwise miss those virtual-dispatch call sites. We add only the
-		// ABSTRACT related methods (the base declarations) — an abstract method has no body, so its
-		// usages are exactly the polymorphic call sites; concrete sibling overrides are left out so we
-		// don't report direct calls to other implementations.
+		// For a method, also search the base methods it overrides: a call made through a base-typed
+		// value (interface or abstract/concrete superclass) is recorded against that base declaration,
+		// so find-usages on a concrete override would otherwise miss those virtual-dispatch call sites.
+		// We add exactly the ANCESTOR methods (the ones this method overrides, up the hierarchy) — not
+		// sibling overrides, so we never report direct calls to other implementations.
 		List<JavaNode> targets = new ArrayList<>();
 		targets.add(node);
 		if (node instanceof JavaMethod) {
-			java.util.List<String> group = overrideGroupOf(node);
-			if (group != null) {
-				String self = methodKey((JavaMethod) node);
-				for (String mk : group) {
-					if (mk.equals(self) || !Boolean.TRUE.equals(overrideAbstract.get(mk))) {
-						continue;
-					}
+			java.util.List<String> baseKeys = overrideBases == null ? null : overrideBases.get(methodKey((JavaMethod) node));
+			if (baseKeys != null) {
+				for (String mk : baseKeys) {
 					JavaMethod jm = resolveMethodKey(mk);
 					if (jm != null) {
 						targets.add(jm);
 					}
 				}
 			} else {
+				// live fallback (non-exported / attr intact): the method's base declarations
+				java.util.Set<MethodInfo> bases = baseInfosOf((JavaMethod) node);
 				for (JavaMethod rel : ((JavaMethod) node).getOverrideRelatedMethods()) {
-					if (rel != null && rel.getAccessFlags().isAbstract()) {
-						targets.add(rel);
+					try {
+						if (rel != null && bases.contains(rel.getMethodNode().getMethodInfo())) {
+							targets.add(rel);
+						}
+					} catch (Throwable ignore) {
+						// best-effort
 					}
 				}
 			}

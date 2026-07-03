@@ -38,6 +38,27 @@ H.spec(function(win)
   end
   H.check("gr on Hello.greet finds the interface-typed call in Main", hits_main, #(gr.usages or {}) .. " usages")
 
+  -- gr must expand to base declarations whether abstract OR concrete, but never to sibling overrides.
+  local function usages_of(cls, decl_pat)
+    local _, lines = H.open_class(win, cls)
+    local l, c = H.locate(lines, decl_pat)
+    H.check("found " .. cls .. " " .. decl_pat, l ~= nil)
+    vim.api.nvim_win_set_cursor(win, { l, c - 1 })
+    local i, ln, co = H.code.cursor_target()
+    local _, r = H.req("findUsages", { id = i, line = ln, col = co })
+    local by = {}
+    for _, u in ipairs(r.usages or {}) do
+      by[u.id] = true
+    end
+    return by
+  end
+  -- abstract base (Base.handle is abstract, called by Base.process)
+  H.check("gr on Upper.handle reaches the abstract base's call site", usages_of("com.example.Upper", "String (handle)%s*%(")["com.example.Base"] == true)
+  -- concrete base (Base.describe has a body; Caller calls it through the Base type) — the case the
+  -- old abstract-only filter missed
+  local du = usages_of("com.example.Upper", "String (describe)%s*%(")
+  H.check("gr on Upper.describe reaches the CONCRETE base call via the base type", du["com.example.Caller"] == true, vim.inspect(vim.tbl_keys(du)))
+
   -- Frida: hooking the interface method targets every implementation
   local captured
   local orig = frida.open
