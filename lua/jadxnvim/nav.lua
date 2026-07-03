@@ -176,6 +176,29 @@ function M.goto_def()
         goto_def_fallback(word, qualifier) -- couldn't resolve semantically; fall back to name search
         return
       end
+      local targets = res.targets
+      if type(targets) == "table" and #targets > 1 then
+        -- virtual dispatch: the call resolves to a base/interface method with several
+        -- implementations — let the user pick which one to jump to.
+        local items = {}
+        for _, t in ipairs(targets) do
+          local tag = t["abstract"] and "interface" or "impl"
+          items[#items + 1] = {
+            text = string.format("%-9s %s", tag, t.fullName or t.id),
+            id = t.id,
+            name = t.name,
+          }
+        end
+        fuzzy.pick({
+          title = string.format(" Implementations of %s (%d) ", res.name or "method", #items),
+          items = items,
+          previewer = preview.class(),
+          on_select = function(it)
+            code.open(it.id, { find_method = it.name })
+          end,
+        })
+        return
+      end
       code.open(res.id, { line = res.line, col = res.col })
     end)
   end)

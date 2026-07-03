@@ -1322,13 +1322,48 @@ public final class Session {
 			result.put("found", false);
 			return result;
 		}
-		JavaClass target = node.getTopParentClass();
-		String targetCode = target.getCodeInfo().getCodeStr();
-		int defPos = node.getDefPos();
-		int[] lc = defPos >= 0 ? Positions.toLineCol(targetCode, defPos) : new int[] { 1, 0 };
+		// A call on an interface/base-typed value resolves to the base method; offer every override
+		// implementation too, so gd on a virtual call can jump to any concrete implementation. The
+		// targets are lightweight (class id + method name, no per-target decompile) — the plugin opens
+		// the class and relocates on the name — so even a functional interface with hundreds of
+		// implementations stays fast; only the primary target's exact position is computed here.
+		List<JavaNode> defs = new ArrayList<>();
+		defs.add(node);
+		if (node instanceof JavaMethod) {
+			for (JavaMethod rel : ((JavaMethod) node).getOverrideRelatedMethods()) {
+				if (rel != null) {
+					defs.add(rel);
+				}
+			}
+		}
+		List<Map<String, Object>> targets = new ArrayList<>();
+		java.util.Set<String> seen = new java.util.HashSet<>();
+		for (JavaNode d : defs) {
+			JavaClass top = d.getTopParentClass();
+			if (top == null) {
+				continue;
+			}
+			if (!seen.add(top.getRawName() + "#" + d.getName())) {
+				continue;
+			}
+			Map<String, Object> t = new LinkedHashMap<>();
+			t.put("id", top.getRawName());
+			t.put("fullName", top.getFullName());
+			t.put("name", d.getName());
+			// distinguish the interface/abstract declaration from a concrete implementation
+			t.put("abstract", (d instanceof JavaMethod) && ((JavaMethod) d).getAccessFlags().isAbstract());
+			targets.add(t);
+		}
 		result.put("found", true);
-		result.put("id", target.getRawName());
-		result.put("fullName", target.getFullName());
+		result.put("targets", targets);
+
+		// Primary target: the resolved node, with its exact position (one decompile) for the common
+		// single-target direct jump and older clients.
+		JavaClass ptop = node.getTopParentClass();
+		int defPos = node.getDefPos();
+		int[] lc = defPos >= 0 ? Positions.toLineCol(ptop.getCodeInfo().getCodeStr(), defPos) : new int[] { 1, 0 };
+		result.put("id", ptop.getRawName());
+		result.put("fullName", ptop.getFullName());
 		result.put("name", node.getName());
 		result.put("line", lc[0]);
 		result.put("col", lc[1]);
@@ -1352,38 +1387,56 @@ public final class Session {
 		}
 		result.put("name", node.getName());
 
-		// Collect the unique top-level classes that reference this node, then ask each for the
-		// precise offsets of the reference within its decompiled code.
-		Map<String, JavaClass> classes = new LinkedHashMap<>();
-		for (JavaNode use : node.getUseIn()) {
-			JavaClass top = use.getTopParentClass();
-			if (top != null) {
-				classes.putIfAbsent(top.getRawName(), top);
+		// For a method, also search the interface/abstract methods it overrides: a call through an
+		// interface/base-typed value is recorded against that abstract method, so find-usages on a
+		// concrete override would otherwise miss those virtual-dispatch call sites. We add only the
+		// ABSTRACT related methods (the base declarations) — an abstract method has no body, so its
+		// usages are exactly the polymorphic call sites; concrete sibling overrides are left out so we
+		// don't report direct calls to other implementations.
+		List<JavaNode> targets = new ArrayList<>();
+		targets.add(node);
+		if (node instanceof JavaMethod) {
+			for (JavaMethod rel : ((JavaMethod) node).getOverrideRelatedMethods()) {
+				if (rel != null && rel.getAccessFlags().isAbstract()) {
+					targets.add(rel);
+				}
 			}
 		}
 
 		int budget = MAX_USAGES;
 		boolean truncated = false;
-		for (JavaClass cls : classes.values()) {
-			ICodeInfo info = cls.getCodeInfo();
-			String code = info.getCodeStr();
-			List<Integer> places = cls.getUsePlacesFor(info, node);
-			for (int offset : places) {
-				if (budget-- <= 0) {
-					truncated = true;
-					break;
+		java.util.Set<String> seen = new java.util.HashSet<>();
+		outer:
+		for (JavaNode target : targets) {
+			// Collect the unique top-level classes that reference this node, then ask each for the
+			// precise offsets of the reference within its decompiled code.
+			Map<String, JavaClass> classes = new LinkedHashMap<>();
+			for (JavaNode use : target.getUseIn()) {
+				JavaClass top = use.getTopParentClass();
+				if (top != null) {
+					classes.putIfAbsent(top.getRawName(), top);
 				}
-				int[] lc = Positions.toLineCol(code, offset);
-				Map<String, Object> u = new LinkedHashMap<>();
-				u.put("id", cls.getRawName());
-				u.put("fullName", cls.getFullName());
-				u.put("line", lc[0]);
-				u.put("col", lc[1]);
-				u.put("text", Positions.lineText(code, offset).strip());
-				usages.add(u);
 			}
-			if (truncated) {
-				break;
+			for (JavaClass cls : classes.values()) {
+				ICodeInfo info = cls.getCodeInfo();
+				String code = info.getCodeStr();
+				for (int offset : cls.getUsePlacesFor(info, target)) {
+					if (!seen.add(cls.getRawName() + ":" + offset)) {
+						continue; // same call site reachable via several related methods
+					}
+					if (budget-- <= 0) {
+						truncated = true;
+						break outer;
+					}
+					int[] lc = Positions.toLineCol(code, offset);
+					Map<String, Object> u = new LinkedHashMap<>();
+					u.put("id", cls.getRawName());
+					u.put("fullName", cls.getFullName());
+					u.put("line", lc[0]);
+					u.put("col", lc[1]);
+					u.put("text", Positions.lineText(code, offset).strip());
+					usages.add(u);
+				}
 			}
 		}
 		result.put("truncated", truncated);
