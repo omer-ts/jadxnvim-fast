@@ -19,3 +19,6 @@ samples/
 
 # git-bash crash dumps
 *.stackdump
+
+# test fixtures build output
+tests/.work/

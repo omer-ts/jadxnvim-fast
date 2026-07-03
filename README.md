@@ -71,6 +71,19 @@ cd daemon
 
 On Windows: `./gradlew.bat shadowJar`.
 
+## Tests
+
+A headless test suite runs the daemon + plugin against a small fixture compiled from
+`tests/fixtures/src`, and runs on CI (see `.github/workflows/ci.yml`):
+
+```sh
+bash tests/run.sh        # builds the daemon jar + fixture jar if needed, runs every spec
+```
+
+Each `tests/spec/*_spec.lua` opens the fixture in a fresh headless Neovim and asserts behaviour
+(load/tree, search, xref, edit + `.jadx` round-trip, Frida hooks, project state). Requires `nvim`,
+a JDK (for `javac`/`jar`), and optionally `rg` on `PATH`.
+
 After pulling changes that add daemon features, rebuild the jar and restart Neovim (the daemon runs
 for the life of a Neovim session). If the plugin ever warns that *"the jadxd daemon is out of date"*,
 it means a running daemon predates a method the plugin needs — rebuild as above and restart.
