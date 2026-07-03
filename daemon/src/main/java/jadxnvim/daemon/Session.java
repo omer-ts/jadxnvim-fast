@@ -1598,7 +1598,9 @@ public final class Session {
 		// single-target direct jump and older clients.
 		JavaClass ptop = node.getTopParentClass();
 		int defPos = node.getDefPos();
-		int[] lc = defPos >= 0 ? Positions.toLineCol(ptop.getCodeInfo().getCodeStr(), defPos) : new int[] { 1, 0 };
+		int[] lc = defPos >= 0
+				? Positions.toLineCol(freshCodeInfo(ptop, ptop.getRawName()).getCodeStr(), defPos)
+				: new int[] { 1, 0 };
 		result.put("id", ptop.getRawName());
 		result.put("fullName", ptop.getFullName());
 		result.put("name", node.getName());
@@ -1678,7 +1680,10 @@ public final class Session {
 				}
 			}
 			for (JavaClass cls : classes.values()) {
-				ICodeInfo info = cls.getCodeInfo();
+				// Use the cached layout: the reported line/col must match the buffer the plugin opens
+				// for this class (getCode uses the same freshCodeInfo), or the jump lands in the wrong
+				// place — jadx's parallel decompile is non-deterministic across calls.
+				ICodeInfo info = freshCodeInfo(cls, cls.getRawName());
 				String code = info.getCodeStr();
 				for (int offset : cls.getUsePlacesFor(info, target)) {
 					if (!seen.add(cls.getRawName() + ":" + offset)) {
