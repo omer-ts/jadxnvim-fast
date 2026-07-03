@@ -16,6 +16,21 @@ local M = {}
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 
+-- The selected-row highlight: the default CursorLine is background-only and can vanish on a
+-- transparent terminal, so use a bold highlight over the colorscheme's selection colour (PmenuSel /
+-- Visual), with a solid fallback background. Applied to the picker window only via winhighlight.
+local function ensure_sel_hl()
+  local function hl(name)
+    return vim.api.nvim_get_hl(0, { name = name, link = false })
+  end
+  local sel = hl("PmenuSel")
+  if not (sel.bg or sel.fg) then
+    sel = hl("Visual")
+  end
+  local bg = sel.bg or (vim.o.background == "light" and 0xc6ccd6 or 0x3b4252)
+  vim.api.nvim_set_hl(0, "JadxPickerSel", { bg = bg, fg = sel.fg, bold = true })
+end
+
 --- Pure filter (exposed for testing). Returns matching items, best first, capped at `limit`.
 function M.filter(items, query, limit)
   limit = limit or 200
@@ -81,7 +96,9 @@ function M.pick(opts)
     relative = "editor", width = rw, height = 1, row = base_row + H + 1, col = base_col,
     style = "minimal", border = "rounded", title = " search term ", title_pos = "left",
   })
+  ensure_sel_hl()
   vim.wo[results_win].cursorline = true
+  vim.wo[results_win].winhighlight = "CursorLine:JadxPickerSel"
   vim.wo[results_win].wrap = false
 
   local preview_buf, preview_win
