@@ -143,6 +143,8 @@ Extra args after the project are passed through to `nvim`.
 | `:JadxFindText`        | Full-text search, then fuzzy-narrow the results                |
 | `:JadxRename`          | Rename the symbol under the cursor (persists to `.jadx`)        |
 | `:JadxComment`         | Comment the symbol under the cursor (persists to `.jadx`)       |
+| `:JadxFridaHook`       | Generate a Frida hook for the symbol under the cursor           |
+| `:JadxFridaHookClass`  | Generate a Frida hook for every method of the current class     |
 | `:JadxClose`           | Close the project and stop the daemon                           |
 
 ### Fuzzy finders
@@ -164,7 +166,10 @@ results. `<CR>` reopens the full result set (after you closed it), `<C-x>` / `dd
 `<C-l>` clears all.
 
 In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` (`<C-d>`/`<C-u>` to page) to move,
-`<CR>` to open, `<Esc>` to cancel. A **syntax-highlighted preview** of the highlighted result is
+`<CR>` to open, `<Esc>` to cancel. `<C-t>` sends the current results to a **persistent scratch pane**
+(a normal, searchable buffer where `<CR>` opens a result and `q` closes). `<C-f>` generates a
+**Frida hook script** for the results (classes → hook the class, methods → hook the method, a usages
+list → hook the searched method) into a scratch `.js` buffer. A **syntax-highlighted preview** of the highlighted result is
 shown beside the list (bat-style — line-numbered and centered on the match). A status footer shows
 `shown / total` (and `searching… N found` while a text search is still streaming). Bound to literal `<Space>` so it works regardless of your `mapleader`.
 Rebind or disable via `keys` in `setup()`:
@@ -205,6 +210,8 @@ In a **code** buffer (`jadx://<class>`, read-only `java`):
 | `<Tab>`      | Toggle Java ⟷ Smali (syncs to the same method; remembers each pane's cursor) |
 | `<leader>jr` | Rename                         |
 | `<leader>jc` | Comment                        |
+| `<leader>jh` | Frida hook the symbol under the cursor (a method — and every implementation for an interface call) |
+| `<leader>jH` | Frida hook every method of this class |
 
 In code buffers `y` / `Y` copy to your **computer's** clipboard — over SSH too, via OSC 52 (no
 `xclip`/`win32yank` needed). Disable with `clipboard = false` in `setup()`, or it steps aside if
