@@ -463,6 +463,28 @@ function M.target_win()
 end
 
 --- (class_id, line, char_col) for the symbol under the cursor, or nil if not a jadx code buffer.
+-- Byte column (0-based) of the start of the identifier under/just-after the cursor. jadx anchors a
+-- symbol's annotation at the token's *start*, so gd/gr/rename must query there — otherwise they only
+-- resolve when the cursor sits on the first character of the word.
+local function ident_start_bytecol(line, col0)
+  local function is_ident(c)
+    return c ~= "" and c:match("[%w_$]") ~= nil
+  end
+  local idx = col0 + 1 -- 1-based index of the char under the cursor
+  if not is_ident(line:sub(idx, idx)) then
+    -- cursor might be just past the end of an identifier (e.g. on the '(' after a call)
+    if idx > 1 and is_ident(line:sub(idx - 1, idx - 1)) then
+      idx = idx - 1
+    else
+      return col0 -- not on an identifier; leave the column as-is
+    end
+  end
+  while idx > 1 and is_ident(line:sub(idx - 1, idx - 1)) do
+    idx = idx - 1
+  end
+  return idx - 1 -- back to 0-based byte column
+end
+
 function M.cursor_target()
   local buf = vim.api.nvim_get_current_buf()
   local id = vim.b[buf].jadx_class_id
@@ -471,8 +493,9 @@ function M.cursor_target()
   end
   local pos = vim.api.nvim_win_get_cursor(0) -- { row(1-based), col(0-based byte) }
   local line = vim.api.nvim_get_current_line()
-  local ok, charcol = pcall(vim.str_utfindex, line, pos[2])
-  return id, pos[1], ok and charcol or pos[2]
+  local bytecol = ident_start_bytecol(line, pos[2])
+  local ok, charcol = pcall(vim.str_utfindex, line, bytecol)
+  return id, pos[1], ok and charcol or bytecol
 end
 
 --- After an edit shifts lines (a rename/comment inserts a `/* renamed from */` etc. comment above
