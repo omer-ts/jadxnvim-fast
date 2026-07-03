@@ -90,7 +90,7 @@ function M.from_items(items)
   local targets = {}
   for _, it in ipairs(items or {}) do
     if it.kind == "method" and it.id then
-      targets[#targets + 1] = { class = it.id, method = it.name }
+      targets[#targets + 1] = { class = it.id, method = it.rawName or it.name }
     elseif it.id then
       targets[#targets + 1] = { class = it.id } -- class / text / xref hit -> hook the class
     end

@@ -62,8 +62,9 @@ end
 --- Open the fixture project and wait until the tree is populated AND the background export finishes
 --- (the export decompiles every class, which is what builds jadx's override/usage graph — so
 --- go-to-implementations and polymorphic find-usages are complete). Returns the code window.
-function M.open()
-  jadx.setup({ jar = M.jar, rg = M.rg, session = false })
+function M.open(opts)
+  opts = opts or {}
+  jadx.setup({ jar = M.jar, rg = M.rg, session = false, lean = opts.lean == true })
   local export_done = false
   local d = rpc.on("loadDone", function()
     export_done = true
@@ -123,8 +124,9 @@ function M.done()
 end
 
 --- Run a spec body with a fresh project, then finish. Errors are reported as a failure.
-function M.spec(fn)
-  local win = M.open()
+--- opts.lean = true opens in lean mode (serve from the on-disk export).
+function M.spec(fn, opts)
+  local win = M.open(opts)
   local ok, err = pcall(fn, win)
   if not ok then
     M.check("spec raised no error", false, err)

@@ -152,12 +152,23 @@ public final class Session {
 	// impl-less attr), so we snapshot it while every class is still processed. Key = "rawName#name#argc".
 	private final java.util.List<String[]> overrideEdges = java.util.Collections.synchronizedList(new ArrayList<>());
 	private final Map<String, Boolean> overrideAbstract = new java.util.concurrent.ConcurrentHashMap<>();
+	private final Map<String, String> overrideRaw = new java.util.concurrent.ConcurrentHashMap<>(); // key -> raw method name
 	private volatile Map<String, String> overrideRoot; // methodKey -> union-find root
 	private volatile Map<String, java.util.List<String>> overrideGroup; // root -> member method keys
+	private volatile Map<String, java.util.List<String>> overrideByName; // "classId#name" -> member keys (lean/disk)
 
 	private static String methodKey(JavaMethod jm) {
 		JavaClass top = jm.getTopParentClass();
 		return (top != null ? top.getRawName() : "?") + "#" + jm.getName() + "#" + jm.getArguments().size();
+	}
+
+	// The method's runtime (raw) name — what a Frida hook must use, even if renamed in jadx.
+	private static String rawMethodName(JavaMethod jm) {
+		try {
+			return jm.getMethodNode().getMethodInfo().getName();
+		} catch (Throwable e) {
+			return jm.getName();
+		}
 	}
 
 	// Record a class's override relationships into overrideEdges/overrideAbstract (called per class
@@ -171,12 +182,14 @@ public final class Session {
 				}
 				String k = methodKey(jm);
 				overrideAbstract.putIfAbsent(k, jm.getAccessFlags().isAbstract());
+				overrideRaw.putIfAbsent(k, rawMethodName(jm));
 				for (JavaMethod r : rel) {
 					if (r == null) {
 						continue;
 					}
 					String rk = methodKey(r);
 					overrideAbstract.putIfAbsent(rk, r.getAccessFlags().isAbstract());
+					overrideRaw.putIfAbsent(rk, rawMethodName(r));
 					overrideEdges.add(new String[] { k, rk });
 				}
 			}
@@ -216,8 +229,17 @@ public final class Session {
 			root.put(k, r);
 			group.computeIfAbsent(r, x -> new ArrayList<>()).add(k);
 		}
+		// Secondary index by "classId#name" (no arg count) for the lean disk path, which resolves a
+		// method by name only. Overloads collapse — acceptable for the override list.
+		Map<String, java.util.List<String>> byName = new java.util.HashMap<>();
+		for (String k : root.keySet()) {
+			int h2 = k.lastIndexOf('#');
+			String nameKey = h2 > 0 ? k.substring(0, h2) : k;
+			byName.putIfAbsent(nameKey, group.get(root.get(k)));
+		}
 		this.overrideRoot = root;
 		this.overrideGroup = group;
+		this.overrideByName = byName;
 	}
 
 	// The member keys of a method's override group (incl. itself), or null if not captured.
@@ -245,6 +267,7 @@ public final class Session {
 		t.put("id", id);
 		t.put("fullName", id); // raw name for display; avoids decompiling every implementation
 		t.put("name", name);
+		t.put("rawName", overrideRaw.getOrDefault(mk, name)); // runtime name for Frida
 		t.put("abstract", Boolean.TRUE.equals(overrideAbstract.get(mk)));
 		targets.add(t);
 	}
@@ -372,6 +395,10 @@ public final class Session {
 			throw new IllegalStateException("no input path provided");
 		}
 		cancelExport();
+		// drop any override graph from a previously-opened project (a cached open skips the rebuild)
+		overrideRoot = null;
+		overrideGroup = null;
+		overrideByName = null;
 		File given = new File(this.inputPath);
 		if (!given.exists()) {
 			throw new IllegalArgumentException("input not found: " + given.getAbsolutePath());
@@ -737,8 +764,10 @@ public final class Session {
 		// fresh override capture for this build
 		overrideEdges.clear();
 		overrideAbstract.clear();
+		overrideRaw.clear();
 		overrideRoot = null;
 		overrideGroup = null;
+		overrideByName = null;
 
 		// Resume a compatible partial checkpoint if one exists; any resume error falls back to a
 		// clean rebuild, so a corrupt checkpoint can never produce a bad index.
@@ -1365,9 +1394,23 @@ public final class Session {
 					result.put("found", true);
 					result.put("id", f[1]);
 					result.put("fullName", diskFullName(f[1]));
-					result.put("name", keyName(key));
+					String nm = keyName(key);
+					result.put("name", nm);
 					result.put("line", parseIntSafe(f[2], 1));
 					result.put("col", 0);
+					// go-to-implementations in lean mode: the override graph captured at export is in
+					// memory even though we serve from disk. Look it up by classId#name.
+					java.util.List<String> group = overrideByName == null ? null
+							: overrideByName.get(f[1] + "#" + nm);
+					if (group != null && group.size() > 1) {
+						List<Map<String, Object>> targets = new ArrayList<>();
+						java.util.Set<String> seen = new java.util.HashSet<>();
+						for (String mk : group) {
+							addKeyTarget(targets, seen, mk);
+						}
+						result.put("targets", targets);
+						result.put("kind", "method");
+					}
 					return result;
 				}
 			}
@@ -1486,6 +1529,7 @@ public final class Session {
 				t.put("id", top.getRawName());
 				t.put("fullName", top.getFullName());
 				t.put("name", d.getName());
+				t.put("rawName", (d instanceof JavaMethod) ? rawMethodName((JavaMethod) d) : d.getName());
 				t.put("abstract", (d instanceof JavaMethod) && ((JavaMethod) d).getAccessFlags().isAbstract());
 				targets.add(t);
 			}
@@ -1503,6 +1547,7 @@ public final class Session {
 		result.put("id", ptop.getRawName());
 		result.put("fullName", ptop.getFullName());
 		result.put("name", node.getName());
+		result.put("rawName", (node instanceof JavaMethod) ? rawMethodName((JavaMethod) node) : node.getName());
 		result.put("line", lc[0]);
 		result.put("col", lc[1]);
 		return result;
@@ -1530,6 +1575,7 @@ public final class Session {
 			result.put("targetId", declaring.getRawName());
 			result.put("targetKind", (node instanceof JavaMethod) ? "method"
 					: (node instanceof JavaClass) ? "class" : "other");
+			result.put("targetRawName", (node instanceof JavaMethod) ? rawMethodName((JavaMethod) node) : node.getName());
 		}
 
 		// For a method, also search the interface/abstract methods it overrides: a call through an

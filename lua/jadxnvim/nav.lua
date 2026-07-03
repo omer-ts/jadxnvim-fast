@@ -251,7 +251,7 @@ function M.find_usages()
       local hook
       if type(res.targetId) == "string" then
         hook = (res.targetKind == "method")
-            and { { class = res.targetId, method = name } }
+            and { { class = res.targetId, method = res.targetRawName or name } }
           or { { class = res.targetId } }
       end
       searches.record({ kind = "xref", query = name, title = title, items = items, previewer = preview.class(), on_select = on_open })
@@ -282,7 +282,7 @@ function M.frida_hook()
         targets[1] = { class = res.id } -- whole class
       elseif res.kind == "method" then
         for _, t in ipairs(res.targets or {}) do
-          targets[#targets + 1] = { class = t.id, method = t.name }
+          targets[#targets + 1] = { class = t.id, method = t.rawName or t.name }
         end
       else
         targets[1] = { class = res.id } -- field/other -> hook the declaring class
