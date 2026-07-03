@@ -338,6 +338,38 @@ function M.pick(opts)
   })
   vim.api.nvim_create_autocmd("BufLeave", { group = group, buffer = prompt_buf, callback = close })
 
+  -- Send the current (filtered) results to a persistent scratch pane.
+  local function to_pane()
+    if mode ~= "filter" or #current == 0 then
+      return
+    end
+    local items = current
+    close()
+    vim.schedule(function()
+      require("jadxnvim.results").to_pane(items, on_select, opts.title and vim.trim(opts.title) or "results")
+    end)
+  end
+  -- Generate Frida hooks for the current results (a class/method/text list) or the picker's own
+  -- hook targets (e.g. usages of a specific method).
+  local function to_frida()
+    if mode ~= "filter" or #current == 0 then
+      return
+    end
+    local frida = require("jadxnvim.frida")
+    local targets
+    if type(opts.hook) == "function" then
+      targets = opts.hook(current)
+    elseif type(opts.hook) == "table" then
+      targets = opts.hook
+    else
+      targets = frida.from_items(current)
+    end
+    close()
+    vim.schedule(function()
+      frida.open(targets, opts.title and vim.trim(opts.title) or "hooks")
+    end)
+  end
+
   local kopts = { buffer = prompt_buf, nowait = true, silent = true }
   for _, m in ipairs({ "i", "n" }) do
     vim.keymap.set(m, "<Down>", function() move(1) end, kopts)
@@ -347,6 +379,8 @@ function M.pick(opts)
     vim.keymap.set(m, "<C-d>", function() move(5) end, kopts)
     vim.keymap.set(m, "<C-u>", function() move(-5) end, kopts)
     vim.keymap.set(m, "<CR>", accept, kopts)
+    vim.keymap.set(m, "<C-t>", to_pane, kopts) -- send results to a temp pane
+    vim.keymap.set(m, "<C-f>", to_frida, kopts) -- generate Frida hooks
     vim.keymap.set(m, "<Esc>", close, kopts)
     vim.keymap.set(m, "<C-c>", close, kopts)
   end

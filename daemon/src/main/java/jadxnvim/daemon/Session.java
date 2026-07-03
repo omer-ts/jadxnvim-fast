@@ -1356,6 +1356,8 @@ public final class Session {
 		}
 		result.put("found", true);
 		result.put("targets", targets);
+		result.put("kind", (node instanceof JavaMethod) ? "method"
+				: (node instanceof JavaClass) ? "class" : "other");
 
 		// Primary target: the resolved node, with its exact position (one decompile) for the common
 		// single-target direct jump and older clients.
@@ -1386,6 +1388,13 @@ public final class Session {
 			return result;
 		}
 		result.put("name", node.getName());
+		// The searched symbol's own class (for generating a Frida hook of the target itself).
+		JavaClass declaring = node.getTopParentClass();
+		if (declaring != null) {
+			result.put("targetId", declaring.getRawName());
+			result.put("targetKind", (node instanceof JavaMethod) ? "method"
+					: (node instanceof JavaClass) ? "class" : "other");
+		}
 
 		// For a method, also search the interface/abstract methods it overrides: a call through an
 		// interface/base-typed value is recorded against that abstract method, so find-usages on a

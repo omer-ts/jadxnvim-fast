@@ -246,10 +246,60 @@ function M.find_usages()
       local on_open = function(it)
         code.open(it.id, { line = it.line, col = it.col })
       end
+      -- For <C-f> (Frida) in the usages picker, hook the searched symbol itself: the target method
+      -- (all overloads) or the whole class — not each call site.
+      local hook
+      if type(res.targetId) == "string" then
+        hook = (res.targetKind == "method")
+            and { { class = res.targetId, method = name } }
+          or { { class = res.targetId } }
+      end
       searches.record({ kind = "xref", query = name, title = title, items = items, previewer = preview.class(), on_select = on_open })
-      fuzzy.pick({ title = title, items = items, previewer = preview.class(), on_select = on_open })
+      fuzzy.pick({ title = title, items = items, previewer = preview.class(), on_select = on_open, hook = hook })
     end)
   end)
+end
+
+--- Generate a Frida hook for the symbol under the cursor: the method (all overloads — and every
+--- implementation, for an interface/virtual call) or the whole class.
+function M.frida_hook()
+  local id, line, col = code.cursor_target()
+  if not id then
+    notify("not in a jadx code buffer", vim.log.levels.WARN)
+    return
+  end
+  local word = vim.fn.expand("<cword>")
+  rpc.request("gotoDef", { id = id, line = line, col = col }, function(err, res)
+    vim.schedule(function()
+      local frida = require("jadxnvim.frida")
+      if err or not res or not res.found then
+        -- unresolved: best-effort hook of the word under the cursor as a method of this class
+        frida.open({ { class = id, method = word } }, word)
+        return
+      end
+      local targets = {}
+      if res.kind == "class" then
+        targets[1] = { class = res.id } -- whole class
+      elseif res.kind == "method" then
+        for _, t in ipairs(res.targets or {}) do
+          targets[#targets + 1] = { class = t.id, method = t.name }
+        end
+      else
+        targets[1] = { class = res.id } -- field/other -> hook the declaring class
+      end
+      frida.open(targets, res.name or "hook")
+    end)
+  end)
+end
+
+--- Generate a Frida hook for every method of the class in the current buffer.
+function M.frida_hook_class()
+  local id = code.cursor_target()
+  if not id then
+    notify("not in a jadx code buffer", vim.log.levels.WARN)
+    return
+  end
+  require("jadxnvim.frida").open({ { class = id } }, id)
 end
 
 return M

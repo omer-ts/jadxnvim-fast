@@ -68,6 +68,8 @@ local function java_keymaps(bufnr)
   vim.keymap.set("n", "<leader>jc", function()
     require("jadxnvim.edit").comment()
   end, opts)
+  vim.keymap.set("n", "<leader>jh", nav("frida_hook"), opts) -- Frida hook: symbol under cursor
+  vim.keymap.set("n", "<leader>jH", nav("frida_hook_class"), opts) -- Frida hook: whole class
   common_keymaps(bufnr)
 end
 

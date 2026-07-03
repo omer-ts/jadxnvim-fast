@@ -114,6 +114,14 @@ end, {
   desc = "jadxnvim: jump a stack-trace frame to the decompiled Java (nearest position/method)",
 })
 
+vim.api.nvim_create_user_command("JadxFridaHook", function()
+  require("jadxnvim.nav").frida_hook()
+end, { desc = "jadxnvim: generate a Frida hook for the symbol under the cursor" })
+
+vim.api.nvim_create_user_command("JadxFridaHookClass", function()
+  require("jadxnvim.nav").frida_hook_class()
+end, { desc = "jadxnvim: generate a Frida hook for the whole class in this buffer" })
+
 vim.api.nvim_create_user_command("JadxRename", function()
   require("jadxnvim.edit").rename()
 end, { desc = "jadxnvim: rename symbol under cursor (persists to .jadx)" })
