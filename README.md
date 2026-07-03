@@ -200,8 +200,8 @@ In a **code** buffer (`jadx://<class>`, read-only `java`):
 
 | Key          | Action                         |
 | ------------ | ------------------------------ |
-| `gd`         | Go to definition (falls back to class/method name search if unresolved) |
-| `gr`         | Find usages (xref) — browsable list with preview |
+| `gd`         | Go to definition (falls back to class/method name search if unresolved). On a call through an interface/base type it lists **all implementations** to pick from |
+| `gr`         | Find usages (xref) — browsable list with preview; on an overriding method it also finds virtual-dispatch calls made through the interface/base type |
 | `<Tab>`      | Toggle Java ⟷ Smali (syncs to the same method; remembers each pane's cursor) |
 | `<leader>jr` | Rename                         |
 | `<leader>jc` | Comment                        |
