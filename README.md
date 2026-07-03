@@ -236,6 +236,11 @@ In code buffers `y` / `Y` copy to your **computer's** clipboard — over SSH too
 `xclip`/`win32yank` needed). Disable with `clipboard = false` in `setup()`, or it steps aside if
 you've already configured a clipboard provider.
 
+Decompiled buffers are set up for **folding** (`zc`/`za` to fold a block, `zM`/`zR` to close/open
+all). By default (`folding = "auto"`) they use treesitter's fold expression when the Java parser is
+active — folding `if`/`for`/method `{ }` blocks precisely — and fall back to indent folding
+otherwise. Set `folding = "indent"`, `"expr"`, or `false` in `setup()` to override.
+
 Go-to-definition and usages integrate with the jumplist and quickfix, so `<C-o>`/`<C-i>` and
 `:cnext`/`:cprev` work as usual.
 

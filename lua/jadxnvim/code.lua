@@ -46,6 +46,41 @@ local function to_lines(text)
   return vim.split((text or ""):gsub("\r", ""), "\n", { plain = true })
 end
 
+-- Configure window-local folding for a decompiled buffer so `zc`/`za`/`zM` work on { } blocks.
+-- Scratch buffers default to foldmethod=manual (no folds exist -> "E490: No fold found"), so we set
+-- a real fold method: treesitter's fold expression when the parser is attached (precise block folds),
+-- otherwise indent folding (works on jadx's consistently-indented output).
+local function setup_folds(bufnr, win)
+  local mode = (require("jadxnvim").config or {}).folding
+  if mode == nil then
+    mode = "auto"
+  end
+  if mode == false or mode == "manual" or mode == "none" then
+    return
+  end
+  local method, expr
+  local ts_folds = vim.b[bufnr].jadx_ts and pcall(vim.treesitter.query.get, "java", "folds")
+  if mode == "expr" or (mode == "auto" and ts_folds) then
+    method, expr = "expr", "v:lua.vim.treesitter.foldexpr()"
+  elseif mode == "syntax" then
+    method = "syntax"
+  else -- "auto" without treesitter, or "indent"
+    method = "indent"
+    -- jadx indents 4 spaces per level; match it so each nested { } block folds separately (with the
+    -- default shiftwidth of 8 two levels would collapse into one, so an inner if-body wouldn't fold).
+    vim.bo[bufnr].shiftwidth = 4
+  end
+  pcall(function()
+    vim.wo[win].foldmethod = method
+    if expr then
+      vim.wo[win].foldexpr = expr
+    end
+    vim.wo[win].foldenable = true
+    vim.wo[win].foldlevel = 99 -- open fully; folds exist so zc/za/zM operate on them
+    vim.wo[win].foldnestmax = 20
+  end)
+end
+
 local function common_keymaps(bufnr)
   vim.keymap.set("n", "<Tab>", function()
     M.toggle_view()
@@ -92,6 +127,7 @@ local function highlight(bufnr, ft)
   if ft == "java" and ts_ready("java") then
     used_ts = pcall(vim.treesitter.start, bufnr, "java")
   end
+  vim.b[bufnr].jadx_ts = used_ts -- treesitter attached -> its fold expression is available
   if not used_ts then
     -- Force the regex syntax to load (works even if the session never ran `:syntax on`) and sync
     -- from the top so the whole decompiled file is highlighted, not just the visible window.
@@ -261,6 +297,14 @@ function M.setup()
       vim.bo[ev.buf].bufhidden = "hide"
       vim.bo[ev.buf].swapfile = false
       fill_resource(ev.buf, name)
+    end,
+  })
+  -- Folding is window-local, so (re)apply it whenever a jadx buffer is shown in a window.
+  vim.api.nvim_create_autocmd("BufWinEnter", {
+    group = group,
+    pattern = { JAVA_PREFIX .. "*", SMALI_PREFIX .. "*", RES_PREFIX .. "*" },
+    callback = function(ev)
+      setup_folds(ev.buf, vim.api.nvim_get_current_win())
     end,
   })
 end

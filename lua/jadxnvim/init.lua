@@ -56,6 +56,11 @@ M.config = {
   -- of a stub comment (jadx-gui's "show inconsistent code" / --show-bad-code). On by default; set
   -- false to hide bad code. Changing it re-indexes the export once.
   inconsistent_code = true,
+  -- Code folding in decompiled buffers. "auto" uses treesitter's fold expression when the parser is
+  -- active (folds if/for/while/method { } blocks precisely), else falls back to indent folding.
+  -- Other values: "expr" (always treesitter), "indent", "syntax", or false/"manual" to leave it alone.
+  -- Buffers open fully unfolded — fold with zc/za, close all with zM, open all with zR.
+  folding = "auto",
   -- Icons for the tree and combined search. Defaults use Nerd Font glyphs; override any key with
   -- plain text if you don't run a Nerd Font, e.g. icons = { class = "C", package = "pkg" }.
   -- See lua/jadxnvim/icons.lua for the full list of keys.
