@@ -1714,6 +1714,15 @@ public final class Session {
 		if (node == null) {
 			throw new IllegalArgumentException("no symbol under cursor");
 		}
+		// A constructor's name IS the class name — renaming the <init> method is a no-op in jadx, so
+		// redirect to the declaring class (matching jadx-gui, where renaming a constructor renames the
+		// class and every other constructor with it).
+		if (node instanceof JavaMethod && ((JavaMethod) node).isConstructor()) {
+			JavaClass dc = node.getDeclaringClass();
+			if (dc != null) {
+				node = dc;
+			}
+		}
 		JadxNodeRef ref = JadxNodeRef.forJavaNode(node);
 		if (ref == null) {
 			throw new IllegalArgumentException("this element cannot be renamed");

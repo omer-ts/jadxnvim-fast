@@ -35,4 +35,20 @@ H.spec(function(win)
   H.check("comment ok", e2 == nil, e2 and e2.message)
   local _, c3 = H.req("getCode", { id = "com.example.Hello" })
   H.check("comment appears in code", c3.code:find("MARK_COMMENT") ~= nil)
+
+  -- Renaming via the CONSTRUCTOR renames the class (a constructor's name is the class name).
+  local _, cc0 = H.req("getCode", { id = "com.example.Ctor" })
+  local clines = vim.split(cc0.code, "\n", { plain = true })
+  local kl, kc = H.locate(clines, "public (Ctor)%s*%(") -- the constructor declaration
+  H.check("found Ctor constructor decl", kl ~= nil)
+  vim.api.nvim_win_set_cursor(win, { kl, kc - 1 })
+  -- open the Ctor buffer so cursor_target resolves against it
+  H.open_class(win, "com.example.Ctor")
+  vim.api.nvim_win_set_cursor(win, { kl, kc - 1 })
+  local kid, kln, kcol = H.code.cursor_target()
+  local ke = H.req("rename", { id = kid, line = kln, col = kcol, newName = "Widget" })
+  H.check("constructor rename ok", ke == nil, ke and ke.message)
+  local _, cc1 = H.req("getCode", { id = "com.example.Ctor" })
+  H.check("renaming the constructor renamed the class", cc1.code:find("class Widget") ~= nil, cc1.code:match("[^\n]*class[^\n]*"))
+  H.check("and the constructor now uses the new class name", cc1.code:find("Widget%s*%(") ~= nil)
 end)
