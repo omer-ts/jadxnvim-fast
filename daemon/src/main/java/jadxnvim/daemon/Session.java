@@ -61,11 +61,13 @@ public final class Session {
 	// Cache signature: changes if the input, the index format, OR the code data (renames/comments)
 	// change — a rename doesn't touch the input but must invalidate the export so it's rebuilt with
 	// the new names (otherwise the stale export/xref would be reused on reopen and xrefs break).
-	private static long signature(File input, JadxCodeData cd) {
+	private static long signature(File input, JadxCodeData cd, boolean showInconsistentCode) {
 		// Fold in length AND mtime so replacing the input with different content of the same byte
-		// length (e.g. a rebuilt APK) invalidates the cache instead of serving a stale export.
+		// length (e.g. a rebuilt APK) invalidates the cache instead of serving a stale export. The
+		// showInconsistentCode flag changes the decompiled output, so it's part of the signature too.
 		long h = input.length() * 31 + INDEX_FORMAT_VERSION;
 		h = h * 1000003 + input.lastModified();
+		h = h * 1000003 + (showInconsistentCode ? 1 : 0);
 		h = h * 1000003 + codeDataHash(cd);
 		return h;
 	}
@@ -95,6 +97,9 @@ public final class Session {
 	private boolean export = true;
 	private boolean temp = false;
 	private boolean noUsage = false;
+	// Emit partially-decompiled ("inconsistent") code rather than a stub for methods jadx can't fully
+	// decompile (jadx-gui's "show inconsistent code" / --show-bad-code). On by default.
+	private boolean showInconsistentCode = true;
 	// Lean mode: after the export finishes, drop the in-memory jadx model and serve browse/search/
 	// navigate from the on-disk export. The model is rebuilt on demand for semantic ops (rename,
 	// comment, smali). Implies noUsage.
@@ -150,6 +155,10 @@ public final class Session {
 		if (lean) {
 			this.noUsage = true; // the graph would be wasted work if we drop the model anyway
 		}
+	}
+
+	public void setShowInconsistentCode(boolean show) {
+		this.showInconsistentCode = show;
 	}
 
 	public Object dispatch(String method, JsonObject params) throws Exception {
@@ -258,7 +267,7 @@ public final class Session {
 		this.namesDir = new File(exportDir, "index-names");
 		this.xrefDir = new File(exportDir, "index-xref");
 		this.metaDir = new File(exportDir, "index-meta");
-		long sig = signature(input, cd);
+		long sig = signature(input, cd, showInconsistentCode);
 
 		// Lean fast-open: with a valid cached export, skip building the jadx model entirely (no
 		// multi-GB parse peak) and serve browse/search/tree from disk right away. The model is built
@@ -378,7 +387,7 @@ public final class Session {
 			try {
 				// Signature includes the index format version and the code data, so a format change or
 				// a rename/comment (which changes names but not the input) invalidates the cache.
-				long sig = signature(input, codeData);
+				long sig = signature(input, codeData, showInconsistentCode);
 				// Reuse the cache only if it also has the name index (older caches predate it, so
 				// they rebuild once to gain fast class/method search).
 				boolean hasNames = new File(nmDir, SearchIndex.classesName(0)).isFile();
@@ -1544,8 +1553,8 @@ public final class Session {
 		args.setCodeData(cd);
 		// Emit partially-decompiled ("inconsistent") code instead of a stub for methods jadx can't
 		// fully decompile (jadx-gui's "show inconsistent code" / --show-bad-code), so obfuscated
-		// classes still show something browsable/searchable rather than a comment.
-		args.setShowInconsistentCode(true);
+		// classes still show something browsable/searchable rather than a comment. Toggleable.
+		args.setShowInconsistentCode(showInconsistentCode);
 		// Don't retain decompiled code in memory. On huge APKs (e.g. 400k classes) the default
 		// in-memory cache exhausts the heap and GC-thrashes during the full export; without it the
 		// export streams to disk at low, constant memory. Browsing re-decompiles per class (cheap,

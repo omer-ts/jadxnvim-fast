@@ -52,6 +52,10 @@ M.config = {
   -- 400k-class APK. The model is rebuilt on demand (one-time) the first time you go-to-def, find
   -- usages, view smali, or edit. Implies usage = false. Requires export = true.
   lean = false,
+  -- Show partially-decompiled ("inconsistent") code for methods jadx can't fully decompile, instead
+  -- of a stub comment (jadx-gui's "show inconsistent code" / --show-bad-code). On by default; set
+  -- false to hide bad code. Changing it re-indexes the export once.
+  inconsistent_code = true,
   -- Icons for the tree and combined search. Defaults use Nerd Font glyphs; override any key with
   -- plain text if you don't run a Nerd Font, e.g. icons = { class = "C", package = "pkg" }.
   -- See lua/jadxnvim/icons.lua for the full list of keys.
@@ -297,6 +301,9 @@ function M.open(project, opts)
   end
   if M.config.lean == true then
     table.insert(cmd, "--lean")
+  end
+  if M.config.inconsistent_code == false then
+    table.insert(cmd, "--no-inconsistent-code")
   end
   local rg = M.config.rg
   if not rg or rg == "" then

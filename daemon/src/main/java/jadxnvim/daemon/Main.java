@@ -28,6 +28,7 @@ public final class Main {
 		boolean temp = false;
 		boolean noUsage = false;
 		boolean lean = false;
+		boolean showInconsistentCode = true;
 		String rgPath = null;
 		for (int i = 0; i < argv.length; i++) {
 			String a = argv[i];
@@ -39,6 +40,8 @@ public final class Main {
 				noUsage = true;
 			} else if ("--lean".equals(a)) {
 				lean = true;
+			} else if ("--no-inconsistent-code".equals(a)) {
+				showInconsistentCode = false;
 			} else if ("--rg".equals(a) && i + 1 < argv.length) {
 				rgPath = argv[++i];
 			} else if (a != null && a.startsWith("--rg=")) {
@@ -57,6 +60,7 @@ public final class Main {
 			session.setTemp(temp);
 			session.setNoUsage(noUsage);
 			session.setLean(lean);
+			session.setShowInconsistentCode(showInconsistentCode);
 			try {
 				session.loadProject(null);
 			} catch (Exception e) {
