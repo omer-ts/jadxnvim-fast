@@ -75,7 +75,8 @@ public final class Session {
 	// The jadx-gui project fields the plugin manages (everything but codeData/files/projectVersion).
 	private static final String[] UI_STATE_KEYS = {
 			"openTabs", "searchHistory", "treeExpansionsV2", "cacheDir",
-			"searchResourcesFilter", "searchResourcesSizeLimit", "enableLiveReload", "mappingsPath"
+			"searchResourcesFilter", "searchResourcesSizeLimit", "enableLiveReload", "mappingsPath",
+			"jadxnvimBookmarks" // jadxnvim's richer bookmark list (jadx-gui keeps bookmarks in openTabs)
 	};
 
 	private static com.google.gson.JsonObject extractUiState(com.google.gson.JsonObject root) {

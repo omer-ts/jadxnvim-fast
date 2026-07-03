@@ -156,6 +156,8 @@ Extra args after the project are passed through to `nvim`.
 | `:JadxFindText`        | Full-text search, then fuzzy-narrow the results                |
 | `:JadxRename`          | Rename the symbol under the cursor (persists to `.jadx`)        |
 | `:JadxComment`         | Comment the symbol under the cursor (persists to `.jadx`)       |
+| `:JadxBookmark`        | Toggle a bookmark at the cursor                                 |
+| `:JadxBookmarks`       | List / jump to / delete bookmarks                              |
 | `:JadxFridaHook`       | Generate a Frida hook for the symbol under the cursor           |
 | `:JadxFridaHookClass`  | Generate a Frida hook for every method of the current class     |
 | `:JadxClose`           | Close the project and stop the daemon                           |
@@ -172,6 +174,7 @@ is bound to these global keys when a project is open:
 | `<Space>fd` | methods (jumps to the declaration)                            |
 | `<Space>fv` | everything — classes + methods + text in one list (jadx-gui-style) |
 | `<Space>fs` | **search history** — reopen or delete past searches / xrefs (also `:JadxHistory`) |
+| `<Space>fb` | **bookmarks** — jump to or delete bookmarked positions (also `:JadxBookmarks`) |
 
 **Search history:** every text search, xref (find-usages), class/method search is recorded. `<Space>fs`
 opens a history list — each entry shows its type icon, query + count, and age, with a preview of its
@@ -225,6 +228,7 @@ In a **code** buffer (`jadx://<class>`, read-only `java`):
 | `<leader>jc` | Comment                        |
 | `<leader>jh` | Frida hook the symbol under the cursor (a method — and every implementation for an interface call) |
 | `<leader>jH` | Frida hook every method of this class |
+| `<leader>jm` | Toggle a bookmark at the cursor |
 
 In code buffers `y` / `Y` copy to your **computer's** clipboard — over SSH too, via OSC 52 (no
 `xclip`/`win32yank` needed). Disable with `clipboard = false` in `setup()`, or it steps aside if
@@ -250,6 +254,10 @@ jadxnvim also **reads and writes jadx-gui's UI-state**, in jadx-gui's own format
   jadx-gui's search dropdown.
 - **cacheDir** — the project points at jadxnvim's on-disk cache (`<name>.jadxnvim/`, a dedicated
   `gui-cache` subdir for jadx-gui so it never touches jadxnvim's index).
+- **Bookmarks** — `<leader>jm` bookmarks the position under the cursor; `<Space>fb` lists/jumps.
+  They're written as jadx-gui bookmarked tabs (`openTabs` with `bookmarked: true` + `caret`), so they
+  show up in jadx-gui's *Bookmarked tabs* panel; jadxnvim also keeps a richer list (multiple per
+  class, with a text snippet) in its own preserved field.
 
 Any fields jadxnvim doesn't manage (tree state, plugin options, ...) are preserved, so round-tripping
 a jadx-gui project never loses its state. The input APK is referenced relatively, so a project

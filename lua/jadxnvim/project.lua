@@ -43,8 +43,24 @@ function M.push()
   if not rpc.is_running() then
     return
   end
+  local bookmarks = require("jadxnvim.bookmarks")
   local state = {}
   local tabs = M.capture_open_tabs()
+  -- fold bookmarks into openTabs (bookmarked = true, one per class) for jadx-gui interop
+  local by_class = {}
+  for _, t in ipairs(tabs) do
+    by_class[t.tabPath] = t
+  end
+  for _, bt in ipairs(bookmarks.tabs()) do
+    local ex = by_class[bt.tabPath]
+    if ex then
+      ex.bookmarked = true
+      ex.caret = bt.caret
+    else
+      tabs[#tabs + 1] = bt
+      by_class[bt.tabPath] = bt
+    end
+  end
   if #tabs > 0 then
     state.openTabs = tabs -- a non-empty list encodes as a JSON array; omit when empty
   end
@@ -52,7 +68,11 @@ function M.push()
   if #hist > 0 then
     state.searchHistory = hist
   end
-  if state.openTabs or state.searchHistory then
+  local recs = bookmarks.records() -- jadxnvim's richer bookmark list (preserved field)
+  if #recs > 0 then
+    state.jadxnvimBookmarks = recs
+  end
+  if state.openTabs or state.searchHistory or state.jadxnvimBookmarks then
     -- Wait briefly for the write so it commits before the daemon is stopped on exit.
     local done = false
     rpc.request("setProjectState", state, function()
@@ -73,6 +93,7 @@ function M.restore(state, restore_tabs)
   if type(state.searchHistory) == "table" then
     searches.seed(state.searchHistory)
   end
+  require("jadxnvim.bookmarks").seed(state.jadxnvimBookmarks, state.openTabs)
   if restore_tabs and type(state.openTabs) == "table" then
     for _, t in ipairs(state.openTabs) do
       if t.type == "class" and type(t.tabPath) == "string" and t.tabPath ~= "" then

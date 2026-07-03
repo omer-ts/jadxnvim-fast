@@ -114,6 +114,14 @@ end, {
   desc = "jadxnvim: jump a stack-trace frame to the decompiled Java (nearest position/method)",
 })
 
+vim.api.nvim_create_user_command("JadxBookmark", function()
+  require("jadxnvim.bookmarks").toggle()
+end, { desc = "jadxnvim: toggle a bookmark at the cursor" })
+
+vim.api.nvim_create_user_command("JadxBookmarks", function()
+  require("jadxnvim.bookmarks").picker()
+end, { desc = "jadxnvim: list/jump/delete bookmarks" })
+
 vim.api.nvim_create_user_command("JadxFridaHook", function()
   require("jadxnvim.nav").frida_hook()
 end, { desc = "jadxnvim: generate a Frida hook for the symbol under the cursor" })

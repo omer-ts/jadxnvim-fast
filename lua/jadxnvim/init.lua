@@ -68,6 +68,7 @@ M.config = {
     find_methods = "<Space>fd",
     find_combined = "<Space>fv",
     saved_searches = "<Space>fs",
+    bookmarks = "<Space>fb",
   },
 }
 
@@ -97,6 +98,7 @@ local function map_finders()
   map(keys.find_methods, function() require("jadxnvim.find").methods() end, "jadx: fuzzy find methods")
   map(keys.find_combined, function() require("jadxnvim.find").combined() end, "jadx: combined search")
   map(keys.saved_searches, function() require("jadxnvim.searches").manager() end, "jadx: saved searches")
+  map(keys.bookmarks, function() require("jadxnvim.bookmarks").picker() end, "jadx: bookmarks")
 end
 
 -- Register the daemon load-lifecycle handlers exactly once.
