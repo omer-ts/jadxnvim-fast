@@ -20,22 +20,22 @@ H.spec(function(win)
   H.check("from_items: class -> whole class", targets[1].class == "com.example.Hello" and targets[1].method == nil)
   H.check("from_items: method -> class+method", targets[2].method == "greet")
 
-  -- cursor hook on a concrete method -> that class + method
+  -- cursor hook on a concrete, non-overriding method -> just that class + method
   local captured
   local orig = frida.open
   frida.open = function(t)
     captured = t
   end
   local _, hlines = H.open_class(win, "com.example.Hello")
-  local ml, mc = H.locate(hlines, "String (greet)%s*%(")
+  local ml, mc = H.locate(hlines, "int (getCount)%s*%(")
   vim.api.nvim_win_set_cursor(win, { ml, mc - 1 })
   nav.frida_hook()
   local ok = vim.wait(6000, function()
     return captured ~= nil
   end, 50)
   H.check("cursor hook produced a target", ok and #captured >= 1, captured and #captured)
-  H.check("hooks Hello.greet", captured and captured[1].class == "com.example.Hello" and captured[1].method == "greet",
-    captured and vim.inspect(captured[1]))
+  H.check("hooks Hello.getCount", captured and captured[1].class == "com.example.Hello"
+    and captured[1].method == "getCount", captured and vim.inspect(captured[1]))
 
   -- whole-class hook
   captured = nil

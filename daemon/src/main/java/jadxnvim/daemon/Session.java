@@ -147,6 +147,126 @@ public final class Session {
 	private int codeDataVersion = 0;
 	private final Map<String, ICodeInfo> freshInfo = new java.util.HashMap<>();
 
+	// Method override hierarchy, captured during export. jadx's live override attribute is torn down
+	// by the per-class unload() that bounds export memory (re-decompiling an interface later yields an
+	// impl-less attr), so we snapshot it while every class is still processed. Key = "rawName#name#argc".
+	private final java.util.List<String[]> overrideEdges = java.util.Collections.synchronizedList(new ArrayList<>());
+	private final Map<String, Boolean> overrideAbstract = new java.util.concurrent.ConcurrentHashMap<>();
+	private volatile Map<String, String> overrideRoot; // methodKey -> union-find root
+	private volatile Map<String, java.util.List<String>> overrideGroup; // root -> member method keys
+
+	private static String methodKey(JavaMethod jm) {
+		JavaClass top = jm.getTopParentClass();
+		return (top != null ? top.getRawName() : "?") + "#" + jm.getName() + "#" + jm.getArguments().size();
+	}
+
+	// Record a class's override relationships into overrideEdges/overrideAbstract (called per class
+	// during export, while the class is decompiled and its override attribute is intact).
+	private void captureOverrides(JavaClass cls) {
+		try {
+			for (JavaMethod jm : cls.getMethods()) {
+				java.util.List<JavaMethod> rel = jm.getOverrideRelatedMethods();
+				if (rel == null || rel.isEmpty()) {
+					continue;
+				}
+				String k = methodKey(jm);
+				overrideAbstract.putIfAbsent(k, jm.getAccessFlags().isAbstract());
+				for (JavaMethod r : rel) {
+					if (r == null) {
+						continue;
+					}
+					String rk = methodKey(r);
+					overrideAbstract.putIfAbsent(rk, r.getAccessFlags().isAbstract());
+					overrideEdges.add(new String[] { k, rk });
+				}
+			}
+		} catch (Throwable ignore) {
+			// override capture is best-effort; gd/gr fall back to the live attr
+		}
+	}
+
+	private static String ufFind(Map<String, String> parent, String x) {
+		String r = x;
+		while (!r.equals(parent.getOrDefault(r, r))) {
+			r = parent.get(r);
+		}
+		while (!parent.getOrDefault(x, x).equals(r)) {
+			String nx = parent.get(x);
+			parent.put(x, r);
+			x = nx;
+		}
+		return r;
+	}
+
+	// After export, collapse the captured edges into connected components (a method's full override
+	// group), so gd/gr can list every implementation regardless of which member you start from.
+	private void finalizeOverrides() {
+		Map<String, String> parent = new java.util.HashMap<>();
+		String[][] edges;
+		synchronized (overrideEdges) {
+			edges = overrideEdges.toArray(new String[0][]);
+		}
+		for (String[] e : edges) {
+			parent.put(ufFind(parent, e[0]), ufFind(parent, e[1]));
+		}
+		Map<String, String> root = new java.util.HashMap<>();
+		Map<String, java.util.List<String>> group = new java.util.HashMap<>();
+		for (String k : overrideAbstract.keySet()) {
+			String r = ufFind(parent, k);
+			root.put(k, r);
+			group.computeIfAbsent(r, x -> new ArrayList<>()).add(k);
+		}
+		this.overrideRoot = root;
+		this.overrideGroup = group;
+	}
+
+	// The member keys of a method's override group (incl. itself), or null if not captured.
+	private java.util.List<String> overrideGroupOf(JavaNode node) {
+		if (!(node instanceof JavaMethod) || overrideRoot == null) {
+			return null;
+		}
+		String r = overrideRoot.get(methodKey((JavaMethod) node));
+		return r == null ? null : overrideGroup.get(r);
+	}
+
+	// Build a gd target from a captured method key (no decompile: id/name come from the key).
+	private void addKeyTarget(List<Map<String, Object>> targets, java.util.Set<String> seen, String mk) {
+		int h1 = mk.indexOf('#');
+		int h2 = mk.lastIndexOf('#');
+		if (h1 < 0 || h2 <= h1) {
+			return;
+		}
+		String id = mk.substring(0, h1);
+		String name = mk.substring(h1 + 1, h2);
+		if (!seen.add(id + "#" + name)) {
+			return;
+		}
+		Map<String, Object> t = new LinkedHashMap<>();
+		t.put("id", id);
+		t.put("fullName", id); // raw name for display; avoids decompiling every implementation
+		t.put("name", name);
+		t.put("abstract", Boolean.TRUE.equals(overrideAbstract.get(mk)));
+		targets.add(t);
+	}
+
+	// Resolve a captured method key back to a live JavaMethod (for its getUseIn()).
+	private JavaMethod resolveMethodKey(String mk) {
+		int h1 = mk.indexOf('#');
+		if (h1 < 0) {
+			return null;
+		}
+		JavaClass c = findClass(mk.substring(0, h1));
+		if (c == null) {
+			return null;
+		}
+		for (JavaMethod jm : c.getMethods()) {
+			if (methodKey(jm).equals(mk)) {
+				return jm;
+			}
+		}
+		return null;
+	}
+
 	public void setEmitter(Emitter emitter) {
 		this.emitter = emitter;
 	}
@@ -570,6 +690,7 @@ public final class Session {
 		String id = cls.getRawName();
 		ICodeInfo ci = cls.getCodeInfo();
 		String code = ci.getCodeStr();
+		captureOverrides(cls); // snapshot override edges before the export unloads this class
 		int[] starts = lineStarts(code);
 		// Raw parsed method list: same order memberPos uses, so the stored index maps back correctly.
 		// Skipped (DONT_GENERATE) slots stay null to keep positions. The method's declaration line
@@ -613,6 +734,11 @@ public final class Session {
 		List<JavaClass> all = d.getClasses();
 		int total = all.size();
 		boolean withXref = lean;
+		// fresh override capture for this build
+		overrideEdges.clear();
+		overrideAbstract.clear();
+		overrideRoot = null;
+		overrideGroup = null;
 
 		// Resume a compatible partial checkpoint if one exists; any resume error falls back to a
 		// clean rebuild, so a corrupt checkpoint can never produce a bad index.
@@ -731,6 +857,7 @@ public final class Session {
 			return null;
 		}
 		SearchIndex idx = b.finish(mDir, sig);
+		finalizeOverrides(); // collapse the captured edges into per-method override groups
 		// completed — the resume artifacts are no longer needed
 		progressFile.delete();
 		doneFile.delete();
@@ -1327,32 +1454,41 @@ public final class Session {
 		// targets are lightweight (class id + method name, no per-target decompile) — the plugin opens
 		// the class and relocates on the name — so even a functional interface with hundreds of
 		// implementations stays fast; only the primary target's exact position is computed here.
-		List<JavaNode> defs = new ArrayList<>();
-		defs.add(node);
-		if (node instanceof JavaMethod) {
-			for (JavaMethod rel : ((JavaMethod) node).getOverrideRelatedMethods()) {
-				if (rel != null) {
-					defs.add(rel);
-				}
-			}
-		}
 		List<Map<String, Object>> targets = new ArrayList<>();
 		java.util.Set<String> seen = new java.util.HashSet<>();
-		for (JavaNode d : defs) {
-			JavaClass top = d.getTopParentClass();
-			if (top == null) {
-				continue;
+		// Prefer the override group captured at export (survives the post-export unload). Fall back to
+		// the live override attribute (fresh model: no-export / cached open) when it wasn't captured.
+		java.util.List<String> group = overrideGroupOf(node);
+		if (group != null) {
+			for (String mk : group) {
+				addKeyTarget(targets, seen, mk);
 			}
-			if (!seen.add(top.getRawName() + "#" + d.getName())) {
-				continue;
+		}
+		if (targets.isEmpty()) {
+			List<JavaNode> defs = new ArrayList<>();
+			defs.add(node);
+			if (node instanceof JavaMethod) {
+				for (JavaMethod rel : ((JavaMethod) node).getOverrideRelatedMethods()) {
+					if (rel != null) {
+						defs.add(rel);
+					}
+				}
 			}
-			Map<String, Object> t = new LinkedHashMap<>();
-			t.put("id", top.getRawName());
-			t.put("fullName", top.getFullName());
-			t.put("name", d.getName());
-			// distinguish the interface/abstract declaration from a concrete implementation
-			t.put("abstract", (d instanceof JavaMethod) && ((JavaMethod) d).getAccessFlags().isAbstract());
-			targets.add(t);
+			for (JavaNode d : defs) {
+				JavaClass top = d.getTopParentClass();
+				if (top == null) {
+					continue;
+				}
+				if (!seen.add(top.getRawName() + "#" + d.getName())) {
+					continue;
+				}
+				Map<String, Object> t = new LinkedHashMap<>();
+				t.put("id", top.getRawName());
+				t.put("fullName", top.getFullName());
+				t.put("name", d.getName());
+				t.put("abstract", (d instanceof JavaMethod) && ((JavaMethod) d).getAccessFlags().isAbstract());
+				targets.add(t);
+			}
 		}
 		result.put("found", true);
 		result.put("targets", targets);
@@ -1405,9 +1541,23 @@ public final class Session {
 		List<JavaNode> targets = new ArrayList<>();
 		targets.add(node);
 		if (node instanceof JavaMethod) {
-			for (JavaMethod rel : ((JavaMethod) node).getOverrideRelatedMethods()) {
-				if (rel != null && rel.getAccessFlags().isAbstract()) {
-					targets.add(rel);
+			java.util.List<String> group = overrideGroupOf(node);
+			if (group != null) {
+				String self = methodKey((JavaMethod) node);
+				for (String mk : group) {
+					if (mk.equals(self) || !Boolean.TRUE.equals(overrideAbstract.get(mk))) {
+						continue;
+					}
+					JavaMethod jm = resolveMethodKey(mk);
+					if (jm != null) {
+						targets.add(jm);
+					}
+				}
+			} else {
+				for (JavaMethod rel : ((JavaMethod) node).getOverrideRelatedMethods()) {
+					if (rel != null && rel.getAccessFlags().isAbstract()) {
+						targets.add(rel);
+					}
 				}
 			}
 		}
