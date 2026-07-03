@@ -29,7 +29,9 @@ import jadx.api.data.ICodeRename;
 import jadx.api.data.impl.JadxCodeComment;
 import jadx.api.data.impl.JadxCodeData;
 import jadx.api.data.impl.JadxCodeRename;
+import jadx.api.data.impl.JadxCodeRef;
 import jadx.api.data.impl.JadxNodeRef;
+import jadx.api.JavaVariable;
 import jadx.api.metadata.ICodeAnnotation;
 import jadx.api.metadata.ICodeMetadata;
 import jadx.api.metadata.ICodeNodeRef;
@@ -1714,6 +1716,11 @@ public final class Session {
 		if (node == null) {
 			throw new IllegalArgumentException("no symbol under cursor");
 		}
+		// A local variable is not a global node: it's identified by a code reference (its slot within
+		// the method), so it needs a JadxCodeRename carrying the method's node ref + a VAR code ref.
+		if (node instanceof JavaVariable) {
+			return renameVariable((JavaVariable) node, newName);
+		}
 		// A constructor's name IS the class name — renaming the <init> method is a no-op in jadx, so
 		// redirect to the declaring class (matching jadx-gui, where renaming a constructor renames the
 		// class and every other constructor with it).
@@ -1738,6 +1745,27 @@ public final class Session {
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("ok", true);
 		result.put("newName", newName);
+		result.put("project", projectFile.getAbsolutePath());
+		return result;
+	}
+
+	// Rename a local variable via a code reference (method node ref + VAR code ref). An empty newName
+	// clears any existing rename for that variable.
+	private Map<String, Object> renameVariable(JavaVariable var, String newName) throws Exception {
+		JadxNodeRef mthRef = JadxNodeRef.forMth(var.getMth());
+		JadxCodeRef codeRef = JadxCodeRef.forVar(var.getVarNode());
+		List<ICodeRename> renames = new ArrayList<>(currentRenames());
+		renames.removeIf(r -> mthRef.equals(r.getNodeRef()) && codeRef.equals(r.getCodeRef()));
+		if (newName != null && !newName.isEmpty()) {
+			renames.add(new JadxCodeRename(mthRef, codeRef, newName));
+		}
+		codeData.setRenames(renames);
+		applyCodeData();
+
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("ok", true);
+		result.put("newName", newName);
+		result.put("kind", "variable");
 		result.put("project", projectFile.getAbsolutePath());
 		return result;
 	}

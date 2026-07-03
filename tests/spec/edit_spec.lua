@@ -51,4 +51,26 @@ H.spec(function(win)
   local _, cc1 = H.req("getCode", { id = "com.example.Ctor" })
   H.check("renaming the constructor renamed the class", cc1.code:find("class Widget") ~= nil, cc1.code:match("[^\n]*class[^\n]*"))
   H.check("and the constructor now uses the new class name", cc1.code:find("Widget%s*%(") ~= nil)
+
+  -- Rename a LOCAL VARIABLE (identified by a code ref, not a global node) — propagates to every use.
+  local _, vlines = H.open_class(win, "com.example.Vars")
+  local vl, vcol, vname
+  for i, l in ipairs(vlines) do
+    local s, _, nm = l:find("for %(int (%w+)")
+    if s then
+      vl, vname = i, nm
+      vcol = l:find(nm, s, true)
+      break
+    end
+  end
+  H.check("found a loop variable to rename", vl ~= nil, vname)
+  vim.api.nvim_win_set_cursor(win, { vl, vcol - 1 })
+  local vid, vln, vco = H.code.cursor_target()
+  local ve = H.req("rename", { id = vid, line = vln, col = vco, newName = "counter" })
+  H.check("variable rename ok", ve == nil, ve and ve.message)
+  local _, vc2 = H.req("getCode", { id = "com.example.Vars" })
+  H.check("the variable was renamed everywhere it's used", vc2.code:find("int counter") ~= nil and vc2.code:find("counter%+%+") ~= nil,
+    vc2.code:match("[^\n]*for %([^\n]*"))
+  H.check("the old synthetic name is gone from the loop header",
+    not (vc2.code:match("for %(int (%w+)") == vname), vname)
 end)

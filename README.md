@@ -226,7 +226,7 @@ In a **code** buffer (`jadx://<class>`, read-only `java`):
 | `gd`         | Go to definition (falls back to class/method name search if unresolved). On a call through an interface/base type it lists **all implementations** to pick from |
 | `gr`         | Find usages (xref) — browsable list with preview; on an overriding method it also finds virtual-dispatch calls made through the interface/base type |
 | `<Tab>`      | Toggle Java ⟷ Smali (syncs to the same method; remembers each pane's cursor) |
-| `<leader>jr` | Rename                         |
+| `<leader>jr` | Rename (classes, methods, fields, and **local variables**; a constructor renames its class) |
 | `<leader>jc` | Comment                        |
 | `<leader>jh` | Frida hook the symbol under the cursor (a method — and every implementation for an interface call) |
 | `<leader>jH` | Frida hook every method of this class |
