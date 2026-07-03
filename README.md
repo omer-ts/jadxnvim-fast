@@ -220,9 +220,21 @@ to work purely in memory and never write a file). Renames and comments are store
 code-data format and written to that `.jadx` (same `projectVersion`/`files`/`codeData` shape and
 GSON serialization jadx-gui uses). Open the same `.jadx` in jadx-gui and your renames/comments are
 there; conversely, opening a project edited in jadx-gui shows its renames/comments in jadxnvim.
-Saving preserves fields jadxnvim doesn't manage (open tabs, tree state, ...), so round-tripping a
-jadx-gui project doesn't lose its UI state. The input APK is referenced relatively, so a project
-directory stays portable.
+
+jadxnvim also **reads and writes jadx-gui's UI-state**, in jadx-gui's own format:
+
+- **Open tabs** — your open class buffers are saved as the project's `openTabs` (as jadx-gui
+  `TabViewState`s). Reopen the project — in jadxnvim or jadx-gui — and the same tabs come back.
+- **Search history** — text searches, xrefs and name searches are recorded to the project's
+  `searchHistory`; on open they're available again (re-runnable) in `<Space>fs`, and populate
+  jadx-gui's search dropdown.
+- **cacheDir** — the project points at jadxnvim's on-disk cache (`<name>.jadxnvim/`, a dedicated
+  `gui-cache` subdir for jadx-gui so it never touches jadxnvim's index).
+
+Any fields jadxnvim doesn't manage (tree state, plugin options, ...) are preserved, so round-tripping
+a jadx-gui project never loses its state. The input APK is referenced relatively, so a project
+directory stays portable. (Verified against jadx-gui's own project loader: a project jadxnvim writes
+loads in jadx-gui with the rename applied and the tabs/search-history restored.)
 
 ## Status
 
