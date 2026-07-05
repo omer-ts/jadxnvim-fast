@@ -44,23 +44,29 @@ communication is local stdio, so there is no network protocol or auth to configu
   | --- | --- | --- |
   | default (`usage = true`) | ~6.9 GB | full jadx-gui-quality output + precise `gr` |
   | `usage = false` | ~4.6 GB | skips jadx's ~2.3 GB xref graph (see below) |
-  | `lean = true` | **~120 MB** | model dropped after export; served from disk |
+  | `lean = true` | ~0.5–1.5 GB | browse/search/nav served from disk; parsed model kept resident for instant edits |
+  | `lean = true` + `keep_model = false` | **~120 MB** | also drops the model after export (slow first edit) |
 
   jadx builds a global cross-reference (usage) graph at load — ~2.3 GB of it for a large APK — that powers
   precise find-usages (`gr`) and single-use anonymous-class inlining. Set `usage = false` to skip it:
   `gr` then falls back to a fast name-based text search, and anonymous classes aren't inlined.
 
-  **Lean mode (`lean = true`)** goes further: once the on-load export is written, jadxnvim drops jadx's
-  entire in-memory model and serves the class tree, code view, search, the fuzzy finders, **go-to-def
-  and find-usages** straight from the on-disk export (the export also writes an rg-searchable
-  cross-reference index) — steady-state RAM falls to a few hundred MB (~420 MB RSS on a large APK). Only
-  smali view and editing (rename/comment) rebuild the model on demand (one-time, with a notice). And
-  once the export is **cached**, opening the project skips building the model entirely — it serves from
-  disk immediately, so there's no multi-GB parse peak at all (a large APK opens in ~0 s at a few hundred
-  MB). Only the *first* indexing of an APK needs the full model in memory. Implies `usage = false`;
-  requires `export = true`. Cost: the cross-reference index adds disk (≈2 GB for a large APK, on top of
-  the ~1 GB of decompiled shards) — it's queried with ripgrep and never loaded into RAM, and lives in
-  the gitignored `<name>.jadxnvim/` cache.
+  **Lean mode (`lean = true`)** goes further: once the on-load export is written, jadxnvim serves the
+  class tree, code view, search, the fuzzy finders, **go-to-def and find-usages** straight from the
+  on-disk export (the export also writes an rg-searchable cross-reference index), and jadx's usage graph
+  is skipped entirely. Once the export is **cached**, opening the project skips the multi-GB parse peak —
+  a large APK opens in ~0 s. Implies `usage = false`; requires `export = true`. Cost: the cross-reference
+  index adds disk (≈2 GB for a large APK, on top of the ~1 GB of decompiled shards) — it's queried with
+  ripgrep and never loaded into RAM, and lives in the gitignored `<name>.jadxnvim/` cache.
+
+  By default lean mode **keeps jadx's parsed model resident** (pre-warmed in the background after a fast
+  cached open) so the first rename/comment is *instant* rather than re-parsing the whole APK on demand.
+  `NoOpCodeCache` keeps decompiled text out of the heap, so the retained model is just parsed structures
+  (~0.5–1.5 GB even on a 400k-class APK). After an edit, reopening the project **reuses the existing
+  index** and refreshes stale names in the background instead of blocking on a full re-index — the class
+  you're viewing always shows current names. On RAM-constrained hosts set `keep_model = false` (or pass
+  `--drop-model`) to drop the model after export; the first edit then re-parses the APK once (a
+  multi-second-to-minute stall on huge APKs) and steady-state RAM falls to ~120 MB.
 
 ## Build the daemon
 
@@ -207,8 +213,8 @@ In the **tree** window the project is split into two sections, each row tagged w
 - **Sources** — packages → classes (`<CR>` / `o` expands a package or opens a class).
 - **Resources** — the APK's resource files as a directory tree; opening one (`AndroidManifest.xml`,
   `res/values/strings.xml`, …) shows its **decoded** text, syntax-highlighted by extension. In lean
-  mode the resource *list* is served from disk; opening a resource's *content* rebuilds the model
-  once (like smali).
+  mode the resource *list* is served from disk; opening a resource's *content* uses the resident model
+  (or, with `keep_model = false`, rebuilds it once — like smali).
 
 Press `/` to **filter** the tree (case-insensitive; `<Esc>` clears). The icons default to Nerd Font
 glyphs — override them (or switch to plain ASCII) via `icons` in `setup()`:

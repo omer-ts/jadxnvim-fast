@@ -47,11 +47,16 @@ M.config = {
   -- and ~20 s of load time. Set false to save that memory on constrained servers; find-usages then
   -- falls back to a name-based text search and anonymous classes aren't inlined.
   usage = true,
-  -- Lean mode: after the on-load export finishes, drop jadx's in-memory model and serve browsing,
-  -- search and the class tree entirely from the on-disk export — RAM falls to a few hundred MB on a
-  -- 400k-class APK. The model is rebuilt on demand (one-time) the first time you go-to-def, find
-  -- usages, view smali, or edit. Implies usage = false. Requires export = true.
+  -- Lean mode: browsing, search, the class tree and go-to-def / find-usages are served entirely
+  -- from the on-disk export (no usage graph). By default the parsed model is still kept resident
+  -- (NoOpCodeCache keeps decompiled text out of the heap, so it's ~0.5-1.5 GB even on a 400k-class
+  -- APK) so the first rename/comment is instant and reopening an edited project doesn't re-index.
+  -- Implies usage = false. Requires export = true.
   lean = false,
+  -- Keep the parsed jadx model resident in lean mode (see above). Set false (or pass --drop-model)
+  -- on RAM-constrained hosts to drop it after export and rebuild it on demand — the first edit then
+  -- re-parses the whole APK (a one-time multi-second-to-minute stall on huge APKs).
+  keep_model = true,
   -- Show partially-decompiled ("inconsistent") code for methods jadx can't fully decompile, instead
   -- of a stub comment (jadx-gui's "show inconsistent code" / --show-bad-code). On by default; set
   -- false to hide bad code. Changing it re-indexes the export once.
@@ -294,9 +299,10 @@ function M.open(project, opts)
   if not has_heap then
     table.insert(cmd, "-XX:MaxRAMPercentage=70.0")
   end
-  if M.config.lean == true then
-    -- Lean mode's whole point is a small steady-state footprint, so tell G1 to actually hand the
-    -- big export-time heap back to the OS once the model is dropped (default ratios keep it mapped).
+  if M.config.lean == true and M.config.keep_model == false then
+    -- Drop-model lean: the model is released after export, so tell G1 to actually hand the big
+    -- export-time heap back to the OS (default ratios keep it mapped). With keep_model (the default)
+    -- the model stays resident, so these aggressive shrink ratios would only cause GC churn.
     vim.list_extend(cmd, { "-XX:MinHeapFreeRatio=5", "-XX:MaxHeapFreeRatio=25", "-XX:G1PeriodicGCInterval=5000" })
   end
   if opts._index_threads then
@@ -316,6 +322,9 @@ function M.open(project, opts)
   end
   if M.config.lean == true then
     table.insert(cmd, "--lean")
+    if M.config.keep_model == false then
+      table.insert(cmd, "--drop-model")
+    end
   end
   if M.config.inconsistent_code == false then
     table.insert(cmd, "--no-inconsistent-code")

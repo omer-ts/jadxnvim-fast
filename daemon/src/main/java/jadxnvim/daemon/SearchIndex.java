@@ -418,11 +418,16 @@ final class SearchIndex {
 			}
 		}
 
-		/** Close shard files and write the persisted line index + signature; returns the index. */
-		SearchIndex finish(File metaDir, long signature) throws IOException {
+		/**
+		 * Close shard files and write the persisted line index + signatures; returns the index. The
+		 * full signature (.sig, input+codeData) marks the index as exactly matching the project; the
+		 * input signature (.isig, input only) marks it as structurally reusable after a rename/comment.
+		 */
+		SearchIndex finish(File metaDir, long inputSignature, long fullSignature) throws IOException {
 			closeWriters();
 			writeIdx(metaDir);
-			atomicWrite(new File(metaDir, ".sig"), Long.toString(signature).getBytes(StandardCharsets.UTF_8));
+			atomicWrite(new File(metaDir, ".isig"), Long.toString(inputSignature).getBytes(StandardCharsets.UTF_8));
+			atomicWrite(new File(metaDir, ".sig"), Long.toString(fullSignature).getBytes(StandardCharsets.UTF_8));
 			return new SearchIndex(shardsDir, namesDir, xrefDir, meta);
 		}
 
@@ -498,7 +503,20 @@ final class SearchIndex {
 	// --- persistence ---------------------------------------------------------
 
 	static boolean isValid(File metaDir, long signature) {
-		File sig = new File(metaDir, ".sig");
+		return sigMatches(new File(metaDir, ".sig"), signature);
+	}
+
+	/**
+	 * True when the index was built for this exact input (same .isig), regardless of whether the
+	 * code data (renames/comments) has changed since. Such an index describes the same classes at the
+	 * same positions and can be served immediately while a background refresh updates stale names.
+	 * Older indexes predate .isig and report false, so they rebuild once to gain fast reuse.
+	 */
+	static boolean structurallyValid(File metaDir, long inputSignature) {
+		return sigMatches(new File(metaDir, ".isig"), inputSignature);
+	}
+
+	private static boolean sigMatches(File sig, long signature) {
 		if (!sig.isFile()) {
 			return false;
 		}

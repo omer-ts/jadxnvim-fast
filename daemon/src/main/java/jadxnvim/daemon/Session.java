@@ -63,15 +63,24 @@ public final class Session {
 	// Cache signature: changes if the input, the index format, OR the code data (renames/comments)
 	// change — a rename doesn't touch the input but must invalidate the export so it's rebuilt with
 	// the new names (otherwise the stale export/xref would be reused on reopen and xrefs break).
-	private static long signature(File input, JadxCodeData cd, boolean showInconsistentCode) {
+	// Identity of the INPUT + decompiler options, independent of renames/comments. Two indexes with
+	// the same input signature describe the same classes at the same positions (modulo renamed names),
+	// so one can be reused for the other after a rename without a full re-decompile.
+	private static long inputSignature(File input, boolean showInconsistentCode) {
 		// Fold in length AND mtime so replacing the input with different content of the same byte
 		// length (e.g. a rebuilt APK) invalidates the cache instead of serving a stale export. The
 		// showInconsistentCode flag changes the decompiled output, so it's part of the signature too.
 		long h = input.length() * 31 + INDEX_FORMAT_VERSION;
 		h = h * 1000003 + input.lastModified();
 		h = h * 1000003 + (showInconsistentCode ? 1 : 0);
-		h = h * 1000003 + codeDataHash(cd);
 		return h;
+	}
+
+	// Full signature: input identity plus the code data (renames/comments), so an index is "exact"
+	// only when its names match the current project. A codeData change makes the index name-stale but
+	// still structurally valid (same inputSignature) — reusable while a refresh runs in the background.
+	private static long signature(File input, JadxCodeData cd, boolean showInconsistentCode) {
+		return inputSignature(input, showInconsistentCode) * 1000003 + codeDataHash(cd);
 	}
 
 	// The jadx-gui project fields the plugin manages (everything but codeData/files/projectVersion).
@@ -125,6 +134,19 @@ public final class Session {
 	// navigate from the on-disk export. The model is rebuilt on demand for semantic ops (rename,
 	// comment, smali). Implies noUsage.
 	private boolean lean = false;
+	// Keep the parsed jadx model resident even in lean mode (browse/search/navigate still serve from
+	// the on-disk export; the model only backs edits + accurate views). NoOpCodeCache keeps decompiled
+	// text out of the heap, so the retained model is just parsed structures (~0.5-1.5 GB even on a
+	// 400k-class APK). This makes the first rename/comment instant instead of re-parsing the whole APK
+	// (a multi-minute stall that froze the daemon). Opt out with --drop-model on RAM-constrained hosts.
+	private boolean keepModel = true;
+	// True while browse/search/navigate are being served from the on-disk export (independent of
+	// whether the model happens to be resident, so a warm model doesn't disable disk-serving).
+	private volatile boolean leanServing = false;
+	// True when the loaded index is structurally valid for this input but was built with older code
+	// data (renames/comments changed since) — its class/method names may be stale. Views re-decompile
+	// from the model (correct names) until a background refresh rebuilds and swaps the index in.
+	private volatile boolean indexNamesStale = false;
 	private java.util.concurrent.atomic.AtomicBoolean exportCancel;
 	private File exportDir;
 	private File indexDir;
@@ -342,8 +364,12 @@ public final class Session {
 	public void setLean(boolean lean) {
 		this.lean = lean;
 		if (lean) {
-			this.noUsage = true; // the graph would be wasted work if we drop the model anyway
+			this.noUsage = true; // gd/gr serve from the disk xref index, so skip the in-memory graph
 		}
+	}
+
+	public void setKeepModel(boolean keepModel) {
+		this.keepModel = keepModel;
 	}
 
 	public void setShowInconsistentCode(boolean show) {
@@ -472,13 +498,19 @@ public final class Session {
 		this.namesDir = new File(exportDir, "index-names");
 		this.xrefDir = new File(exportDir, "index-xref");
 		this.metaDir = new File(exportDir, "index-meta");
+		long inputSig = inputSignature(input, showInconsistentCode);
 		long sig = signature(input, cd, showInconsistentCode);
+		boolean exactCache = SearchIndex.isValid(metaDir, sig);
+		// Structurally valid = same input, possibly older names (renames/comments changed since it was
+		// built). Serve it immediately anyway and refresh names in the background, instead of blocking
+		// the user for minutes on a full re-decompile after every edit.
+		boolean structCache = exactCache || SearchIndex.structurallyValid(metaDir, inputSig);
+		boolean hasNames = new File(namesDir, SearchIndex.classesName(0)).isFile();
 
-		// Lean fast-open: with a valid cached export, skip building the jadx model entirely (no
-		// multi-GB parse peak) and serve browse/search/tree from disk right away. The model is built
-		// on demand the first time a semantic op needs it.
-		if (lean && export && !temp && SearchIndex.isValid(metaDir, sig)
-				&& new File(namesDir, SearchIndex.classesName(0)).isFile()) {
+		// Lean fast-open: with a (structurally) valid cached export, skip the blocking model parse and
+		// serve browse/search/tree from disk right away. Keep-model then pre-warms the parsed model in
+		// the background so the first edit is instant; --drop-model leaves it lazy.
+		if (lean && export && !temp && structCache && hasNames) {
 			JadxDecompiler prev = this.jadx;
 			this.jadx = null;
 			this.codeData = cd;
@@ -493,6 +525,8 @@ public final class Session {
 			this.freshInfo.clear();
 			this.searchIndex = SearchIndex.load(indexDir, namesDir, xrefDir, metaDir);
 			this.sourcesReady = true;
+			this.leanServing = true;
+			this.indexNamesStale = !exactCache; // stale names → views re-decompile from the model
 			if (prev != null) {
 				try {
 					prev.close();
@@ -520,7 +554,16 @@ public final class Session {
 			info.put("projectState", projectUiState);
 			emitter.emit("ready", info);
 			emitter.emit("loadDone", Map.of("total", 0, "cached", true));
-			emitter.emit("modelUnloaded", Map.of("lean", true));
+			if (keepModel) {
+				warmModelAsync(); // pre-warm so the first edit (and any stale-name view) is instant
+			} else if (exactCache) {
+				emitter.emit("modelUnloaded", Map.of("lean", true));
+			}
+			if (!exactCache) {
+				// Names changed since the export was built: rebuild it to current names in the
+				// background and swap it in (reusing the model warmed above, so no duplicate parse).
+				refreshIndexAsync();
+			}
 			return info;
 		}
 
@@ -540,6 +583,8 @@ public final class Session {
 		this.freshInfo.clear();
 		this.searchIndex = null;
 		this.sourcesReady = false;
+		this.leanServing = false;
+		this.indexNamesStale = false;
 		if (previous != null) {
 			try {
 				previous.close();
@@ -592,8 +637,9 @@ public final class Session {
 		File input = this.inputFile;
 		Thread t = new Thread(() -> {
 			try {
-				// Signature includes the index format version and the code data, so a format change or
-				// a rename/comment (which changes names but not the input) invalidates the cache.
+				// The full signature folds in the code data, so a rename/comment marks the cache
+				// name-stale; the input signature (input + options only) stays valid across edits.
+				long inputSig = inputSignature(input, showInconsistentCode);
 				long sig = signature(input, codeData, showInconsistentCode);
 				// Reuse the cache only if it also has the name index (older caches predate it, so
 				// they rebuild once to gain fast class/method search).
@@ -604,20 +650,20 @@ public final class Session {
 					if (!resourcesFile().isFile()) {
 						writeResourceList(d); // older caches predate the resource list; backfill it once
 					}
+					// Establish disk-serving (and settle the model) BEFORE announcing loadDone, so a
+					// search/navigate arriving right after loadDone sees the export ready, not a
+					// half-set state that falls back to the slow in-memory path.
+					finishLeanServing();
 					emitter.emit("loadDone", Map.of("total", 0, "cached", true));
-					if (lean) {
-						unloadModel();
-					}
 					return;
 				}
-				searchIndex = buildIndex(d, idxDir, nmDir, xrDir, mDir, sig, cancel);
+				searchIndex = buildIndex(d, idxDir, nmDir, xrDir, mDir, inputSig, sig, cancel);
 				if (searchIndex != null && !cancel.get()) {
 					sourcesReady = true;
+					indexNamesStale = false;
 					writeResourceList(d); // so lean mode can list resources without reloading the model
+					finishLeanServing();
 					emitter.emit("loadDone", Map.of("total", 1));
-					if (lean) {
-						unloadModel();
-					}
 				}
 			} catch (Throwable err) {
 				System.err.println("[jadxd] export error: " + err);
@@ -781,8 +827,8 @@ public final class Session {
 		}
 	}
 
-	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File nmDir, File xrDir, File mDir, long sig,
-			java.util.concurrent.atomic.AtomicBoolean cancel) throws Exception {
+	private SearchIndex buildIndex(JadxDecompiler d, File idxDir, File nmDir, File xrDir, File mDir, long inputSig,
+			long sig, java.util.concurrent.atomic.AtomicBoolean cancel) throws Exception {
 		List<JavaClass> all = d.getClasses();
 		int total = all.size();
 		boolean withXref = lean;
@@ -823,7 +869,7 @@ public final class Session {
 		}
 		mDir.mkdirs(); // .progress/.pos/.idx live here; ensure it exists before the first checkpoint write
 		if (total == 0) {
-			return builder.finish(mDir, sig);
+			return builder.finish(mDir, inputSig, sig);
 		}
 
 		List<JavaClass> remaining = new ArrayList<>();
@@ -910,7 +956,7 @@ public final class Session {
 		if (cancel.get()) {
 			return null;
 		}
-		SearchIndex idx = b.finish(mDir, sig);
+		SearchIndex idx = b.finish(mDir, inputSig, sig);
 		finalizeOverrides(); // collapse the captured edges into per-method override groups
 		// completed — the resume artifacts are no longer needed
 		progressFile.delete();
@@ -1256,10 +1302,12 @@ public final class Session {
 	}
 
 	public Map<String, Object> getCode(String id) {
-		// Lean mode: read the exported copy straight off disk (no model, no re-decompile) as long as
-		// the project is unedited. This is also exactly the text the search index was built from, so
-		// search line numbers land precisely.
-		if (servingFromDisk() && codeDataVersion == 0 && searchIndex.hasCode(id)) {
+		// Lean mode: read the exported copy straight off disk (no re-decompile) as long as the project
+		// is unedited AND the export's names are current. This is exactly the text the search index was
+		// built from, so search line numbers land precisely. When names are stale (renames changed
+		// since the export), re-decompile from the model so the viewed class shows correct names while
+		// the background refresh rebuilds the index.
+		if (servingFromDisk() && !indexNamesStale && codeDataVersion == 0 && searchIndex.hasCode(id)) {
 			String code = searchIndex.codeOf(id);
 			if (code != null) {
 				Map<String, Object> result = new LinkedHashMap<>();
@@ -1299,6 +1347,9 @@ public final class Session {
 	// --- disk cross-reference (lean mode go-to-def / find-usages, no model) -------------------
 
 	private boolean xrefReady() {
+		// Position-based (needs the buffer the user sees to match the index layout): only while serving
+		// exact disk text. After an in-session edit the buffer is re-decompiled from the model with a
+		// possibly different layout, so gd/gr resolve against the model instead.
 		return servingFromDisk() && searchIndex.xrefDir() != null && searchIndex.xrefDir().isDirectory();
 	}
 
@@ -1883,7 +1934,7 @@ public final class Session {
 		// When the on-disk index can serve the search (ripgrep over shards/name files), don't touch
 		// the model — in lean mode that avoids re-materializing it. The in-memory fallback only runs
 		// when the index isn't ready, in which case the model is still loaded.
-		JadxDecompiler d = servingFromDisk() ? null : ensureLoaded();
+		JadxDecompiler d = navServableFromDisk() ? null : ensureLoaded();
 		String query = reqStr(params, "query");
 		Search.Opts opts = new Search.Opts();
 		if (params.has("limit") && !params.get("limit").isJsonNull()) {
@@ -1899,9 +1950,10 @@ public final class Session {
 			opts.kind = params.get("kind").getAsString();
 		}
 		// Pass the index for both text (shard scan) and name (class/method name files) searches once
-		// the export is ready; Search decides how to use it and falls back to the in-memory scan.
-		// After an edit (codeDataVersion > 0) the export is stale, so search the live model instead.
-		SearchIndex idx = (sourcesReady && codeDataVersion == 0) ? searchIndex : null;
+		// the export is ready; Search decides how to use it and falls back to the in-memory scan. The
+		// index stays structurally valid across edits, so keep using ripgrep (just-renamed symbols may
+		// read under their old name until the background refresh completes) rather than a slow scan.
+		SearchIndex idx = navServableFromDisk() ? searchIndex : null;
 		int searchId = search().start(d, kind, query, opts, idx, rgPath);
 		Map<String, Object> result = new LinkedHashMap<>();
 		result.put("searchId", searchId);
@@ -1981,6 +2033,22 @@ public final class Session {
 		return d;
 	}
 
+	/**
+	 * The export is ready to serve browse/search/navigate from disk. Keep the parsed model resident
+	 * (default) so the first edit is instant, or drop it to a low memory baseline (--drop-model).
+	 */
+	private void finishLeanServing() {
+		if (!lean) {
+			return;
+		}
+		leanServing = true;
+		if (keepModel) {
+			emitter.emit("modelWarm", Map.of("lean", true));
+		} else {
+			unloadModel();
+		}
+	}
+
 	/** Lean mode: drop the in-memory model once the export can serve browse/search/navigate. */
 	private synchronized void unloadModel() {
 		JadxDecompiler d = this.jadx;
@@ -2000,8 +2068,217 @@ public final class Session {
 		emitter.emit("modelUnloaded", Map.of("lean", true));
 	}
 
+	/**
+	 * Build the parsed model on a background thread and publish it, so browse/search/navigate stay
+	 * responsive (served from disk) during the multi-minute parse instead of freezing the daemon. Used
+	 * to pre-warm after a cached fast-open so the first rename/comment is instant. The build runs OFF
+	 * the dispatch lock; only the brief publish takes it.
+	 */
+	private void warmModelAsync() {
+		final File in = this.inputFile;
+		final JadxCodeData cd = this.codeData;
+		if (in == null) {
+			return;
+		}
+		synchronized (this) {
+			if (jadx != null || modelWarming) {
+				return; // already resident or a warm is in flight
+			}
+			modelWarming = true;
+		}
+		Thread t = new Thread(() -> {
+			JadxDecompiler d = null;
+			try {
+				d = buildModel(in, cd);
+			} catch (Throwable e) {
+				System.err.println("[jadxd] model warm failed: " + e);
+			}
+			synchronized (this) {
+				modelWarming = false;
+				if (d != null) {
+					if (jadx == null && in.equals(this.inputFile)) {
+						this.jadx = d;
+						this.packageIndex = null;
+						emitter.emit("modelWarm", Map.of("lean", true));
+					} else {
+						try {
+							d.close(); // lost the race (an edit already reloaded) or the project changed
+						} catch (Exception ignore) {
+							// best effort
+						}
+					}
+				}
+				this.notifyAll(); // wake any edit waiting on the warm (reloadModel)
+			}
+		}, "jadx-warm");
+		t.setDaemon(true);
+		t.setPriority(Thread.MIN_PRIORITY);
+		t.start();
+	}
+
+	private volatile boolean modelWarming = false;
+	private volatile boolean refreshing = false;
+
+	/**
+	 * Rebuild the on-disk export to match the current code data (renames/comments), then atomically
+	 * swap it in for what we're serving. Runs entirely in the background: the fresh index is built into
+	 * sibling ".next" directories (off the dispatch lock, so browse/search stay live on the old index),
+	 * and only the final directory swap + reload takes the lock — at which point no request is reading
+	 * the files (all dispatch, including ripgrep, is serialized on {@code this}). Clears the stale flag.
+	 */
+	private void refreshIndexAsync() {
+		final File input = this.inputFile;
+		if (input == null) {
+			return;
+		}
+		synchronized (this) {
+			if (refreshing) {
+				return;
+			}
+			refreshing = true;
+		}
+		final File cIdx = this.indexDir, cNm = this.namesDir, cXr = this.xrefDir, cMeta = this.metaDir;
+		final File bIdx = nextDir(cIdx), bNm = nextDir(cNm), bXr = nextDir(cXr), bMeta = nextDir(cMeta);
+		final java.util.concurrent.atomic.AtomicBoolean cancel = new java.util.concurrent.atomic.AtomicBoolean(false);
+		this.exportCancel = cancel;
+		Thread t = new Thread(() -> {
+			boolean builtLocally = false;
+			JadxDecompiler d = null;
+			try {
+				synchronized (this) {
+					d = this.jadx;
+				}
+				// Prefer the model being pre-warmed alongside us — wait briefly for it to publish so we
+				// don't parse the APK a second time. buildModel already runs on the warm thread.
+				for (int w = 0; d == null && modelWarming && w < 1800; w++) {
+					Thread.sleep(100);
+					synchronized (this) {
+						d = this.jadx;
+					}
+				}
+				if (d == null) {
+					d = buildModel(input, this.codeData); // parse off-lock; publish below if keeping
+					builtLocally = true;
+				}
+				if (builtLocally && keepModel) {
+					synchronized (this) {
+						if (this.jadx == null && input.equals(this.inputFile)) {
+							this.jadx = d;
+							this.packageIndex = null;
+							builtLocally = false; // now owned by the session
+							emitter.emit("modelWarm", Map.of("lean", true));
+						}
+					}
+				}
+				long inputSig = inputSignature(input, showInconsistentCode);
+				long fullSig = signature(input, this.codeData, showInconsistentCode);
+				deleteDir(bIdx);
+				deleteDir(bNm);
+				deleteDir(bXr);
+				deleteDir(bMeta);
+				SearchIndex fresh = buildIndex(d, bIdx, bNm, bXr, bMeta, inputSig, fullSig, cancel);
+				if (fresh == null || cancel.get()) {
+					deleteDir(bIdx);
+					deleteDir(bNm);
+					deleteDir(bXr);
+					deleteDir(bMeta);
+					return;
+				}
+				synchronized (this) {
+					if (!input.equals(this.inputFile) || cancel.get()) {
+						return; // project changed or cancelled — discard the fresh build
+					}
+					// No request is reading the served files here (dispatch, incl. rg, holds `this`),
+					// so it is safe to replace the canonical directories in place.
+					replaceDir(bIdx, cIdx);
+					replaceDir(bNm, cNm);
+					replaceDir(bXr, cXr);
+					replaceDir(bMeta, cMeta);
+					this.searchIndex = SearchIndex.load(cIdx, cNm, cXr, cMeta);
+					this.diskPkgIndex = null;
+					this.diskNames = null;
+					this.indexNamesStale = false;
+					this.sourcesReady = true;
+				}
+				emitter.emit("indexRefreshed", Map.of("lean", true));
+			} catch (Throwable e) {
+				System.err.println("[jadxd] index refresh error: " + e);
+				deleteDir(bIdx);
+				deleteDir(bNm);
+				deleteDir(bXr);
+				deleteDir(bMeta);
+			} finally {
+				refreshing = false;
+				if (builtLocally && d != null) {
+					try {
+						d.close(); // transient model (drop-model mode) — release it
+					} catch (Exception ignore) {
+						// best effort
+					}
+				}
+			}
+		}, "jadx-index-refresh");
+		t.setDaemon(true);
+		t.setPriority(Thread.MIN_PRIORITY);
+		t.start();
+	}
+
+	// Sibling scratch directory ("<name>.next") that a background rebuild writes into before the swap.
+	private static File nextDir(File dir) {
+		return new File(dir.getParentFile(), dir.getName() + ".next");
+	}
+
+	// Move src onto dst (same parent → same filesystem), replacing dst. Caller holds `this`, so no
+	// reader touches these files during the swap.
+	private static void replaceDir(File src, File dst) {
+		deleteDir(dst);
+		if (!src.renameTo(dst)) {
+			// Rename can fail if a stray handle lingers; fall back to a recursive copy + drop.
+			copyDir(src, dst);
+			deleteDir(src);
+		}
+	}
+
+	private static void copyDir(File src, File dst) {
+		if (src == null || !src.exists()) {
+			return;
+		}
+		dst.mkdirs();
+		File[] files = src.listFiles();
+		if (files == null) {
+			return;
+		}
+		for (File f : files) {
+			File target = new File(dst, f.getName());
+			if (f.isDirectory()) {
+				copyDir(f, target);
+			} else {
+				try {
+					java.nio.file.Files.copy(f.toPath(), target.toPath(),
+							java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+				} catch (IOException e) {
+					throw new RuntimeException(e);
+				}
+			}
+		}
+	}
+
 	/** Rebuild the model on demand (lean mode) for an op that needs jadx semantics. */
 	private synchronized JadxDecompiler reloadModel() {
+		if (jadx != null) {
+			return jadx;
+		}
+		// A background warm may already be parsing the APK. Wait for it rather than parsing a second
+		// time. wait() releases `this` (fully, despite dispatch's reentrant hold), so the warm thread
+		// can publish and other RPCs stay responsive during the wait.
+		while (jadx == null && modelWarming) {
+			try {
+				this.wait(1000);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				break;
+			}
+		}
 		if (jadx != null) {
 			return jadx;
 		}
@@ -2011,11 +2288,23 @@ public final class Session {
 		return jadx;
 	}
 
-	/** True when running lean with the model currently dropped (serve from disk). */
+	/** True when exact class TEXT should be served from the on-disk export (verbatim, current names). */
 	private boolean servingFromDisk() {
-		// After an in-session edit (rename/comment) the on-disk export is stale, so stop serving from
-		// it and use the (now-loaded) model instead.
-		return jadx == null && sourcesReady && searchIndex != null && codeDataVersion == 0;
+		// Serve exact text from disk only while it matches what we'd decompile: no in-session edit and
+		// names not stale. Otherwise re-decompile from the model for correct names. A resident model
+		// doesn't change this (it only backs edits).
+		return leanServing && sourcesReady && searchIndex != null && codeDataVersion == 0;
+	}
+
+	/**
+	 * True when the on-disk export can back NAVIGATION and SEARCH (go-to-def, find-usages, name/text
+	 * search). Unlike {@link #servingFromDisk()} this stays true across in-session edits: the index is
+	 * structurally valid (same classes, node identities, near-identical positions) even after a rename,
+	 * so gd/gr/search keep using ripgrep over the shards instead of the slow in-memory scan or the
+	 * usage-less model. Names for just-edited symbols may lag until the background refresh swaps in.
+	 */
+	private boolean navServableFromDisk() {
+		return leanServing && sourcesReady && searchIndex != null;
 	}
 
 	private JadxDecompiler ensureLoaded() {
