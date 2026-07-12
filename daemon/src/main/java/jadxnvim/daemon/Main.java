@@ -15,6 +15,12 @@ import java.nio.charset.StandardCharsets;
 public final class Main {
 
 	public static void main(String[] argv) throws Exception {
+		// Standalone CLI subcommands (index/stats/search/xref) run the v2 index engine directly and
+		// exit, without entering the JSON-RPC daemon loop.
+		if (Cli.run(argv)) {
+			return;
+		}
+
 		// Reserve the real stdout for the protocol; send everything else to stderr.
 		PrintStream protocolOut = new PrintStream(new FileOutputStream(FileDescriptor.out), true,
 				StandardCharsets.UTF_8);
@@ -30,6 +36,7 @@ public final class Main {
 		boolean lean = false;
 		boolean keepModel = true;
 		boolean showInconsistentCode = true;
+		boolean v2 = false;
 		String rgPath = null;
 		for (int i = 0; i < argv.length; i++) {
 			String a = argv[i];
@@ -45,6 +52,8 @@ public final class Main {
 				keepModel = false; // RAM-constrained: drop the model after export (slow first edit)
 			} else if ("--no-inconsistent-code".equals(a)) {
 				showInconsistentCode = false;
+			} else if ("--v2".equals(a) || "--fast".equals(a)) {
+				v2 = true;
 			} else if ("--rg".equals(a) && i + 1 < argv.length) {
 				rgPath = argv[++i];
 			} else if (a != null && a.startsWith("--rg=")) {
@@ -65,6 +74,7 @@ public final class Main {
 			session.setLean(lean);
 			session.setKeepModel(keepModel);
 			session.setShowInconsistentCode(showInconsistentCode);
+			session.setV2(v2);
 			try {
 				session.loadProject(null);
 			} catch (Exception e) {

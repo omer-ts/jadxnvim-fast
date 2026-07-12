@@ -61,6 +61,13 @@ M.config = {
   -- of a stub comment (jadx-gui's "show inconsistent code" / --show-bad-code). On by default; set
   -- false to hide bad code. Changing it re-indexes the export once.
   inconsistent_code = true,
+  -- Fast engine (v2): open + browse + name/content search are served from a memory-mapped SQLite
+  -- index built directly from the dex tables (dexlib2, no decompilation), and a class is decompiled
+  -- on demand via a mini-dex when you open it. This makes even 700MB APKs open in seconds at a few
+  -- hundred MB, instead of the classic multi-GB whole-APK parse. Advanced ops (go-to-def / find-
+  -- usages / rename) build the full jadx model on first use (a one-time cost). Set false to force the
+  -- classic engine. When on, the export/lean/usage/keep_model options above don't apply.
+  fast = true,
   -- Code folding in decompiled buffers. "auto" uses treesitter's fold expression when the parser is
   -- active (folds if/for/while/method { } blocks precisely), else falls back to indent folding.
   -- Other values: "expr" (always treesitter), "indent", "syntax", or false/"manual" to leave it alone.
@@ -328,6 +335,9 @@ function M.open(project, opts)
   end
   if M.config.inconsistent_code == false then
     table.insert(cmd, "--no-inconsistent-code")
+  end
+  if M.config.fast ~= false then
+    table.insert(cmd, "--fast")
   end
   local rg = M.config.rg
   if not rg or rg == "" then

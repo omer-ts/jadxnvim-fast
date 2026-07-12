@@ -147,6 +147,11 @@ public final class Session {
 	// data (renames/comments changed since) — its class/method names may be stale. Views re-decompile
 	// from the model (correct names) until a background refresh rebuilds and swaps the index in.
 	private volatile boolean indexNamesStale = false;
+	// v2 fast engine: when enabled, browse/code/name+content search are served from the SQLite index
+	// (dexlib2-built) and the on-demand mini-dex renderer, with no whole-APK jadx model. Advanced ops
+	// (gd/gr/rename/resources) fall through to the legacy path, which builds the model lazily.
+	private boolean v2mode = false;
+	private volatile V2Engine v2;
 	private java.util.concurrent.atomic.AtomicBoolean exportCancel;
 	private File exportDir;
 	private File indexDir;
@@ -376,6 +381,10 @@ public final class Session {
 		this.showInconsistentCode = show;
 	}
 
+	public void setV2(boolean v2mode) {
+		this.v2mode = v2mode;
+	}
+
 	public Object dispatch(String method, JsonObject params) throws Exception {
 		// RPC dispatch is single-threaded, so this lock only serializes ops against the background
 		// export thread's unloadModel()/reloadModel() (also synchronized) — preventing a model
@@ -387,6 +396,15 @@ public final class Session {
 	}
 
 	private Object dispatch0(String method, JsonObject params) throws Exception {
+		// v2 fast path: serve browse/code/search from the SQLite index + renderer. Anything v2 doesn't
+		// handle (gd/gr/rename/resources/smali) returns NOT_HANDLED and falls through to legacy below,
+		// which builds the jadx model lazily via ensureLoaded().
+		if (v2 != null && !"loadProject".equals(method) && !"shutdown".equals(method)) {
+			Object r = v2.handle(method, params);
+			if (r != V2Engine.NOT_HANDLED) {
+				return r;
+			}
+		}
 		switch (method) {
 			case "loadProject":
 				return loadProject(str(params, "path"));
@@ -498,6 +516,14 @@ public final class Session {
 		this.namesDir = new File(exportDir, "index-names");
 		this.xrefDir = new File(exportDir, "index-xref");
 		this.metaDir = new File(exportDir, "index-meta");
+
+		// v2 fast engine: build/open the SQLite index and serve from it — no jadx model parse. Only for
+		// dex-based inputs (.apk/.dex); dexlib2 can't read .jar/.class/.aar, so those use the legacy
+		// engine even when fast mode is on.
+		if (v2mode && isDexInput(input)) {
+			return loadProjectV2(input, cd, projFile);
+		}
+
 		long inputSig = inputSignature(input, showInconsistentCode);
 		long sig = signature(input, cd, showInconsistentCode);
 		boolean exactCache = SearchIndex.isValid(metaDir, sig);
@@ -618,6 +644,93 @@ public final class Session {
 		if (export && !temp) {
 			startExport(decompiler);
 		}
+		return info;
+	}
+
+	/**
+	 * v2 open: build or reuse the SQLite index (dexlib2, no decompilation) and stand up the {@link
+	 * V2Engine}. Returns as soon as the index is ready — seconds for a 700MB APK at a few hundred MB —
+	 * without parsing a jadx model. The model is built lazily only if an advanced op needs it.
+	 */
+	private Map<String, Object> loadProjectV2(File input, JadxCodeData cd, File projFile) throws Exception {
+		// Tear down any previous state (legacy model or a prior v2 engine).
+		V2Engine prevV2 = this.v2;
+		this.v2 = null;
+		if (prevV2 != null) {
+			prevV2.close();
+		}
+		JadxDecompiler prevJadx = this.jadx;
+		this.jadx = null;
+		if (prevJadx != null) {
+			try {
+				prevJadx.close();
+			} catch (Exception ignore) {
+				// best effort
+			}
+		}
+		this.codeData = cd;
+		this.inputFile = input.getAbsoluteFile();
+		this.projectFile = projFile;
+		this.searchIndex = null;
+		this.leanServing = false;
+		this.sourcesReady = false;
+		this.packageIndex = null;
+		this.classList = null;
+		this.methodList = null;
+		this.diskPkgIndex = null;
+		this.diskNames = null;
+		this.codeDataVersion = 0;
+		this.freshInfo.clear();
+
+		exportDir.mkdirs();
+		File dbFile = new File(exportDir, "index.db");
+		String sig = DexIndexer.signature(input);
+		Db db = Db.open(dbFile.getAbsolutePath());
+		boolean cached = db.isValid(sig);
+		if (!cached) {
+			db.close();
+			// Fresh build assumes an empty schema; start from a clean file.
+			dbFile.delete();
+			new File(dbFile.getAbsolutePath() + "-wal").delete();
+			new File(dbFile.getAbsolutePath() + "-shm").delete();
+			db = Db.open(dbFile.getAbsolutePath());
+			try {
+				DexIndexer indexer = new DexIndexer(db, (done, pct) ->
+						emitter.emit("loadProgress", Map.of("done", done, "total", 0, "percent", pct)));
+				indexer.build(input);
+			} catch (Exception e) {
+				try {
+					db.close(); // don't leak the connection if indexing fails
+				} catch (Exception ignore) {
+					// best effort
+				}
+				throw e;
+			}
+		}
+		File work = new File(exportDir, "render");
+		this.v2 = new V2Engine(db, this.inputFile, work, this.emitter);
+		long classes = this.v2.classCount();
+
+		if (!temp && !projFile.exists()) {
+			try {
+				ProjectIO.save(projFile, this.inputFile, this.codeData, projectUiState);
+			} catch (IOException e) {
+				System.err.println("[jadxd] could not create project file: " + e);
+			}
+		}
+
+		Map<String, Object> info = new LinkedHashMap<>();
+		info.put("input", input.getAbsolutePath());
+		info.put("project", temp ? null : projFile.getAbsolutePath());
+		info.put("temp", temp);
+		info.put("classes", classes);
+		info.put("renames", cd.getRenames() == null ? 0 : cd.getRenames().size());
+		info.put("comments", cd.getComments() == null ? 0 : cd.getComments().size());
+		info.put("v2", true);
+		info.put("protocol", PROTOCOL_VERSION);
+		info.put("projectState", projectUiState);
+		emitter.emit("ready", info);
+		emitter.emit("loadDone", Map.of("total", 0, "cached", cached));
 		return info;
 	}
 
@@ -1056,6 +1169,13 @@ public final class Session {
 			exportCancel.set(true);
 			exportCancel = null;
 		}
+	}
+
+	// dexlib2 (the v2 index engine) reads dex-based containers only. Java bytecode inputs
+	// (.jar/.class/.aar) must use the legacy jadx path (jadx-java-convert).
+	private static boolean isDexInput(File input) {
+		String n = input.getName().toLowerCase();
+		return n.endsWith(".apk") || n.endsWith(".dex");
 	}
 
 	private static String stripExt(String name) {
@@ -2038,6 +2158,13 @@ public final class Session {
 
 	public Map<String, Object> shutdown() {
 		cancelExport();
+		if (v2 != null) {
+			try {
+				v2.close();
+			} catch (Exception ignore) {
+				// best effort
+			}
+		}
 		if (jadx != null) {
 			try {
 				jadx.close();
@@ -2364,6 +2491,15 @@ public final class Session {
 		if (jadx == null) {
 			if (lean && inputFile != null) {
 				return reloadModel();
+			}
+			// v2 mode serves browse/code/search from SQLite without a model; an advanced op (gd/gr/
+			// rename/resources/smali) fell through, so build the full jadx model on demand. One-time
+			// cost (minutes + multi-GB on a huge APK); reused for later ops.
+			if (v2 != null && inputFile != null) {
+				System.err.println("[jadxd] v2: building jadx model on demand for an advanced operation "
+						+ "(this is the heavy path — first gd/gr/rename on a large APK)");
+				this.jadx = buildModel(inputFile, codeData);
+				return this.jadx;
 			}
 			throw new IllegalStateException("project not loaded");
 		}

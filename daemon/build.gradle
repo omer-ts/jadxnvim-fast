@@ -21,6 +21,13 @@ dependencies {
 
     implementation 'com.google.code.gson:gson:2.11.0'
 
+    // dexlib2 (Google's maintained smali fork): memory-mapped, lazy dex reader used to build the
+    // class/method/field/xref/string index WITHOUT decompiling. Package: com.android.tools.smali.dexlib2.
+    implementation 'com.android.tools.smali:smali-dexlib2:3.0.9'
+
+    // Embedded SQLite (bundles a modern SQLite with FTS5) — the index/query store.
+    implementation 'org.xerial:sqlite-jdbc:3.46.1.0'
+
     // slf4j binding for jadx's logging (routed to stderr via logback.xml).
     runtimeOnly 'ch.qos.logback:logback-classic:1.5.6'
 }
