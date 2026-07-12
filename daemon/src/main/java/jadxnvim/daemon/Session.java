@@ -888,9 +888,14 @@ public final class Session {
 		});
 		java.util.concurrent.atomic.AtomicInteger progress = new java.util.concurrent.atomic.AtomicInteger(doneAll.size());
 		java.util.concurrent.atomic.AtomicInteger lastPct = new java.util.concurrent.atomic.AtomicInteger(-1);
-		// Process in batches; checkpoint between batches (no worker active) so a later OOM-kill
-		// resumes from the last checkpoint instead of re-indexing everything.
-		int batch = 20000;
+		// Process in batches; between batches (no worker active) we can take a durable checkpoint so a
+		// later OOM-kill resumes from it instead of re-indexing everything. The batch is only a quiesce
+		// window — keep it small so quiesce points come often. The actual checkpoint is wall-clock gated
+		// (below): under memory pressure a batch can slow to minutes, and a coarse "checkpoint every
+		// batch" then leaves long gaps where an OOM-kill discards the whole in-flight batch and the
+		// retry redoes the same classes and dies again — no forward progress. Gating on elapsed time
+		// instead bounds the work an OOM can throw away, so restarts always advance.
+		int batch = 4000;
 		try {
 			String bp = System.getProperty("jadxnvim.indexBatch");
 			if (bp != null) {
@@ -900,6 +905,43 @@ public final class Session {
 			// keep default
 		}
 		final int BATCH = batch;
+		long checkpointMs = 15000;
+		try {
+			String cp = System.getProperty("jadxnvim.checkpointMs");
+			if (cp != null) {
+				checkpointMs = Math.max(0, Long.parseLong(cp.trim()));
+			}
+		} catch (Exception ignore) {
+			// keep default
+		}
+		final long CHECKPOINT_MS = checkpointMs;
+		long lastCheckpoint = System.currentTimeMillis();
+		// Stall watchdog: if the indexed-class count stops advancing (e.g. a jadx decompile loops on a
+		// pathological/obfuscated method and pins a worker), log it to stderr instead of hanging
+		// silently. Purely diagnostic — it never touches the build state.
+		final java.util.concurrent.atomic.AtomicBoolean watchDone = new java.util.concurrent.atomic.AtomicBoolean(false);
+		Thread watchdog = new Thread(() -> {
+			int last = progress.get();
+			long lastMoved = System.currentTimeMillis();
+			while (!watchDone.get()) {
+				try {
+					Thread.sleep(15000);
+				} catch (InterruptedException e) {
+					break;
+				}
+				int cur = progress.get();
+				if (cur != last) {
+					last = cur;
+					lastMoved = System.currentTimeMillis();
+					continue;
+				}
+				long stalledSec = (System.currentTimeMillis() - lastMoved) / 1000;
+				System.err.println("[jadxd] index stalled at " + cur + "/" + total + " — no class indexed for "
+						+ stalledSec + "s (a slow or looping decompile can pin a worker)");
+			}
+		}, "jadx-index-watchdog");
+		watchdog.setDaemon(true);
+		watchdog.start();
 		try {
 			for (int s = 0; s < remaining.size(); s += BATCH) {
 				if (cancel.get()) {
@@ -943,15 +985,26 @@ public final class Session {
 				if (cancel.get()) {
 					return null;
 				}
-				// checkpoint: no workers active now, so positions match what's on disk. Write the
-				// (cosmetic) progress gate first, then checkpoint() commits atomically via .pos last —
-				// so the last durable write is always the authoritative one.
+				// No workers active now, so positions match what's on disk — a safe point to checkpoint.
+				// Only actually persist one every CHECKPOINT_MS, though: checkpoint() rewrites the full
+				// .idx (O(classes so far)), so doing it every small batch would be O(n^2) I/O. Time-gating
+				// keeps total checkpoint cost bounded while still capping how much an OOM-kill can lose.
+				// The (in-memory) doneAll grows every batch, but resume rebuilds it from the committed
+				// .pos — never from this — so it is safe for doneAll to run ahead of the last checkpoint.
 				doneAll.addAll(batchIds);
-				writeProgress(progressFile, doneAll.size(), total, sig);
-				b.checkpoint(mDir);
+				long now = System.currentTimeMillis();
+				if (now - lastCheckpoint >= CHECKPOINT_MS) {
+					// progress gate first (cosmetic), then checkpoint() commits atomically via .pos last —
+					// so the last durable write is always the authoritative one.
+					writeProgress(progressFile, doneAll.size(), total, sig);
+					b.checkpoint(mDir);
+					lastCheckpoint = now;
+				}
 			}
 		} finally {
 			pool.shutdown();
+			watchDone.set(true);
+			watchdog.interrupt();
 		}
 		if (cancel.get()) {
 			return null;
