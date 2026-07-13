@@ -207,8 +207,7 @@ final class V2Engine {
 			}
 		}
 		String desc = "L" + id.replace('.', '/') + ";";
-		String hint = db.dexEntryOf(desc);
-		Renderer.Result r = renderer.decompile(desc, hint);
+		Renderer.Result r = renderer.decompile(desc);
 		synchronized (codeCache) {
 			codeCache.put(id, r.code);
 		}
@@ -286,20 +285,19 @@ final class V2Engine {
 	private Map<String, Object> gotoDef(String id, int line, int col) throws Exception {
 		Map<String, Object> result = new LinkedHashMap<>();
 		String desc = descOf(id);
-		Renderer.ResolvedSymbol sym = renderer.resolveAt(desc, db.dexEntryOf(desc), line, col);
+		Renderer.ResolvedSymbol sym = renderer.resolveAt(desc, line, col);
 		if (sym == null) {
 			result.put("found", false);
 			return result;
 		}
 		String topFqn = topLevel(DexIndexer.descToFqn(sym.declClassDesc));
 		String topDesc = descOf(topFqn);
-		String topHint = db.dexEntryOf(topDesc);
-		if (topHint == null) {
+		if (db.classIdOf(topDesc) < 0) {
 			// Declaring class is not in this APK (a framework/library type) — nothing to open.
 			result.put("found", false);
 			return result;
 		}
-		Renderer.Pos pos = renderer.declarationPos(topDesc, topHint, sym);
+		Renderer.Pos pos = renderer.declarationPos(topDesc, sym);
 		result.put("found", true);
 		result.put("kind", kindName(sym.kind));
 		result.put("name", sym.displayName);
@@ -342,7 +340,7 @@ final class V2Engine {
 		result.put("usages", usages);
 		result.put("usageFallback", false);
 		String desc = descOf(id);
-		Renderer.ResolvedSymbol sym = renderer.resolveAt(desc, db.dexEntryOf(desc), line, col);
+		Renderer.ResolvedSymbol sym = renderer.resolveAt(desc, line, col);
 		if (sym == null) {
 			result.put("name", "symbol");
 			result.put("truncated", false);
@@ -405,7 +403,7 @@ final class V2Engine {
 				futures.add(pool.submit(() -> {
 					String d = descOf(top);
 					java.util.List<Renderer.Usage> sites =
-							renderer.findUsageSites(d, db.dexEntryOf(d), targetKeys);
+							renderer.findUsageSites(d, targetKeys);
 					return new Object[] { top, sites };
 				}));
 			}

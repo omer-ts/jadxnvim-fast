@@ -103,15 +103,15 @@ public final class Renderer {
 	// Render a class from a mini-dex and hand (jadx, class, codeInfo, code) to fn, closing after.
 	// Single-threaded decompile keeps the output deterministic, so a cursor offset computed against a
 	// previously returned getCode() string still resolves to the right node here.
-	private <T> T withRenderedClass(String classDesc, String dexEntryHint, boolean closure, T missing,
+	private <T> T withRenderedClass(String classDesc, boolean closure, T missing,
 			RenderFn<T> fn) throws Exception {
 		String fqn = DexIndexer.descToFqn(classDesc);
 		File miniDex = new File(workDir,
 				"minidex-" + (closure ? "c" : "") + Integer.toHexString(classDesc.hashCode()) + ".dex");
 		try {
 			int n = closure
-					? extractor.extractWithClosure(classDesc, dexEntryHint, miniDex)
-					: extractor.extract(classDesc, dexEntryHint, miniDex);
+					? extractor.extractWithClosure(classDesc, miniDex)
+					: extractor.extract(classDesc, miniDex);
 			if (n == 0) {
 				return missing;
 			}
@@ -148,9 +148,9 @@ public final class Renderer {
 	 * app types, so the code reads better. Deterministic (single-threaded + a deterministic mini-dex),
 	 * so a re-render for resolveAt lands on identical offsets.
 	 */
-	public Result decompile(String classDesc, String dexEntryHint) throws Exception {
+	public Result decompile(String classDesc) throws Exception {
 		String fqn = DexIndexer.descToFqn(classDesc);
-		Result r = withRenderedClass(classDesc, dexEntryHint, true, null,
+		Result r = withRenderedClass(classDesc, true, null,
 				(jadx, cls, info, code) -> new Result(fqn, code, 1));
 		if (r == null) {
 			throw new IllegalArgumentException("class not found in APK: " + fqn);
@@ -162,9 +162,9 @@ public final class Renderer {
 	 * Resolve the symbol referenced at (line, col) in the rendered class {@code classDesc}, keyed so
 	 * it can be looked up in the SQLite xref index. Returns null if nothing resolves there.
 	 */
-	public ResolvedSymbol resolveAt(String classDesc, String dexEntryHint, int line, int col)
+	public ResolvedSymbol resolveAt(String classDesc, int line, int col)
 			throws Exception {
-		return withRenderedClass(classDesc, dexEntryHint, true, null, (jadx, cls, info, code) -> {
+		return withRenderedClass(classDesc, true, null, (jadx, cls, info, code) -> {
 			int offset = Positions.toOffset(code, line, col);
 			JavaNode node = jadx.getJavaNodeAtPosition(info, offset);
 			return node == null ? null : symbolOf(node);
@@ -175,10 +175,10 @@ public final class Renderer {
 	 * Locate the declaration of {@code target} inside its (top-level) class {@code classDesc}, using
 	 * jadx's node positions. Falls back to line 1 if not found.
 	 */
-	public Pos declarationPos(String classDesc, String dexEntryHint, ResolvedSymbol target)
+	public Pos declarationPos(String classDesc, ResolvedSymbol target)
 			throws Exception {
 		// Closure render so the returned line matches the class's getCode() buffer (same rendering).
-		Pos p = withRenderedClass(classDesc, dexEntryHint, true, null, (jadx, cls, info, code) -> {
+		Pos p = withRenderedClass(classDesc, true, null, (jadx, cls, info, code) -> {
 			JavaNode decl = findDecl(cls, target);
 			if (decl == null) {
 				return null;
@@ -199,15 +199,15 @@ public final class Renderer {
 	 * annotates the references) and reads the code metadata to recover exact line/col + the code line
 	 * text — the data that makes find-usages navigable, resolved on demand for just this one class.
 	 */
-	public java.util.List<Usage> findUsageSites(String refClassDesc, String refHint,
-			java.util.Set<String> targetKeys) throws Exception {
+	public java.util.List<Usage> findUsageSites(String refClassDesc, java.util.Set<String> targetKeys)
+			throws Exception {
 		String fqn = DexIndexer.descToFqn(refClassDesc);
 		File miniDex = new File(workDir, "usages-" + tmpSeq.incrementAndGet() + ".dex");
 		try {
 			// Render the referencing class with its full closure — the same rendering getCode() uses —
 			// so the reported line/col match the buffer the user opens, and the target class (which this
 			// class references) is loaded so its references are annotated.
-			int n = extractor.extractWithClosure(refClassDesc, refHint, miniDex);
+			int n = extractor.extractWithClosure(refClassDesc, miniDex);
 			if (n == 0) {
 				return java.util.List.of();
 			}

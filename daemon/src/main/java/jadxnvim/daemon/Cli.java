@@ -142,26 +142,10 @@ public final class Cli {
 				? target
 				: "L" + target.replace('.', '/') + ";";
 
-		// Look up the owning dex entry from the index to avoid scanning every dex (best effort).
-		String dexHint = null;
-		File dbFile = new File(db);
-		if (dbFile.isFile()) {
-			try (Db d = Db.open(db);
-					java.sql.PreparedStatement ps = d.connection().prepareStatement(
-							"SELECT dex FROM classes WHERE desc=?")) {
-				ps.setString(1, desc);
-				try (java.sql.ResultSet rs = ps.executeQuery()) {
-					if (rs.next()) {
-						dexHint = rs.getString(1);
-					}
-				}
-			}
-		}
-
 		File work = new File(System.getProperty("java.io.tmpdir"), "jadxd-render");
 		long t0 = System.nanoTime();
 		Renderer renderer = new Renderer(apk, work);
-		Renderer.Result r = renderer.decompile(desc, dexHint);
+		Renderer.Result r = renderer.decompile(desc);
 		long ms = (System.nanoTime() - t0) / 1_000_000;
 		System.out.println(r.code);
 		System.err.println("[jadxd] decompiled " + r.fqn + " (mini-dex: " + r.classesInMiniDex

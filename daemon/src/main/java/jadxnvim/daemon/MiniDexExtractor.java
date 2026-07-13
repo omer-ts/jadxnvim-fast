@@ -2,7 +2,10 @@ package jadxnvim.daemon;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import com.android.tools.smali.dexlib2.Opcodes;
 import com.android.tools.smali.dexlib2.DexFileFactory;
@@ -13,20 +16,32 @@ import com.android.tools.smali.dexlib2.immutable.ImmutableDexFile;
 import com.android.tools.smali.dexlib2.writer.pool.DexPool;
 
 /**
- * Extracts a single class (plus its inner/anonymous classes) from a large APK into a tiny standalone
- * {@code .dex}. Feeding that mini-dex to jadx lets the render engine decompile just the class the user
- * is viewing, at MB-scale memory, instead of paying jadx's whole-APK {@code load()} (minutes and
- * multi-GB — jadx has no lazy class loading, so {@code --single-class} does not avoid it).
+ * Extracts a single class (plus its inner/anonymous classes and, optionally, its 1-hop reference
+ * closure) from a large APK into a tiny standalone {@code .dex}. Feeding that mini-dex to jadx lets
+ * the render engine decompile just the class the user is viewing, at MB-scale memory, instead of
+ * paying jadx's whole-APK {@code load()}.
+ *
+ * <p>Class lookup is backed by a resident {@code type -> ClassDef} map (built once, lazily), so
+ * extracting a class and its reference closure is O(references) rather than O(all classes) — the map
+ * replaces a full scan of every dex on every render. The map holds dexlib2's lightweight
+ * (offset-based, memory-mapped) class wrappers, so it stays cheap even for a 700MB / 165k-class APK.
  *
  * <p>References from the class body to types not present in the mini-dex remain valid dex references
- * (framework types are resolved from jadx's bundled classpath; unresolved app types render by their
- * raw name). Including the inner classes keeps anonymous/nested rendering intact.
+ * (framework types resolve from jadx's bundled classpath; unresolved app types render by raw name).
  */
 public final class MiniDexExtractor {
+
+	// Cap the reference closure so a class referencing thousands of types can't explode the mini-dex.
+	private static final int CLOSURE_CAP = 600;
 
 	private final File apk;
 	private final Opcodes opcodes;
 	private volatile MultiDexContainer<? extends DexBackedDexFile> container;
+
+	// type descriptor -> its ClassDef (first occurrence wins across multidex duplicates).
+	private volatile Map<String, ClassDef> byType;
+	// outer type descriptor -> its inner/nested classes (Lcom/ex/Foo; -> [Foo$Bar, Foo$Bar$Baz, ...]).
+	private volatile Map<String, List<ClassDef>> innersByOuter;
 
 	public MiniDexExtractor(File apk) {
 		this.apk = apk;
@@ -46,138 +61,117 @@ public final class MiniDexExtractor {
 		return c;
 	}
 
-	/**
-	 * Write a mini-dex containing {@code classDesc} and its inner classes to {@code outDex}.
-	 * {@code classDesc} is a raw dex type descriptor, e.g. {@code Lcom/example/Foo;}. When
-	 * {@code dexEntryHint} is non-null it is scanned first (the class's owning dex, from the index),
-	 * avoiding a scan of every dex entry.
-	 *
-	 * @return the number of classes written (0 if the target was not found)
-	 */
-	public int extract(String classDesc, String dexEntryHint, File outDex) throws Exception {
-		String innerPrefix = classDesc.substring(0, classDesc.length() - 1) + "$"; // Lcom/ex/Foo$
-		List<ClassDef> picked = new ArrayList<>();
-		// Dedup by type: a class present in more than one dex (legal in multidex) would otherwise be
-		// written twice and DexPool.writeTo rejects duplicate types.
-		java.util.Set<String> pickedTypes = new java.util.HashSet<>();
-
-		MultiDexContainer<? extends DexBackedDexFile> c = container();
-		List<String> entries = new ArrayList<>();
-		if (dexEntryHint != null && c.getDexEntryNames().contains(dexEntryHint)) {
-			entries.add(dexEntryHint);
-		} else {
-			entries.addAll(c.getDexEntryNames());
+	// Build the type -> ClassDef and outer -> inners maps once (single O(all-classes) pass, reused by
+	// every subsequent extraction). Synchronized; concurrent first-callers block until it is ready.
+	private void ensureMaps() throws Exception {
+		if (byType != null) {
+			return;
 		}
-		boolean foundTarget = false;
-		for (String entry : entries) {
-			DexBackedDexFile dex = c.getEntry(entry).getDexFile();
-			for (ClassDef cd : dex.getClasses()) {
-				String t = cd.getType();
-				if (t.equals(classDesc)) {
-					if (pickedTypes.add(t)) {
-						picked.add(cd);
+		synchronized (this) {
+			if (byType != null) {
+				return;
+			}
+			Map<String, ClassDef> bt = new HashMap<>(1 << 18);
+			Map<String, List<ClassDef>> ibo = new HashMap<>();
+			MultiDexContainer<? extends DexBackedDexFile> c = container();
+			for (String entry : c.getDexEntryNames()) {
+				DexBackedDexFile dex = c.getEntry(entry).getDexFile();
+				for (ClassDef cd : dex.getClasses()) {
+					String t = cd.getType();
+					if (bt.putIfAbsent(t, cd) != null) {
+						continue; // duplicate type across multidex — keep the first
 					}
-					foundTarget = true;
-				} else if (t.startsWith(innerPrefix) && pickedTypes.add(t)) {
-					picked.add(cd);
+					// The first '$' is inside the class name (packages use '/', never '$'), so the part
+					// before it is the top-level outer type. Groups Foo$Bar and Foo$Bar$Baz under Foo.
+					int dollar = t.indexOf('$');
+					if (dollar > 0) {
+						String outer = t.substring(0, dollar) + ";";
+						ibo.computeIfAbsent(outer, k -> new ArrayList<>()).add(cd);
+					}
 				}
 			}
-			if (foundTarget && dexEntryHint != null) {
-				// Inner classes almost always live in the same dex as the outer; if the hint located the
-				// target, we already collected its inners here. (Rare cross-dex inners degrade to missing
-				// nested rendering, not a failure.)
-				break;
+			innersByOuter = ibo;
+			byType = bt; // published last — it is the readiness guard
+		}
+	}
+
+	// Add a class + its inner/nested classes to the picked list (deduped by type).
+	private void addFamily(String classDesc, List<ClassDef> picked, Set<String> types) {
+		ClassDef target = byType.get(classDesc);
+		if (target == null) {
+			return;
+		}
+		if (types.add(classDesc)) {
+			picked.add(target);
+		}
+		for (ClassDef inner : innersByOuter.getOrDefault(classDesc, List.of())) {
+			if (types.add(inner.getType())) {
+				picked.add(inner);
 			}
 		}
-		if (!foundTarget && !entries.equals(c.getDexEntryNames())) {
-			// Hint missed (class not in the hinted dex): fall back to a full scan.
-			return extract(classDesc, null, outDex);
-		}
+	}
+
+	/**
+	 * Write a mini-dex containing {@code classDesc} (a raw dex descriptor, e.g. {@code Lcom/ex/Foo;})
+	 * and its inner classes to {@code outDex}. Returns the number of classes written (0 if not found).
+	 */
+	public int extract(String classDesc, File outDex) throws Exception {
+		ensureMaps();
+		List<ClassDef> picked = new ArrayList<>();
+		Set<String> types = new java.util.HashSet<>();
+		addFamily(classDesc, picked, types);
 		if (picked.isEmpty()) {
 			return 0;
 		}
-		outDex.getAbsoluteFile().getParentFile().mkdirs();
-		DexPool.writeTo(outDex.getAbsolutePath(), new ImmutableDexFile(opcodes, picked));
+		write(picked, outDex);
 		return picked.size();
 	}
-
-	// Cap the reference closure so a class referencing thousands of types can't explode the mini-dex.
-	private static final int CLOSURE_CAP = 600;
 
 	/**
 	 * Like {@link #extract}, but also pulls in the 1-hop reference closure — every app class the
 	 * target's method bodies reference (invoked methods' owners, accessed fields' owners, used types,
 	 * super/interfaces). jadx then builds nodes for those classes, so a cursor on a cross-class call
-	 * resolves to a real node (needed for go-to-def / find-usages). More classes to parse, but each is
-	 * only parsed (not decompiled), so rendering the target stays cheap.
+	 * resolves to a real node (needed for go-to-def / find-usages). Each closure class is only parsed
+	 * (not decompiled), so rendering the target stays cheap. O(references), not O(all classes).
 	 */
-	public int extractWithClosure(String classDesc, String dexEntryHint, File outDex) throws Exception {
-		String innerPrefix = classDesc.substring(0, classDesc.length() - 1) + "$";
-		MultiDexContainer<? extends DexBackedDexFile> c = container();
-		List<String> allEntries = c.getDexEntryNames();
-
-		// Pass 1: target family (target + inner classes) and the type descriptors they reference.
-		List<ClassDef> family = new ArrayList<>();
-		java.util.Set<String> pickedTypes = new java.util.HashSet<>(); // dedup across multidex duplicates
-		java.util.Set<String> wanted = new java.util.HashSet<>();
-		List<String> firstScan = new ArrayList<>();
-		if (dexEntryHint != null && allEntries.contains(dexEntryHint)) {
-			firstScan.add(dexEntryHint);
-		} else {
-			firstScan.addAll(allEntries);
-		}
-		boolean found = false;
-		for (String entry : firstScan) {
-			DexBackedDexFile dex = c.getEntry(entry).getDexFile();
-			for (ClassDef cd : dex.getClasses()) {
-				String t = cd.getType();
-				if ((t.equals(classDesc) || t.startsWith(innerPrefix)) && pickedTypes.add(t)) {
-					family.add(cd);
-					collectRefs(cd, wanted);
-				}
-				if (t.equals(classDesc)) {
-					found = true;
-				}
-			}
-			if (found && dexEntryHint != null) {
-				break;
-			}
-		}
-		if (!found && dexEntryHint != null) {
-			return extractWithClosure(classDesc, null, outDex); // hint missed; full scan
-		}
-		if (family.isEmpty()) {
+	public int extractWithClosure(String classDesc, File outDex) throws Exception {
+		ensureMaps();
+		List<ClassDef> picked = new ArrayList<>();
+		Set<String> types = new java.util.HashSet<>();
+		addFamily(classDesc, picked, types);
+		if (picked.isEmpty()) {
 			return 0;
 		}
-		for (ClassDef cd : family) {
-			wanted.remove(cd.getType());
+		// Collect the types referenced by the target family, then resolve each via the map (O(refs)).
+		Set<String> wanted = new java.util.HashSet<>();
+		for (ClassDef cd : new ArrayList<>(picked)) {
+			collectRefs(cd, wanted);
 		}
-
-		// Pass 2: pull in the referenced app classes (bounded, deduped by type).
-		List<ClassDef> picked = new ArrayList<>(family);
-		if (!wanted.isEmpty()) {
-			int added = 0;
-			outer:
-			for (String entry : allEntries) {
-				DexBackedDexFile dex = c.getEntry(entry).getDexFile();
-				for (ClassDef cd : dex.getClasses()) {
-					String t = cd.getType();
-					if (wanted.contains(t) && pickedTypes.add(t)) {
-						picked.add(cd);
-						if (++added >= CLOSURE_CAP) {
-							break outer;
-						}
-					}
-				}
+		int added = 0;
+		for (String w : wanted) {
+			if (added >= CLOSURE_CAP) {
+				break;
+			}
+			if (types.contains(w)) {
+				continue;
+			}
+			ClassDef cd = byType.get(w);
+			if (cd != null && types.add(w)) {
+				picked.add(cd);
+				added++;
 			}
 		}
-		outDex.getAbsoluteFile().getParentFile().mkdirs();
-		DexPool.writeTo(outDex.getAbsolutePath(), new ImmutableDexFile(opcodes, picked));
+		write(picked, outDex);
 		return picked.size();
 	}
 
+	private void write(List<ClassDef> picked, File outDex) throws Exception {
+		outDex.getAbsoluteFile().getParentFile().mkdirs();
+		DexPool.writeTo(outDex.getAbsolutePath(), new ImmutableDexFile(opcodes, picked));
+	}
+
 	// Collect the type descriptors a class's method bodies (and its super/interfaces) reference.
-	private static void collectRefs(ClassDef cd, java.util.Set<String> out) {
+	private static void collectRefs(ClassDef cd, Set<String> out) {
 		String sup = cd.getSuperclass();
 		if (sup != null) {
 			out.add(sup);
@@ -200,7 +194,7 @@ public final class MiniDexExtractor {
 	}
 
 	private static void addRefType(com.android.tools.smali.dexlib2.iface.reference.Reference ref,
-			java.util.Set<String> out) {
+			Set<String> out) {
 		if (ref instanceof com.android.tools.smali.dexlib2.iface.reference.MethodReference) {
 			out.add(((com.android.tools.smali.dexlib2.iface.reference.MethodReference) ref).getDefiningClass());
 		} else if (ref instanceof com.android.tools.smali.dexlib2.iface.reference.FieldReference) {
