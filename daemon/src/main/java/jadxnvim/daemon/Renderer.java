@@ -4,6 +4,9 @@ import java.io.File;
 import java.nio.file.Files;
 import java.util.List;
 
+import java.util.ArrayList;
+import java.util.Map;
+
 import jadx.api.JadxArgs;
 import jadx.api.JadxDecompiler;
 import jadx.api.ICodeInfo;
@@ -12,6 +15,8 @@ import jadx.api.JavaField;
 import jadx.api.JavaMethod;
 import jadx.api.JavaNode;
 import jadx.api.impl.NoOpCodeCache;
+import jadx.api.metadata.ICodeAnnotation;
+import jadx.api.metadata.ICodeMetadata;
 import jadx.core.codegen.TypeGen;
 import jadx.core.dex.info.FieldInfo;
 import jadx.core.dex.info.MethodInfo;
@@ -28,10 +33,25 @@ public final class Renderer {
 
 	private final MiniDexExtractor extractor;
 	private final File workDir;
+	// Unique temp-file suffix so find-usages renders (which run in parallel) never collide.
+	private final java.util.concurrent.atomic.AtomicInteger tmpSeq = new java.util.concurrent.atomic.AtomicInteger();
 
 	public Renderer(File apk, File workDir) {
 		this.extractor = new MiniDexExtractor(apk);
 		this.workDir = workDir;
+	}
+
+	/** A precise usage site within a referencing class. */
+	public static final class Usage {
+		public final int line;
+		public final int col;
+		public final String text;
+
+		Usage(int line, int col, String text) {
+			this.line = line;
+			this.col = col;
+			this.text = text;
+		}
 	}
 
 	public static final class Result {
@@ -162,6 +182,77 @@ public final class Renderer {
 			return new Pos(lc[0], lc[1], true);
 		});
 		return p == null ? new Pos(1, 0, false) : p;
+	}
+
+	/**
+	 * Find every precise site in {@code refClassDesc} that references the symbol keyed by
+	 * {@code targetKey}. Renders the referencing class together with the target class (so jadx
+	 * annotates the references) and reads the code metadata to recover exact line/col + the code line
+	 * text — the data that makes find-usages navigable, resolved on demand for just this one class.
+	 */
+	public java.util.List<Usage> findUsageSites(String refClassDesc, String refHint, String targetClassDesc,
+			String targetHint, String targetKey) throws Exception {
+		String fqn = DexIndexer.descToFqn(refClassDesc);
+		File miniDex = new File(workDir, "usages-" + tmpSeq.incrementAndGet() + ".dex");
+		try {
+			int n = extractor.extractFamilies(new String[] { refClassDesc, targetClassDesc },
+					new String[] { refHint, targetHint }, miniDex);
+			if (n == 0) {
+				return java.util.List.of();
+			}
+			JadxArgs args = new JadxArgs();
+			args.getInputFiles().add(miniDex);
+			args.setCodeCache(NoOpCodeCache.INSTANCE);
+			args.setSkipResources(true);
+			args.setShowInconsistentCode(true);
+			args.setThreadsCount(1);
+			try (JadxDecompiler jadx = new JadxDecompiler(args)) {
+				jadx.load();
+				JavaClass refClass = findClass(jadx.getClasses(), fqn);
+				if (refClass == null) {
+					return java.util.List.of();
+				}
+				ICodeInfo info = refClass.getCodeInfo();
+				ICodeMetadata md = info.getCodeMetadata();
+				if (md == null) {
+					return java.util.List.of();
+				}
+				String code = info.getCodeStr();
+				String[] lines = code.split("\n", -1);
+				java.util.List<Usage> out = new ArrayList<>();
+				java.util.Set<Integer> seenLines = new java.util.HashSet<>();
+				for (Map.Entry<Integer, ICodeAnnotation> e : md.getAsMap().entrySet()) {
+					ICodeAnnotation.AnnType t = e.getValue().getAnnType();
+					// References only (not the declaration itself).
+					if (t != ICodeAnnotation.AnnType.CLASS && t != ICodeAnnotation.AnnType.METHOD
+							&& t != ICodeAnnotation.AnnType.FIELD) {
+						continue;
+					}
+					int off = e.getKey();
+					JavaNode node = jadx.getJavaNodeAtPosition(info, off);
+					if (node == null) {
+						continue;
+					}
+					ResolvedSymbol s = symbolOf(node);
+					if (s == null || !targetKey.equals(s.targetKey)) {
+						continue;
+					}
+					int[] lc = Positions.toLineCol(code, off);
+					if (!seenLines.add(lc[0])) {
+						continue; // one entry per line
+					}
+					String text = lc[0] >= 1 && lc[0] <= lines.length ? lines[lc[0] - 1].strip() : "";
+					out.add(new Usage(lc[0], lc[1], text));
+				}
+				return out;
+			}
+		} finally {
+			try {
+				Files.deleteIfExists(miniDex.toPath());
+			} catch (Exception ignore) {
+				// best effort
+			}
+		}
 	}
 
 	// Find the class/method/field node in cls (recursively through inner classes) whose key matches.

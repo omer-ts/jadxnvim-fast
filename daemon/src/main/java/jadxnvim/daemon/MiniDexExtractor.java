@@ -101,6 +101,62 @@ public final class MiniDexExtractor {
 		return picked.size();
 	}
 
+	/**
+	 * Extract several class families (each = a class + its inner classes) into one mini-dex. Used by
+	 * find-usages to render a referencing class together with the target class, so jadx annotates the
+	 * references to the target and their precise offsets can be recovered. {@code hints} (may be null,
+	 * or hold nulls) name each class's owning dex to avoid scanning every entry.
+	 */
+	public int extractFamilies(String[] descs, String[] hints, File outDex) throws Exception {
+		MultiDexContainer<? extends DexBackedDexFile> c = container();
+		List<String> allEntries = c.getDexEntryNames();
+		List<ClassDef> picked = new ArrayList<>();
+		java.util.Set<String> pickedTypes = new java.util.HashSet<>();
+
+		for (int k = 0; k < descs.length; k++) {
+			String desc = descs[k];
+			if (desc == null) {
+				continue;
+			}
+			String hint = hints != null ? hints[k] : null;
+			String innerPrefix = desc.substring(0, desc.length() - 1) + "$";
+			boolean found = collectFamily(c, desc, innerPrefix,
+					hint != null && allEntries.contains(hint) ? List.of(hint) : allEntries,
+					picked, pickedTypes);
+			if (!found && hint != null) {
+				collectFamily(c, desc, innerPrefix, allEntries, picked, pickedTypes); // hint missed
+			}
+		}
+		if (picked.isEmpty()) {
+			return 0;
+		}
+		outDex.getAbsoluteFile().getParentFile().mkdirs();
+		DexPool.writeTo(outDex.getAbsolutePath(), new ImmutableDexFile(opcodes, picked));
+		return picked.size();
+	}
+
+	private static boolean collectFamily(MultiDexContainer<? extends DexBackedDexFile> c, String desc,
+			String innerPrefix, List<String> entries, List<ClassDef> picked, java.util.Set<String> pickedTypes)
+			throws Exception {
+		boolean found = false;
+		for (String entry : entries) {
+			DexBackedDexFile dex = c.getEntry(entry).getDexFile();
+			for (ClassDef cd : dex.getClasses()) {
+				String t = cd.getType();
+				if ((t.equals(desc) || t.startsWith(innerPrefix)) && pickedTypes.add(t)) {
+					picked.add(cd);
+				}
+				if (t.equals(desc)) {
+					found = true;
+				}
+			}
+			if (found && entries.size() == 1) {
+				break;
+			}
+		}
+		return found;
+	}
+
 	// Cap the reference closure so a class referencing thousands of types can't explode the mini-dex.
 	private static final int CLOSURE_CAP = 600;
 

@@ -267,6 +267,8 @@ final class V2Engine {
 	// --- go-to-def / find-usages (SQLite xref index, no jadx model) ----------
 
 	private static final int MAX_USAGES = 5000;
+	// Cap referencing classes we render for precise sites (bounds gr latency on hot symbols).
+	private static final int REF_CLASS_CAP = 400;
 
 	private Map<String, Object> gotoDef(String id, int line, int col) throws Exception {
 		Map<String, Object> result = new LinkedHashMap<>();
@@ -307,36 +309,93 @@ final class V2Engine {
 			return result;
 		}
 		result.put("name", sym.displayName);
+		String targetTopFqn = topLevel(DexIndexer.descToFqn(sym.declClassDesc));
 		// Frida-hook target (the searched symbol's own class).
-		result.put("targetId", topLevel(DexIndexer.descToFqn(sym.declClassDesc)));
+		result.put("targetId", targetTopFqn);
 		result.put("targetKind", kindName(sym.kind));
 		result.put("targetRawName", sym.rawName);
 
-		List<Db.XrefHit> hits = db.xrefsTo(sym.targetKey, MAX_USAGES * 4);
-		// Class-granular in fast mode: exact call lines would require rendering each referencing class,
-		// so collapse to one entry per referencing (top-level) class. gr jumps you to the class; the
-		// precise per-call line is a job for the opt-in full-model precise mode.
-		java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+		// Distinct referencing (top-level) classes from the xref index, capped.
+		List<Db.XrefHit> hits = db.xrefsTo(sym.targetKey, MAX_USAGES * 8);
+		java.util.LinkedHashSet<String> refClasses = new java.util.LinkedHashSet<>();
 		boolean truncated = false;
 		for (Db.XrefHit h : hits) {
 			String top = topLevel(h.srcClassFqn);
-			if (!seen.add(top)) {
+			if (refClasses.contains(top)) {
 				continue;
 			}
-			Map<String, Object> u = new LinkedHashMap<>();
-			u.put("id", top);
-			u.put("fullName", h.srcClassFqn);
-			u.put("line", 1);
-			u.put("col", 0);
-			u.put("text", h.srcClassFqn);
-			usages.add(u);
-			if (usages.size() >= MAX_USAGES) {
+			if (refClasses.size() >= REF_CLASS_CAP) {
 				truncated = true;
 				break;
 			}
+			refClasses.add(top);
+		}
+
+		// Resolve precise call-site lines by rendering each referencing class (with the target class
+		// loaded) in parallel and reading jadx metadata. This is what makes gr navigable — each entry
+		// jumps to the actual call, with the code line as its text — without decompiling the whole APK.
+		String targetTopDesc = descOf(targetTopFqn);
+		String targetHint = db.dexEntryOf(targetTopDesc);
+		String targetKey = sym.targetKey;
+		int threads = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors()));
+		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(
+				threads, r -> {
+					Thread t = new Thread(r, "jadxd-usages");
+					t.setDaemon(true);
+					return t;
+				});
+		try {
+			java.util.List<java.util.concurrent.Future<Object[]>> futures = new ArrayList<>();
+			for (String top : refClasses) {
+				futures.add(pool.submit(() -> {
+					String d = descOf(top);
+					java.util.List<Renderer.Usage> sites =
+							renderer.findUsageSites(d, db.dexEntryOf(d), targetTopDesc, targetHint, targetKey);
+					return new Object[] { top, sites };
+				}));
+			}
+			for (java.util.concurrent.Future<Object[]> f : futures) {
+				Object[] r;
+				try {
+					r = f.get();
+				} catch (Exception e) {
+					continue; // a class that failed to render just contributes no precise sites
+				}
+				String top = (String) r[0];
+				@SuppressWarnings("unchecked")
+				java.util.List<Renderer.Usage> sites = (java.util.List<Renderer.Usage>) r[1];
+				if (sites.isEmpty()) {
+					// Rendered but no precise site (e.g. inlined/synthetic ref) — still list the class.
+					usages.add(usageHit(top, top, 1, 0, top));
+				} else {
+					for (Renderer.Usage u : sites) {
+						usages.add(usageHit(top, top, u.line, u.col, u.text));
+						if (usages.size() >= MAX_USAGES) {
+							truncated = true;
+							break;
+						}
+					}
+				}
+				if (usages.size() >= MAX_USAGES) {
+					truncated = true;
+					break;
+				}
+			}
+		} finally {
+			pool.shutdownNow();
 		}
 		result.put("truncated", truncated);
 		return result;
+	}
+
+	private static Map<String, Object> usageHit(String id, String fullName, int line, int col, String text) {
+		Map<String, Object> u = new LinkedHashMap<>();
+		u.put("id", id);
+		u.put("fullName", fullName);
+		u.put("line", line);
+		u.put("col", col);
+		u.put("text", text);
+		return u;
 	}
 
 	private static String descOf(String fqn) {
