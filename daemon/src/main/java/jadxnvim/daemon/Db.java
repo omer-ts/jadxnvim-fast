@@ -360,6 +360,84 @@ public final class Db implements AutoCloseable {
 		return out;
 	}
 
+	public static final class ImplHit {
+		public final String desc;
+		public final String fqn;
+		public final int access;
+
+		ImplHit(String desc, String fqn, int access) {
+			this.desc = desc;
+			this.fqn = fqn;
+			this.access = access;
+		}
+	}
+
+	/**
+	 * Classes that declare the method of {@code targetKey} — its declaring class plus every descendant
+	 * (subclass/implementor, transitively) that overrides it. Used for go-to-implementations on an
+	 * abstract/interface method: gd offers all concrete implementations, not just the declaration.
+	 */
+	public synchronized List<ImplHit> implementations(String targetKey, int cap) throws SQLException {
+		int arrow = targetKey.indexOf("->");
+		if (arrow < 0) {
+			return List.of();
+		}
+		String declDesc = targetKey.substring(0, arrow);
+		String rest = targetKey.substring(arrow + 2); // name(proto)ret
+		int paren = rest.indexOf('(');
+		if (paren < 0) {
+			return List.of();
+		}
+		String name = rest.substring(0, paren);
+		String proto = rest.substring(paren);
+
+		// declaring class + descendants (subclasses + implementors), transitively
+		java.util.LinkedHashSet<String> hier = new java.util.LinkedHashSet<>();
+		hier.add(declDesc);
+		java.util.ArrayDeque<String> down = new java.util.ArrayDeque<>();
+		down.add(declDesc);
+		java.util.Set<String> seen = new java.util.HashSet<>(hier);
+		while (!down.isEmpty() && hier.size() < cap) {
+			String d = down.poll();
+			for (String sub : queryList("SELECT desc FROM classes WHERE super_desc=?", d)) {
+				if (seen.add(sub)) {
+					hier.add(sub);
+					down.add(sub);
+				}
+			}
+			for (String impl : queryList(
+					"SELECT c.desc FROM class_iface ci JOIN classes c ON c.id=ci.class_id WHERE ci.iface_desc=?",
+					d)) {
+				if (seen.add(impl)) {
+					hier.add(impl);
+					down.add(impl);
+				}
+			}
+		}
+		// Which of those classes actually declare the method (name + proto).
+		StringBuilder in = new StringBuilder();
+		for (int i = 0; i < hier.size(); i++) {
+			in.append(i == 0 ? "?" : ",?");
+		}
+		String sql = "SELECT c.desc, c.fqn, m.access FROM methods m JOIN classes c ON c.id=m.class_id "
+				+ "WHERE c.desc IN (" + in + ") AND m.name=? AND m.proto=?";
+		List<ImplHit> out = new ArrayList<>();
+		try (PreparedStatement ps = conn.prepareStatement(sql)) {
+			int i = 1;
+			for (String h : hier) {
+				ps.setString(i++, h);
+			}
+			ps.setString(i++, name);
+			ps.setString(i, proto);
+			try (ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					out.add(new ImplHit(rs.getString(1), rs.getString(2), rs.getInt(3)));
+				}
+			}
+		}
+		return out;
+	}
+
 	/** Referencing classes for ANY of the given target keys (deduped, class-granular). */
 	public synchronized List<XrefHit> xrefsToAny(List<String> targets, int limit) throws SQLException {
 		if (targets.isEmpty()) {

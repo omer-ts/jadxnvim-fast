@@ -276,8 +276,12 @@ final class V2Engine {
 	// --- go-to-def / find-usages (SQLite xref index, no jadx model) ----------
 
 	private static final int MAX_USAGES = 5000;
-	// Cap referencing classes we render for precise sites (bounds gr latency on hot symbols).
-	private static final int REF_CLASS_CAP = 400;
+	// Cap referencing classes we list at all.
+	private static final int REF_CLASS_CAP = 5000;
+	// Cap referencing classes we render for PRECISE per-site lines (each is a full-closure decompile).
+	// Beyond this, classes are listed class-granular and relocate by name on open — keeps a hot
+	// interface's gr complete but bounded (~seconds instead of minutes).
+	private static final int RENDER_CAP = 30;
 
 	private Map<String, Object> gotoDef(String id, int line, int col) throws Exception {
 		Map<String, Object> result = new LinkedHashMap<>();
@@ -302,6 +306,33 @@ final class V2Engine {
 		result.put("id", topFqn);
 		result.put("line", pos.line);
 		result.put("col", pos.col);
+
+		// go-to-implementations: for a method, offer every class that declares/overrides it (the
+		// declaration + concrete implementations across the type hierarchy), so gd on an abstract or
+		// interface method lets you jump to any implementation rather than just the declaration.
+		if (sym.kind == Db.KIND_METHOD) {
+			List<Db.ImplHit> impls = db.implementations(sym.targetKey, 400);
+			if (impls.size() > 1) {
+				List<Map<String, Object>> targets = new ArrayList<>();
+				java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+				for (Db.ImplHit im : impls) {
+					String implTop = topLevel(im.fqn);
+					if (!seen.add(implTop)) {
+						continue;
+					}
+					Map<String, Object> t = new LinkedHashMap<>();
+					t.put("id", implTop);
+					t.put("fullName", im.fqn);
+					t.put("name", sym.displayName);
+					t.put("rawName", sym.rawName);
+					t.put("abstract", (im.access & 0x0400) != 0); // ACC_ABSTRACT
+					targets.add(t);
+				}
+				if (targets.size() > 1) {
+					result.put("targets", targets);
+				}
+			}
+		}
 		return result;
 	}
 
@@ -353,9 +384,13 @@ final class V2Engine {
 			refClasses.add(top);
 		}
 
-		// Resolve precise call-site lines by rendering each referencing class in parallel and reading
-		// jadx metadata. This is what makes gr navigable — each entry jumps to the actual call, with the
-		// code line as its text — without decompiling the whole APK.
+		// Render only the first RENDER_CAP referencing classes for precise per-call-site lines (each
+		// render is a full-closure decompile, so an interface with thousands of implementors would
+		// otherwise take minutes). Every remaining referencing class is still listed (class-granular);
+		// opening it relocates to the symbol by name. So find-usages stays complete AND bounded.
+		List<String> ordered = new ArrayList<>(refClasses);
+		int renderN = Math.min(RENDER_CAP, ordered.size());
+
 		int threads = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors()));
 		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(
 				threads, r -> {
@@ -365,7 +400,8 @@ final class V2Engine {
 				});
 		try {
 			java.util.List<java.util.concurrent.Future<Object[]>> futures = new ArrayList<>();
-			for (String top : refClasses) {
+			for (int i = 0; i < renderN; i++) {
+				String top = ordered.get(i);
 				futures.add(pool.submit(() -> {
 					String d = descOf(top);
 					java.util.List<Renderer.Usage> sites =
@@ -384,11 +420,11 @@ final class V2Engine {
 				@SuppressWarnings("unchecked")
 				java.util.List<Renderer.Usage> sites = (java.util.List<Renderer.Usage>) r[1];
 				if (sites.isEmpty()) {
-					// Rendered but no precise site (e.g. inlined/synthetic ref) — still list the class.
-					usages.add(usageHit(top, top, 1, 0, top));
+					// Rendered but no precise site — still list the class, navigable by symbol name.
+					usages.add(classGranularHit(top, sym.rawName));
 				} else {
 					for (Renderer.Usage u : sites) {
-						usages.add(usageHit(top, top, u.line, u.col, u.text));
+						usages.add(preciseHit(top, u.line, u.col, u.text));
 						if (usages.size() >= MAX_USAGES) {
 							truncated = true;
 							break;
@@ -403,17 +439,36 @@ final class V2Engine {
 		} finally {
 			pool.shutdownNow();
 		}
+		// Class-granular entries for the referencing classes we didn't render (beyond RENDER_CAP):
+		// listed once each, and opening one relocates to the symbol by name.
+		for (int i = renderN; i < ordered.size() && usages.size() < MAX_USAGES; i++) {
+			usages.add(classGranularHit(ordered.get(i), sym.rawName));
+		}
 		result.put("truncated", truncated);
 		return result;
 	}
 
-	private static Map<String, Object> usageHit(String id, String fullName, int line, int col, String text) {
+	// A precise call site: exact line/col + the code line, re-located in the buffer via `find`.
+	private static Map<String, Object> preciseHit(String id, int line, int col, String text) {
 		Map<String, Object> u = new LinkedHashMap<>();
 		u.put("id", id);
-		u.put("fullName", fullName);
+		u.put("fullName", id);
 		u.put("line", line);
 		u.put("col", col);
 		u.put("text", text);
+		u.put("find", text); // relocate by the code line
+		return u;
+	}
+
+	// A class-granular usage (not rendered): opening it jumps to the symbol by name (`member`).
+	private static Map<String, Object> classGranularHit(String id, String memberName) {
+		Map<String, Object> u = new LinkedHashMap<>();
+		u.put("id", id);
+		u.put("fullName", id);
+		u.put("line", 1);
+		u.put("col", 0);
+		u.put("text", id);
+		u.put("member", memberName); // relocate to the referenced member by name
 		return u;
 	}
 
