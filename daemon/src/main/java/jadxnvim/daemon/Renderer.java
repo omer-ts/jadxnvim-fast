@@ -139,10 +139,18 @@ public final class Renderer {
 		}
 	}
 
-	/** Decompile the class with raw descriptor {@code classDesc}. */
+	/**
+	 * Decompile the class with raw descriptor {@code classDesc}. Rendered WITH the reference closure so
+	 * the buffer the user sees is the exact same rendering that {@link #resolveAt} / {@link
+	 * #declarationPos} resolve cursor positions against — otherwise a closure-only render would use a
+	 * different layout and cross-class go-to-def / find-usages in reference-heavy classes (e.g.
+	 * Activities) would resolve to the wrong offset or nothing. The closure render also resolves more
+	 * app types, so the code reads better. Deterministic (single-threaded + a deterministic mini-dex),
+	 * so a re-render for resolveAt lands on identical offsets.
+	 */
 	public Result decompile(String classDesc, String dexEntryHint) throws Exception {
 		String fqn = DexIndexer.descToFqn(classDesc);
-		Result r = withRenderedClass(classDesc, dexEntryHint, false, null,
+		Result r = withRenderedClass(classDesc, dexEntryHint, true, null,
 				(jadx, cls, info, code) -> new Result(fqn, code, 1));
 		if (r == null) {
 			throw new IllegalArgumentException("class not found in APK: " + fqn);
@@ -169,7 +177,8 @@ public final class Renderer {
 	 */
 	public Pos declarationPos(String classDesc, String dexEntryHint, ResolvedSymbol target)
 			throws Exception {
-		Pos p = withRenderedClass(classDesc, dexEntryHint, false, null, (jadx, cls, info, code) -> {
+		// Closure render so the returned line matches the class's getCode() buffer (same rendering).
+		Pos p = withRenderedClass(classDesc, dexEntryHint, true, null, (jadx, cls, info, code) -> {
 			JavaNode decl = findDecl(cls, target);
 			if (decl == null) {
 				return null;
@@ -190,13 +199,15 @@ public final class Renderer {
 	 * annotates the references) and reads the code metadata to recover exact line/col + the code line
 	 * text — the data that makes find-usages navigable, resolved on demand for just this one class.
 	 */
-	public java.util.List<Usage> findUsageSites(String refClassDesc, String refHint, String targetClassDesc,
-			String targetHint, String targetKey) throws Exception {
+	public java.util.List<Usage> findUsageSites(String refClassDesc, String refHint, String targetKey)
+			throws Exception {
 		String fqn = DexIndexer.descToFqn(refClassDesc);
 		File miniDex = new File(workDir, "usages-" + tmpSeq.incrementAndGet() + ".dex");
 		try {
-			int n = extractor.extractFamilies(new String[] { refClassDesc, targetClassDesc },
-					new String[] { refHint, targetHint }, miniDex);
+			// Render the referencing class with its full closure — the same rendering getCode() uses —
+			// so the reported line/col match the buffer the user opens, and the target class (which this
+			// class references) is loaded so its references are annotated.
+			int n = extractor.extractWithClosure(refClassDesc, refHint, miniDex);
 			if (n == 0) {
 				return java.util.List.of();
 			}

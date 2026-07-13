@@ -221,15 +221,18 @@ function M.find_usages()
       local usages = res.usages or {}
       -- daemon may return name = null (JSON) which decodes to vim.NIL (a truthy userdata)
       local name = (type(res.name) == "string") and res.name or "symbol"
+      -- Fully-qualified path of the resolved symbol (e.g. com.example.Utils.debugLog); shown on
+      -- failure so it's clear exactly what was searched. Falls back to the short name.
+      local path = (type(res.path) == "string") and res.path or name
       -- In low-memory mode (usage graph disabled) there is no semantic xref; fall back to a fast
       -- name-based text search over the exported sources.
       if res.usageFallback and #usages == 0 and name ~= "symbol" then
-        notify("find-usages: usage graph off — searching for '" .. name .. "' as text", vim.log.levels.INFO)
+        notify("find-usages: usage graph off — searching for '" .. path .. "' as text", vim.log.levels.INFO)
         require("jadxnvim.search").text(name)
         return
       end
       if #usages == 0 then
-        notify("no usages found for " .. name, vim.log.levels.WARN)
+        notify("no usages found for " .. path, vim.log.levels.WARN)
         return
       end
       -- jadx-gui-style xref: a browsable list of usages with a live code preview.

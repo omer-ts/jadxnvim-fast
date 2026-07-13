@@ -309,7 +309,11 @@ final class V2Engine {
 			return result;
 		}
 		result.put("name", sym.displayName);
-		String targetTopFqn = topLevel(DexIndexer.descToFqn(sym.declClassDesc));
+		// Fully-qualified path of the resolved symbol (declaring class + member), shown when no usages
+		// are found so the user knows exactly what was searched.
+		String declFqn = DexIndexer.descToFqn(sym.declClassDesc);
+		result.put("path", sym.kind == Db.KIND_CLASS ? declFqn : declFqn + "." + sym.rawName);
+		String targetTopFqn = topLevel(declFqn);
 		// Frida-hook target (the searched symbol's own class).
 		result.put("targetId", targetTopFqn);
 		result.put("targetKind", kindName(sym.kind));
@@ -331,11 +335,9 @@ final class V2Engine {
 			refClasses.add(top);
 		}
 
-		// Resolve precise call-site lines by rendering each referencing class (with the target class
-		// loaded) in parallel and reading jadx metadata. This is what makes gr navigable — each entry
-		// jumps to the actual call, with the code line as its text — without decompiling the whole APK.
-		String targetTopDesc = descOf(targetTopFqn);
-		String targetHint = db.dexEntryOf(targetTopDesc);
+		// Resolve precise call-site lines by rendering each referencing class in parallel and reading
+		// jadx metadata. This is what makes gr navigable — each entry jumps to the actual call, with the
+		// code line as its text — without decompiling the whole APK.
 		String targetKey = sym.targetKey;
 		int threads = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors()));
 		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(
@@ -350,7 +352,7 @@ final class V2Engine {
 				futures.add(pool.submit(() -> {
 					String d = descOf(top);
 					java.util.List<Renderer.Usage> sites =
-							renderer.findUsageSites(d, db.dexEntryOf(d), targetTopDesc, targetHint, targetKey);
+							renderer.findUsageSites(d, db.dexEntryOf(d), targetKey);
 					return new Object[] { top, sites };
 				}));
 			}
