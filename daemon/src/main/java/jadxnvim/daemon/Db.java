@@ -24,7 +24,7 @@ import java.util.List;
 public final class Db implements AutoCloseable {
 
 	/** Bump when the schema or the semantics of any indexed column change. */
-	public static final int SCHEMA_VERSION = 3;
+	public static final int SCHEMA_VERSION = 4;
 
 	// Symbol kinds (stored in symbols.kind and xrefs.target_kind).
 	public static final int KIND_CLASS = 0;
@@ -106,13 +106,15 @@ public final class Db implements AutoCloseable {
 			st.execute("CREATE TABLE IF NOT EXISTS symbols ("
 					+ "id INTEGER PRIMARY KEY,"
 					+ "kind INTEGER NOT NULL,"
-					+ "name TEXT NOT NULL,"          // simple name searched by the fuzzy finder
-					+ "fqn TEXT NOT NULL,"           // fully-qualified label shown in results
+					+ "name TEXT NOT NULL,"          // simple name shown in results
+					+ "fqn TEXT NOT NULL,"           // fully-qualified raw name (original, pre-jadx)
+					+ "alias TEXT,"                  // jadx-rendered fqn when jadx renames the class; else null
 					+ "class_id INTEGER NOT NULL,"
 					+ "member_idx INTEGER)");        // method/field index within class; null for classes
-			// Trigram FTS over symbol names → fast substring/fuzzy matching (rowid = symbols.id).
+			// Trigram FTS over a combined searchable text per symbol (raw simple + raw fqn + jadx-alias
+			// forms), so a search matches the original name, a qualified/partial path, OR the jadx name.
 			st.execute("CREATE VIRTUAL TABLE IF NOT EXISTS sym_fts USING fts5("
-					+ "name, tokenize='trigram', content='')");
+					+ "text, tokenize='trigram', content='')");
 			// Trigram FTS over string-literal uses → substring content search (rowid = str_use.id).
 			st.execute("CREATE VIRTUAL TABLE IF NOT EXISTS str_use_fts USING fts5("
 					+ "value, tokenize='trigram', content='')");
@@ -199,47 +201,57 @@ public final class Db implements AutoCloseable {
 		public final int kind;
 		public final String name;
 		public final String fqn;
+		public final String alias; // jadx-rendered fqn when renamed, else null
 		public final long classId;
 		public final Integer memberIdx;
 
-		SymbolHit(int kind, String name, String fqn, long classId, Integer memberIdx) {
+		SymbolHit(int kind, String name, String fqn, String alias, long classId, Integer memberIdx) {
 			this.kind = kind;
 			this.name = name;
 			this.fqn = fqn;
+			this.alias = alias;
 			this.classId = classId;
 			this.memberIdx = memberIdx;
 		}
 	}
 
 	/**
-	 * Substring/fuzzy symbol search via the trigram FTS index. {@code kind} restricts results to a
+	 * Substring/fuzzy symbol search via the trigram FTS index. Matches the combined per-symbol text
+	 * (raw simple name, raw fully-qualified name, and jadx-alias forms), so a query can be the original
+	 * name, a qualified/partial path, or the jadx-rendered name. {@code kind} restricts results to a
 	 * single symbol kind ({@link #KIND_CLASS}/{@link #KIND_METHOD}/{@link #KIND_FIELD}); pass -1 for
-	 * all kinds. The kind filter is applied inside SQL so it composes with {@code limit} correctly
-	 * (filtering after the limit would starve a kind whose matches rank below the cutoff).
+	 * all kinds. The kind filter is applied inside SQL so it composes with {@code limit} correctly.
 	 */
 	public synchronized List<SymbolHit> searchSymbols(String query, int kind, int limit) throws SQLException {
 		List<SymbolHit> out = new ArrayList<>();
-		// Trigram FTS needs >= 3 chars; fall back to a LIKE scan for short queries.
+		// Trigram FTS needs >= 3 chars; fall back to a LIKE scan (name/fqn/alias) for short queries.
 		boolean useFts = query != null && query.length() >= 3;
 		String kindClause = kind >= 0 ? " AND s.kind=?" : "";
 		String sql = useFts
-				? "SELECT s.kind,s.name,s.fqn,s.class_id,s.member_idx FROM sym_fts f "
-						+ "JOIN symbols s ON s.id=f.rowid WHERE f.name MATCH ?" + kindClause + " LIMIT ?"
-				: "SELECT s.kind,s.name,s.fqn,s.class_id,s.member_idx FROM symbols s "
-						+ "WHERE s.name LIKE ?" + kindClause + " LIMIT ?";
+				? "SELECT s.kind,s.name,s.fqn,s.alias,s.class_id,s.member_idx FROM sym_fts f "
+						+ "JOIN symbols s ON s.id=f.rowid WHERE f.text MATCH ?" + kindClause + " LIMIT ?"
+				: "SELECT s.kind,s.name,s.fqn,s.alias,s.class_id,s.member_idx FROM symbols s "
+						+ "WHERE (s.name LIKE ? OR s.fqn LIKE ? OR s.alias LIKE ?)" + kindClause + " LIMIT ?";
 		try (PreparedStatement ps = conn.prepareStatement(sql)) {
 			int i = 1;
-			ps.setString(i++, useFts ? "\"" + query.replace("\"", "\"\"") + "\"" : "%" + query + "%");
+			if (useFts) {
+				ps.setString(i++, "\"" + query.replace("\"", "\"\"") + "\"");
+			} else {
+				String like = "%" + query + "%";
+				ps.setString(i++, like);
+				ps.setString(i++, like);
+				ps.setString(i++, like);
+			}
 			if (kind >= 0) {
 				ps.setInt(i++, kind);
 			}
 			ps.setInt(i, limit);
 			try (ResultSet rs = ps.executeQuery()) {
 				while (rs.next()) {
-					int mi = rs.getInt(5);
+					int mi = rs.getInt(6);
 					Integer memberIdx = rs.wasNull() ? null : mi;
-					out.add(new SymbolHit(rs.getInt(1), rs.getString(2), rs.getString(3),
-							rs.getLong(4), memberIdx));
+					out.add(new SymbolHit(rs.getInt(1), rs.getString(2), rs.getString(3), rs.getString(4),
+							rs.getLong(5), memberIdx));
 				}
 			}
 		}

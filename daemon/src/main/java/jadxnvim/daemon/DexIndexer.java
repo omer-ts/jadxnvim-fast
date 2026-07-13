@@ -95,9 +95,9 @@ public final class DexIndexer {
 				PreparedStatement insXref = db.connection().prepareStatement(
 					"INSERT INTO xrefs(target,kind,src_class_id) VALUES(?,?,?)");
 				PreparedStatement insSymbol = db.connection().prepareStatement(
-					"INSERT INTO symbols(id,kind,name,fqn,class_id,member_idx) VALUES(?,?,?,?,?,?)");
+					"INSERT INTO symbols(id,kind,name,fqn,alias,class_id,member_idx) VALUES(?,?,?,?,?,?,?)");
 				PreparedStatement insSymFts = db.connection().prepareStatement(
-					"INSERT INTO sym_fts(rowid,name) VALUES(?,?)");
+					"INSERT INTO sym_fts(rowid,text) VALUES(?,?)");
 				PreparedStatement insStrUse = db.connection().prepareStatement(
 					"INSERT INTO str_use(id,class_id,value) VALUES(?,?,?)");
 				PreparedStatement insStrUseFts = db.connection().prepareStatement(
@@ -125,8 +125,24 @@ public final class DexIndexer {
 					insClass.setString(9, entryName);
 					insClass.executeUpdate();
 
+					// jadx-rendered name (for classes jadx renames because the raw name is an invalid Java
+					// identifier), plus the combined search text so the class is findable by its original
+					// name, a qualified/partial path, OR its jadx name.
+					String jadxSimple = Names.jadxSimpleName(name);
+					String aliasFqn = jadxSimple.equals(name) ? null
+							: (pkg.isEmpty() ? jadxSimple : pkg + "." + jadxSimple);
+					StringBuilder clsText = new StringBuilder();
+					for (String v : Names.searchVariants(name)) {
+						clsText.append(v).append(' ');
+					}
+					clsText.append(fqn);
+					if (aliasFqn != null) {
+						clsText.append(' ').append(aliasFqn);
+					}
+
 					symbolId++;
-					addSymbol(insSymbol, insSymFts, symbolId, Db.KIND_CLASS, name, fqn, classId, null);
+					addSymbol(insSymbol, insSymFts, symbolId, Db.KIND_CLASS, name, fqn, aliasFqn,
+							clsText.toString(), classId, null);
 
 					int fIdx = 0;
 					for (Field f : cls.getFields()) {
@@ -140,7 +156,7 @@ public final class DexIndexer {
 						insField.addBatch();
 						symbolId++;
 						addSymbol(insSymbol, insSymFts, symbolId, Db.KIND_FIELD, f.getName(),
-								fqn + "." + f.getName(), classId, fIdx - 1);
+								fqn + "." + f.getName(), null, f.getName(), classId, fIdx - 1);
 						pending++;
 					}
 					insField.executeBatch();
@@ -161,7 +177,7 @@ public final class DexIndexer {
 						insMethod.addBatch();
 						symbolId++;
 						addSymbol(insSymbol, insSymFts, symbolId, Db.KIND_METHOD, m.getName(),
-								fqn + "." + m.getName() + "()", classId, mIdx);
+								fqn + "." + m.getName() + "()", null, m.getName(), classId, mIdx);
 						mIdx++;
 						pending++;
 
@@ -242,20 +258,22 @@ public final class DexIndexer {
 	}
 
 	private static void addSymbol(PreparedStatement insSymbol, PreparedStatement insSymFts, long id,
-			int kind, String name, String fqn, long classId, Integer memberIdx) throws SQLException {
+			int kind, String name, String fqn, String alias, String ftsText, long classId, Integer memberIdx)
+			throws SQLException {
 		insSymbol.setLong(1, id);
 		insSymbol.setInt(2, kind);
 		insSymbol.setString(3, name);
 		insSymbol.setString(4, fqn);
-		insSymbol.setLong(5, classId);
+		insSymbol.setString(5, alias);
+		insSymbol.setLong(6, classId);
 		if (memberIdx == null) {
-			insSymbol.setNull(6, java.sql.Types.INTEGER);
+			insSymbol.setNull(7, java.sql.Types.INTEGER);
 		} else {
-			insSymbol.setInt(6, memberIdx);
+			insSymbol.setInt(7, memberIdx);
 		}
 		insSymbol.addBatch();
 		insSymFts.setLong(1, id);
-		insSymFts.setString(2, name);
+		insSymFts.setString(2, ftsText);
 		insSymFts.addBatch();
 	}
 

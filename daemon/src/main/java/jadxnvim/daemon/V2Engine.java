@@ -108,10 +108,16 @@ final class V2Engine {
 			try (ResultSet rs = ps.executeQuery()) {
 				while (rs.next()) {
 					String fqn = rs.getString(1);
+					String name = rs.getString(2);
 					Map<String, Object> e = new LinkedHashMap<>();
-					e.put("id", fqn);
-					e.put("name", rs.getString(2));
+					e.put("id", fqn); // raw name — the id getCode/gd/gr key on
+					e.put("name", name);
 					e.put("fullName", fqn);
+					// jadx-rendered name shown alongside the raw name when jadx renames the class.
+					String jadx = Names.jadxSimpleName(name);
+					if (!jadx.equals(name)) {
+						e.put("alias", jadx);
+					}
 					classes.add(e);
 				}
 			}
@@ -124,15 +130,18 @@ final class V2Engine {
 
 	private Map<String, Object> listClasses(int limit) throws Exception {
 		List<Map<String, Object>> items = new ArrayList<>();
-		String sql = "SELECT fqn FROM classes WHERE name NOT LIKE '%$%' ORDER BY fqn LIMIT ?";
+		String sql = "SELECT fqn, name FROM classes WHERE name NOT LIKE '%$%' ORDER BY fqn LIMIT ?";
 		try (PreparedStatement ps = db.connection().prepareStatement(sql)) {
 			ps.setInt(1, limit + 1);
 			try (ResultSet rs = ps.executeQuery()) {
 				while (rs.next()) {
 					String fqn = rs.getString(1);
+					String name = rs.getString(2);
+					String jadx = Names.jadxSimpleName(name);
 					Map<String, Object> m = new LinkedHashMap<>();
 					m.put("id", fqn);
-					m.put("label", fqn);
+					// Label shows the raw fqn plus the jadx name when the class is renamed.
+					m.put("label", jadx.equals(name) ? fqn : fqn + "  (jadx: " + jadx + ")");
 					items.add(m);
 				}
 			}
@@ -467,10 +476,12 @@ final class V2Engine {
 			Map<String, Object> m = new LinkedHashMap<>();
 			m.put("id", topLevel(fqnClassOf(h)));
 			m.put("kind", kindName(h.kind));
-			m.put("fullName", h.fqn);
+			// Show the jadx-rendered name alongside the raw name when the class was renamed.
+			String label = (h.alias != null && !h.alias.equals(h.fqn)) ? h.fqn + "  (jadx: " + h.alias + ")" : h.fqn;
+			m.put("fullName", label);
 			m.put("line", 1);
 			m.put("col", 0);
-			m.put("text", h.fqn);
+			m.put("text", label);
 			batch.add(m);
 			count++;
 			if (batch.size() >= 500) {

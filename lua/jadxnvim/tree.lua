@@ -176,7 +176,8 @@ local function render()
       local shown_classes = {}
       if p.expanded or f ~= "" then
         for _, c in ipairs(classes) do
-          if pkg_match or matches(c.name, f) then
+          -- match the raw name AND the jadx-rendered alias (for classes jadx renamed)
+          if pkg_match or matches(c.name, f) or (c.alias and matches(c.alias, f)) then
             shown_classes[#shown_classes + 1] = c
           end
         end
@@ -187,7 +188,12 @@ local function render()
         rows[#lines] = { kind = "package", pkg = p }
         if expand then
           for _, c in ipairs(shown_classes) do
-            lines[#lines + 1] = "      " .. ic("class") .. c.name
+            -- Show the raw dex name, annotated with the jadx-rendered name when jadx renamed the class.
+            local label = c.name
+            if c.alias then
+              label = label .. "  → " .. c.alias
+            end
+            lines[#lines + 1] = "      " .. ic("class") .. label
             rows[#lines] = { kind = "class", pkg = p, class = c }
           end
         end
