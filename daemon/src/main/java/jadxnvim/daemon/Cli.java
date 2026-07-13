@@ -37,6 +37,9 @@ public final class Cli {
 			case "decompile":
 				decompile(argv);
 				return true;
+			case "dispatchers":
+				dispatchers(argv);
+				return true;
 			default:
 				return false;
 		}
@@ -150,6 +153,57 @@ public final class Cli {
 		System.out.println(r.code);
 		System.err.println("[jadxd] decompiled " + r.fqn + " (mini-dex: " + r.classesInMiniDex
 				+ " classes) in " + ms + " ms");
+	}
+
+	/**
+	 * Scan the APK's bytecode (no decompilation) for merged-dispatcher classes: a method holding a
+	 * packed/sparse switch with many cases, the shape an optimizer (R8/Redex) produces when it merges
+	 * many callbacks/lambdas into one class dispatched by an integer id. Reports the biggest switches,
+	 * with the class's implemented interfaces so the functional ones (Runnable/Function/Callable) stand
+	 * out.
+	 */
+	private static void dispatchers(String[] argv) throws Exception {
+		if (argv.length < 2) {
+			System.err.println("usage: jadxd dispatchers <apk> [minCases]");
+			System.exit(2);
+		}
+		File apk = new File(argv[1]);
+		int minCases = argv.length > 2 ? Integer.parseInt(argv[2]) : 12;
+		com.android.tools.smali.dexlib2.iface.MultiDexContainer<? extends com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile> c =
+				com.android.tools.smali.dexlib2.DexFileFactory.loadDexContainer(apk,
+						com.android.tools.smali.dexlib2.Opcodes.getDefault());
+		List<Object[]> hits = new java.util.ArrayList<>();
+		for (String entry : c.getDexEntryNames()) {
+			com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile dex = c.getEntry(entry).getDexFile();
+			for (com.android.tools.smali.dexlib2.iface.ClassDef cd : dex.getClasses()) {
+				for (com.android.tools.smali.dexlib2.iface.Method m : cd.getMethods()) {
+					com.android.tools.smali.dexlib2.iface.MethodImplementation impl = m.getImplementation();
+					if (impl == null) {
+						continue;
+					}
+					int maxCases = 0;
+					for (com.android.tools.smali.dexlib2.iface.instruction.Instruction insn : impl.getInstructions()) {
+						if (insn instanceof com.android.tools.smali.dexlib2.iface.instruction.SwitchPayload) {
+							int n = ((com.android.tools.smali.dexlib2.iface.instruction.SwitchPayload) insn)
+									.getSwitchElements().size();
+							if (n > maxCases) {
+								maxCases = n;
+							}
+						}
+					}
+					if (maxCases >= minCases) {
+						hits.add(new Object[] { maxCases, DexIndexer.descToFqn(cd.getType()), m.getName(),
+								cd.getInterfaces().toString() });
+					}
+				}
+			}
+		}
+		hits.sort((a, b) -> (int) b[0] - (int) a[0]); // biggest switches first
+		for (int i = 0; i < Math.min(hits.size(), 60); i++) {
+			Object[] h = hits.get(i);
+			System.out.println(String.format("%5d cases  %s.%s()  %s", (int) h[0], h[1], h[2], h[3]));
+		}
+		System.out.println("(" + hits.size() + " methods with >=" + minCases + " switch cases)");
 	}
 
 	private static String defaultDbPath(File input) {

@@ -70,6 +70,9 @@ final class V2Engine {
 				return gotoDef(reqStr(params, "id"), reqInt(params, "line"), reqInt(params, "col"));
 			case "findUsages":
 				return findUsages(reqStr(params, "id"), reqInt(params, "line"), reqInt(params, "col"));
+			case "resolveTask":
+				return resolveTask(reqStr(params, "id"), reqInt(params, "line"), reqInt(params, "col"),
+						intList(params, "taskIds"));
 			case "searchName":
 				return startSearch("name", params);
 			case "searchText":
@@ -485,6 +488,128 @@ final class V2Engine {
 
 	private static String descOf(String fqn) {
 		return "L" + fqn.replace('.', '/') + ";";
+	}
+
+	// --- merged-dispatcher task resolver -------------------------------------
+
+	/**
+	 * Resolve a merged-lambda / merged-callback dispatcher call to the branch it runs. Optimizers
+	 * (R8 / Meta's Redex) merge many small lambdas/Runnables into one class dispatched by an integer id
+	 * (rendered as {@code switch (this.$t)}) — so a call site {@code new X.Uez(.., 5)} really means
+	 * "run case 5 of X.Uez". Given the class referenced at the cursor and the integer literals on that
+	 * call, this finds {@code case <id>:} in the dispatch switch and returns its position.
+	 */
+	private Map<String, Object> resolveTask(String hostId, int line, int col, List<Integer> taskIds)
+			throws Exception {
+		Map<String, Object> result = new LinkedHashMap<>();
+		Renderer.ResolvedSymbol sym = renderer.resolveAt(descOf(hostId), line, col);
+		if (sym == null) {
+			result.put("found", false);
+			result.put("reason", "no class/constructor under the cursor");
+			return result;
+		}
+		// The dispatcher is the class referenced at the cursor (a type, or the class declaring the
+		// constructor/factory being called).
+		String dispFqn = topLevel(DexIndexer.descToFqn(sym.declClassDesc));
+		String dispDesc = descOf(dispFqn);
+		if (db.classIdOf(dispDesc) < 0) {
+			result.put("found", false);
+			result.put("reason", dispFqn + " is not in this APK");
+			return result;
+		}
+		String code = renderClass(dispFqn);
+		int[] loc = findTaskCase(code, taskIds); // {line, taskId}
+		if (loc == null) {
+			result.put("found", false);
+			result.put("reason", "no matching case in " + dispFqn
+					+ (taskIds.isEmpty() ? " (no integer id on this line)" : " for id " + taskIds));
+			return result;
+		}
+		result.put("found", true);
+		result.put("id", dispFqn);
+		result.put("line", loc[0]);
+		result.put("col", 0);
+		result.put("task", loc[1]);
+		result.put("name", sym.displayName);
+		return result;
+	}
+
+	// Locate `case <id>:` in the dispatch switch. Prefers `switch (this.$t)` (the merged-lambda id
+	// field); else falls back to the switch with the most cases. Returns {line, chosenId} or null.
+	private static int[] findTaskCase(String code, List<Integer> taskIds) {
+		if (taskIds.isEmpty()) {
+			return null;
+		}
+		String[] lines = code.split("\n", -1);
+		int swLine = -1;
+		for (int i = 0; i < lines.length; i++) {
+			if (lines[i].contains("switch (this.$t)")) {
+				swLine = i;
+				break;
+			}
+		}
+		if (swLine < 0) {
+			swLine = largestSwitchLine(lines); // fallback: dispatcher may name the id field differently
+		}
+		if (swLine < 0) {
+			return null;
+		}
+		// Collect case label -> first line, for cases after the switch.
+		Map<Integer, Integer> caseLine = new java.util.HashMap<>();
+		java.util.regex.Pattern casePat = java.util.regex.Pattern.compile("^\\s*case\\s+(-?\\d+):");
+		for (int i = swLine + 1; i < lines.length; i++) {
+			java.util.regex.Matcher m = casePat.matcher(lines[i]);
+			if (m.find()) {
+				caseLine.putIfAbsent(Integer.parseInt(m.group(1)), i + 1);
+			}
+		}
+		// Choose the last candidate id that is a real case ($t is commonly the last constructor arg).
+		for (int k = taskIds.size() - 1; k >= 0; k--) {
+			Integer id = taskIds.get(k);
+			Integer ln = caseLine.get(id);
+			if (ln != null) {
+				return new int[] { ln, id };
+			}
+		}
+		return null;
+	}
+
+	// Line index (0-based) of the `switch (` that has the most `case` labels after it — a heuristic for
+	// the dispatch switch when the id field isn't literally $t.
+	private static int largestSwitchLine(String[] lines) {
+		java.util.regex.Pattern casePat = java.util.regex.Pattern.compile("^\\s*case\\s+-?\\d+:");
+		int bestLine = -1;
+		int bestCount = 0;
+		for (int i = 0; i < lines.length; i++) {
+			if (!lines[i].contains("switch (")) {
+				continue;
+			}
+			int count = 0;
+			for (int j = i + 1; j < lines.length && !lines[j].contains("switch ("); j++) {
+				if (casePat.matcher(lines[j]).find()) {
+					count++;
+				}
+			}
+			if (count > bestCount) {
+				bestCount = count;
+				bestLine = i;
+			}
+		}
+		return bestCount >= 3 ? bestLine : -1;
+	}
+
+	private static List<Integer> intList(JsonObject params, String key) {
+		List<Integer> out = new ArrayList<>();
+		if (params != null && params.has(key) && params.get(key).isJsonArray()) {
+			for (com.google.gson.JsonElement e : params.getAsJsonArray(key)) {
+				try {
+					out.add(e.getAsInt());
+				} catch (Exception ignore) {
+					// skip non-ints
+				}
+			}
+		}
+		return out;
 	}
 
 	// --- search (streamed) --------------------------------------------------

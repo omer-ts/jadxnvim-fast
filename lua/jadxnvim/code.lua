@@ -100,6 +100,8 @@ local function java_keymaps(bufnr)
   local opts = { buffer = bufnr, silent = true, nowait = true }
   vim.keymap.set("n", "gd", nav("goto_def"), opts)
   vim.keymap.set("n", "gr", nav("find_usages"), opts)
+  -- resolve a merged-lambda dispatcher call (`new X.Y(.., N)`) to its `case N:` branch
+  vim.keymap.set("n", "<leader>jt", nav("resolve_task"), opts)
   vim.keymap.set("n", "<leader>jr", function()
     require("jadxnvim.edit").rename()
   end, opts)

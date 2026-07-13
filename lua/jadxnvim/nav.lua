@@ -207,6 +207,42 @@ function M.goto_def()
   end)
 end
 
+-- Resolve a merged-lambda/-callback dispatcher call to the branch it actually runs. Optimizers
+-- (R8 / Meta's Redex) merge many lambdas into one class dispatched by an integer id
+-- (`switch (this.$t)`), so a call like `new X.Uez(.., 5)` means "run case 5 of X.Uez". Put the cursor
+-- on the dispatcher class name in the construction and this jumps to `case 5:` in its dispatch switch.
+function M.resolve_task()
+  local id, line, col = code.cursor_target()
+  if not id then
+    notify("not in a jadx code buffer", vim.log.levels.WARN)
+    return
+  end
+  -- Integer literals near the cursor (the call's args may wrap over a few lines) are the candidate
+  -- task ids; the daemon keeps only the one that is a real case in the dispatch switch.
+  local buf = vim.api.nvim_get_current_buf()
+  local ctx = vim.api.nvim_buf_get_lines(buf, line - 1, line + 2, false)
+  local ints = {}
+  for _, l in ipairs(ctx) do
+    for n in (" " .. l):gmatch("[^%w_%.](%d+)") do
+      ints[#ints + 1] = tonumber(n)
+    end
+  end
+  rpc.request("resolveTask", { id = id, line = line, col = col, taskIds = ints }, function(err, res)
+    vim.schedule(function()
+      if err then
+        notify("resolve task failed: " .. (err.message or "?"), vim.log.levels.ERROR)
+        return
+      end
+      if not res.found then
+        notify("resolve task: " .. (res.reason or "not a merged dispatcher call"), vim.log.levels.WARN)
+        return
+      end
+      notify(string.format("task %d → %s:%d", res.task, res.id, res.line), vim.log.levels.INFO)
+      code.open(res.id, { line = res.line, col = res.col })
+    end)
+  end)
+end
+
 function M.find_usages()
   local id, line, col = code.cursor_target()
   if not id then
