@@ -328,8 +328,17 @@ final class V2Engine {
 		result.put("targetKind", kindName(sym.kind));
 		result.put("targetRawName", sym.rawName);
 
+		// Expand a method target to its whole override group (calls via a super/interface/subtype),
+		// so virtual-dispatch usages aren't missed; a class/field is just its single key.
+		java.util.Set<String> targetKeys = new java.util.LinkedHashSet<>();
+		if (sym.kind == Db.KIND_METHOD) {
+			targetKeys.addAll(db.overrideKeys(sym.targetKey, 300));
+		} else {
+			targetKeys.add(sym.targetKey);
+		}
+
 		// Distinct referencing (top-level) classes from the xref index, capped.
-		List<Db.XrefHit> hits = db.xrefsTo(sym.targetKey, MAX_USAGES * 8);
+		List<Db.XrefHit> hits = db.xrefsToAny(new ArrayList<>(targetKeys), MAX_USAGES * 8);
 		java.util.LinkedHashSet<String> refClasses = new java.util.LinkedHashSet<>();
 		boolean truncated = false;
 		for (Db.XrefHit h : hits) {
@@ -347,7 +356,6 @@ final class V2Engine {
 		// Resolve precise call-site lines by rendering each referencing class in parallel and reading
 		// jadx metadata. This is what makes gr navigable — each entry jumps to the actual call, with the
 		// code line as its text — without decompiling the whole APK.
-		String targetKey = sym.targetKey;
 		int threads = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors()));
 		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(
 				threads, r -> {
@@ -361,7 +369,7 @@ final class V2Engine {
 				futures.add(pool.submit(() -> {
 					String d = descOf(top);
 					java.util.List<Renderer.Usage> sites =
-							renderer.findUsageSites(d, db.dexEntryOf(d), targetKey);
+							renderer.findUsageSites(d, db.dexEntryOf(d), targetKeys);
 					return new Object[] { top, sites };
 				}));
 			}

@@ -199,7 +199,10 @@ function M.goto_def()
         })
         return
       end
-      code.open(res.id, { line = res.line, col = res.col })
+      -- For a method, re-locate the declaration by name in the opened buffer (robust to on-demand
+      -- render differences); classes/fields jump to the reported line directly.
+      local find_method = res.kind == "method" and res.name or nil
+      code.open(res.id, { line = res.line, col = res.col, find_method = find_method })
     end)
   end)
 end
@@ -243,11 +246,14 @@ function M.find_usages()
           id = u.id,
           line = u.line,
           col = u.col,
+          snippet = u.text, -- the code line; used to re-locate the exact spot in the opened buffer
         }
       end
       local title = string.format(" Usages of %s (%d%s) ", name, #usages, res.truncated and "+" or "")
       local on_open = function(it)
-        code.open(it.id, { line = it.line, col = it.col })
+        -- Pass the code snippet so code.open re-locates the exact line by text in the actual buffer
+        -- (robust even if this class's on-demand render differs slightly from the indexed position).
+        code.open(it.id, { line = it.line, col = it.col, find = it.snippet })
       end
       -- For <C-f> (Frida) in the usages picker, hook the searched symbol itself: the target method
       -- (all overloads) or the whole class — not each call site.

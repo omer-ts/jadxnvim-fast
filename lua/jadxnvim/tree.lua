@@ -316,10 +316,93 @@ end
 -- (thousands of packages) doesn't try to load them all at once.
 local FILTER_LOAD_CAP = 60
 
+-- Load a package's classes (once) and re-render while the filter is still active.
+local function load_pkg_classes(p)
+  if p.classes ~= nil or p.loading then
+    return
+  end
+  p.loading = true
+  rpc.request("getClasses", { package = p.name }, function(err, res)
+    vim.schedule(function()
+      p.loading = false
+      if not err then
+        p.classes = res.classes or {}
+      end
+      if state.filter ~= "" then
+        render()
+      end
+    end)
+  end)
+end
+
+-- The daemon-backed part of filtering: classes are lazy, so a class matching the filter inside a
+-- package whose NAME does not match would be invisible (its classes were never loaded). Ask the
+-- daemon which classes match (server-side, across the whole APK), then load exactly the packages
+-- that contain a match so render()'s filter can reveal them.
+local pkg_search = { cleanup = nil }
+local function load_matching_class_packages(f)
+  if pkg_search.cleanup then
+    pcall(pkg_search.cleanup)
+    pkg_search.cleanup = nil
+  end
+  local my = { id = nil }
+  local want = {} -- package name -> true
+  local d1 = rpc.on("searchHits", function(p)
+    if p.searchId ~= my.id then
+      return
+    end
+    for _, it in ipairs(p.items or {}) do
+      local fqn = it.id or "" -- topLevel raw fqn
+      local pkg = fqn:match("^(.*)%.[^.]+$") or ""
+      want[pkg] = true
+    end
+  end)
+  local d2
+  d2 = rpc.on("searchDone", function(p)
+    if p.searchId ~= my.id then
+      return
+    end
+    pcall(d1)
+    pcall(d2)
+    pkg_search.cleanup = nil
+    vim.schedule(function()
+      if state.filter ~= f then
+        return -- filter changed while searching
+      end
+      local n = 0
+      for _, pp in ipairs(state.packages) do
+        if n >= FILTER_LOAD_CAP then
+          break
+        end
+        if want[pp.name] and pp.classes == nil and not pp.loading then
+          n = n + 1
+          load_pkg_classes(pp)
+        end
+      end
+    end)
+  end)
+  pkg_search.cleanup = function()
+    pcall(d1)
+    pcall(d2)
+    if my.id then
+      rpc.request("cancelSearch", { searchId = my.id })
+    end
+  end
+  rpc.request("searchName", { query = f, kind = "class", limit = 1000 }, function(err, res)
+    if err or not res then
+      if pkg_search.cleanup then
+        pcall(pkg_search.cleanup)
+        pkg_search.cleanup = nil
+      end
+    else
+      my.id = res.searchId
+    end
+  end)
+end
+
 local function set_filter(f)
   state.filter = f or ""
   if state.filter ~= "" then
-    -- Classes are lazy, so a match inside a collapsed package is invisible until its classes load.
     -- Load classes for packages whose NAME matches the filter (bounded) so those folds can open and
     -- reveal their classes; render() then auto-expands them.
     local loaded = 0
@@ -329,26 +412,21 @@ local function set_filter(f)
       end
       local pkg_name = p.name ~= "" and p.name or "(default package)"
       if p.classes == nil and not p.loading and matches(pkg_name, state.filter) then
-        p.loading = true
         loaded = loaded + 1
-        rpc.request("getClasses", { package = p.name }, function(err, res)
-          vim.schedule(function()
-            p.loading = false
-            if not err then
-              p.classes = res.classes or {}
-            end
-            if state.filter ~= "" then
-              render()
-            end
-          end)
-        end)
+        load_pkg_classes(p)
       end
     end
+    -- Also pull in packages that merely CONTAIN a matching class (name doesn't match), via a
+    -- server-side class search — otherwise those classes are missed.
+    load_matching_class_packages(state.filter)
     -- the resource tree is fully in memory once loaded; make sure it is, so matches there show too
     if state.resources_open and not state.res_root then
       load_resources()
       return
     end
+  elseif pkg_search.cleanup then
+    pcall(pkg_search.cleanup)
+    pkg_search.cleanup = nil
   end
   render()
 end

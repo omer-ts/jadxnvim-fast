@@ -92,6 +92,8 @@ public final class DexIndexer {
 					"INSERT INTO methods(id,class_id,name,proto,access,idx) VALUES(?,?,?,?,?,?)");
 				PreparedStatement insField = db.connection().prepareStatement(
 					"INSERT INTO fields(id,class_id,name,type,access,idx) VALUES(?,?,?,?,?,?)");
+				PreparedStatement insIface = db.connection().prepareStatement(
+					"INSERT INTO class_iface(class_id,iface_desc) VALUES(?,?)");
 				PreparedStatement insXref = db.connection().prepareStatement(
 					"INSERT INTO xrefs(target,kind,src_class_id) VALUES(?,?,?)");
 				PreparedStatement insSymbol = db.connection().prepareStatement(
@@ -143,6 +145,15 @@ public final class DexIndexer {
 					symbolId++;
 					addSymbol(insSymbol, insSymFts, symbolId, Db.KIND_CLASS, name, fqn, aliasFqn,
 							clsText.toString(), classId, null);
+
+					// Implemented interfaces (for find-usages override groups).
+					for (String iface : cls.getInterfaces()) {
+						insIface.setLong(1, classId);
+						insIface.setString(2, iface);
+						insIface.addBatch();
+						pending++;
+					}
+					insIface.executeBatch();
 
 					int fIdx = 0;
 					for (Field f : cls.getFields()) {

@@ -24,7 +24,7 @@ import java.util.List;
 public final class Db implements AutoCloseable {
 
 	/** Bump when the schema or the semantics of any indexed column change. */
-	public static final int SCHEMA_VERSION = 4;
+	public static final int SCHEMA_VERSION = 5;
 
 	// Symbol kinds (stored in symbols.kind and xrefs.target_kind).
 	public static final int KIND_CLASS = 0;
@@ -89,6 +89,11 @@ public final class Db implements AutoCloseable {
 					+ "type TEXT NOT NULL,"
 					+ "access INTEGER NOT NULL,"
 					+ "idx INTEGER NOT NULL)");
+			// Implemented interfaces per class → lets find-usages expand a method to its whole override
+			// group (calls made through a super/interface/subtype), so virtual-dispatch calls aren't missed.
+			st.execute("CREATE TABLE IF NOT EXISTS class_iface ("
+					+ "class_id INTEGER NOT NULL,"
+					+ "iface_desc TEXT NOT NULL)");
 			// Cross-references, deduped per (src_class, target): one row per referencing class, not per
 			// call site. find-usages is class-granular in fast mode, so this keeps the table small
 			// (thousands of duplicate StringBuilder.append edges collapse to one) without losing results.
@@ -135,6 +140,9 @@ public final class Db implements AutoCloseable {
 			st.execute("CREATE INDEX IF NOT EXISTS idx_methods_name ON methods(name)");
 			st.execute("CREATE INDEX IF NOT EXISTS idx_fields_class ON fields(class_id)");
 			st.execute("CREATE INDEX IF NOT EXISTS idx_xrefs_target ON xrefs(target)");
+			st.execute("CREATE INDEX IF NOT EXISTS idx_classes_super ON classes(super_desc)");
+			st.execute("CREATE INDEX IF NOT EXISTS idx_iface_desc ON class_iface(iface_desc)");
+			st.execute("CREATE INDEX IF NOT EXISTS idx_iface_class ON class_iface(class_id)");
 		}
 	}
 
@@ -268,6 +276,115 @@ public final class Db implements AutoCloseable {
 			this.srcClassFqn = srcClassFqn;
 			this.kind = kind;
 		}
+	}
+
+	/**
+	 * The override group of a method target key: the same {@code name(proto)ret} keyed against every
+	 * class in the method's type hierarchy (ancestors via superclass/interfaces, and descendants via
+	 * subclasses/implementors). Searching xrefs for ALL of these catches virtual-dispatch calls made
+	 * through a super/interface/subtype, which a single-key search misses. Bounded by {@code cap}.
+	 */
+	public synchronized List<String> overrideKeys(String targetKey, int cap) throws SQLException {
+		int arrow = targetKey.indexOf("->");
+		if (arrow < 0) {
+			return List.of(targetKey);
+		}
+		String declDesc = targetKey.substring(0, arrow);
+		String rest = targetKey.substring(arrow + 2); // name(proto)ret
+		java.util.LinkedHashSet<String> hier = new java.util.LinkedHashSet<>();
+		hier.add(declDesc);
+		// ancestors: superclass chain + interfaces, transitively
+		java.util.ArrayDeque<String> up = new java.util.ArrayDeque<>();
+		up.add(declDesc);
+		while (!up.isEmpty() && hier.size() < cap) {
+			String d = up.poll();
+			String sup = queryOne("SELECT super_desc FROM classes WHERE desc=?", d);
+			if (sup != null && !sup.equals("Ljava/lang/Object;") && hier.add(sup)) {
+				up.add(sup);
+			}
+			for (String iface : queryList(
+					"SELECT ci.iface_desc FROM class_iface ci JOIN classes c ON c.id=ci.class_id WHERE c.desc=?",
+					d)) {
+				if (hier.add(iface)) {
+					up.add(iface);
+				}
+			}
+		}
+		// descendants: subclasses + implementors, transitively
+		java.util.ArrayDeque<String> down = new java.util.ArrayDeque<>();
+		down.add(declDesc);
+		java.util.Set<String> seen = new java.util.HashSet<>(hier);
+		while (!down.isEmpty() && hier.size() < cap) {
+			String d = down.poll();
+			for (String sub : queryList("SELECT desc FROM classes WHERE super_desc=?", d)) {
+				if (seen.add(sub)) {
+					hier.add(sub);
+					down.add(sub);
+				}
+			}
+			for (String impl : queryList(
+					"SELECT c.desc FROM class_iface ci JOIN classes c ON c.id=ci.class_id WHERE ci.iface_desc=?",
+					d)) {
+				if (seen.add(impl)) {
+					hier.add(impl);
+					down.add(impl);
+				}
+			}
+		}
+		List<String> keys = new ArrayList<>(hier.size());
+		for (String h : hier) {
+			keys.add(h + "->" + rest);
+		}
+		return keys;
+	}
+
+	private String queryOne(String sql, String arg) throws SQLException {
+		try (PreparedStatement ps = conn.prepareStatement(sql)) {
+			ps.setString(1, arg);
+			try (ResultSet rs = ps.executeQuery()) {
+				return rs.next() ? rs.getString(1) : null;
+			}
+		}
+	}
+
+	private List<String> queryList(String sql, String arg) throws SQLException {
+		List<String> out = new ArrayList<>();
+		try (PreparedStatement ps = conn.prepareStatement(sql)) {
+			ps.setString(1, arg);
+			try (ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					out.add(rs.getString(1));
+				}
+			}
+		}
+		return out;
+	}
+
+	/** Referencing classes for ANY of the given target keys (deduped, class-granular). */
+	public synchronized List<XrefHit> xrefsToAny(List<String> targets, int limit) throws SQLException {
+		if (targets.isEmpty()) {
+			return List.of();
+		}
+		StringBuilder in = new StringBuilder();
+		for (int i = 0; i < targets.size(); i++) {
+			in.append(i == 0 ? "?" : ",?");
+		}
+		String sql = "SELECT DISTINCT c.desc,c.fqn,x.kind FROM xrefs x JOIN classes c ON c.id=x.src_class_id "
+				+ "WHERE x.target IN (" + in + ") LIMIT ?";
+		List<XrefHit> out = new ArrayList<>();
+		try (PreparedStatement ps = conn.prepareStatement(sql)) {
+			int i = 1;
+			for (String t : targets) {
+				ps.setString(i++, t);
+			}
+			ps.setInt(i, limit);
+			try (ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					out.add(new XrefHit(rs.getString(1), rs.getString(2), rs.getInt(3)));
+				}
+			}
+		}
+		return out;
 	}
 
 	/** The (deduped, class-granular) classes that reference {@code target}. */

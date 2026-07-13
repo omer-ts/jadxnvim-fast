@@ -199,8 +199,8 @@ public final class Renderer {
 	 * annotates the references) and reads the code metadata to recover exact line/col + the code line
 	 * text — the data that makes find-usages navigable, resolved on demand for just this one class.
 	 */
-	public java.util.List<Usage> findUsageSites(String refClassDesc, String refHint, String targetKey)
-			throws Exception {
+	public java.util.List<Usage> findUsageSites(String refClassDesc, String refHint,
+			java.util.Set<String> targetKeys) throws Exception {
 		String fqn = DexIndexer.descToFqn(refClassDesc);
 		File miniDex = new File(workDir, "usages-" + tmpSeq.incrementAndGet() + ".dex");
 		try {
@@ -245,7 +245,7 @@ public final class Renderer {
 						continue;
 					}
 					ResolvedSymbol s = symbolOf(node);
-					if (s == null || !targetKey.equals(s.targetKey)) {
+					if (s == null || !targetKeys.contains(s.targetKey)) {
 						continue;
 					}
 					int[] lc = Positions.toLineCol(code, off);
