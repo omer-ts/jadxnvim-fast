@@ -199,15 +199,15 @@ public final class Renderer {
 	 * annotates the references) and reads the code metadata to recover exact line/col + the code line
 	 * text — the data that makes find-usages navigable, resolved on demand for just this one class.
 	 */
-	public java.util.List<Usage> findUsageSites(String refClassDesc, java.util.Set<String> targetKeys)
-			throws Exception {
+	public java.util.List<Usage> findUsageSites(String refClassDesc, java.util.Set<String> candidateTargets,
+			java.util.Set<String> targetKeys) throws Exception {
 		String fqn = DexIndexer.descToFqn(refClassDesc);
 		File miniDex = new File(workDir, "usages-" + tmpSeq.incrementAndGet() + ".dex");
 		try {
-			// Render the referencing class with its full closure — the same rendering getCode() uses —
-			// so the reported line/col match the buffer the user opens, and the target class (which this
-			// class references) is loaded so its references are annotated.
-			int n = extractor.extractWithClosure(refClassDesc, miniDex);
+			// Light render: the referencing class + only the target classes it references (enough to
+			// annotate the calls to the target). Much cheaper than its full closure; the reported line/col
+			// may differ slightly from getCode()'s buffer, so the caller re-locates by the code line text.
+			int n = extractor.extractForUsages(refClassDesc, candidateTargets, miniDex);
 			if (n == 0) {
 				return java.util.List.of();
 			}

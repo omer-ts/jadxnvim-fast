@@ -165,6 +165,35 @@ public final class MiniDexExtractor {
 		return picked.size();
 	}
 
+	/**
+	 * Light extraction for find-usages: the referencing class family plus only the target classes it
+	 * actually references (the intersection of its own references with {@code candidateTargets}, the
+	 * override group's declaring classes). Just enough for jadx to annotate the calls to the target,
+	 * without pulling in the ref class's full closure — so rendering a referencing class is a few
+	 * classes instead of hundreds. Returns classes written (0 if the ref class is missing).
+	 */
+	public int extractForUsages(String refClassDesc, Set<String> candidateTargets, File outDex)
+			throws Exception {
+		ensureMaps();
+		List<ClassDef> picked = new ArrayList<>();
+		Set<String> types = new java.util.HashSet<>();
+		addFamily(refClassDesc, picked, types);
+		if (picked.isEmpty()) {
+			return 0;
+		}
+		Set<String> refs = new java.util.HashSet<>();
+		for (ClassDef cd : new ArrayList<>(picked)) {
+			collectRefs(cd, refs);
+		}
+		for (String t : refs) {
+			if (candidateTargets.contains(t) && !types.contains(t)) {
+				addFamily(t, picked, types);
+			}
+		}
+		write(picked, outDex);
+		return picked.size();
+	}
+
 	private void write(List<ClassDef> picked, File outDex) throws Exception {
 		outDex.getAbsoluteFile().getParentFile().mkdirs();
 		DexPool.writeTo(outDex.getAbsolutePath(), new ImmutableDexFile(opcodes, picked));

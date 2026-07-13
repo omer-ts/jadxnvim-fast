@@ -313,9 +313,11 @@ end
 -- inlining is non-deterministic under parallel export), so a search hit's line number is only
 -- approximate. When we have the matched line's text, re-locate it in the actual buffer (nearest to
 -- the approximate line) so the cursor always lands on what you searched for.
+-- Nearest line whose trimmed text equals the snippet, or nil if none matches (so the caller can fall
+-- back to a name-based relocation instead of a stale approximate line).
 local function locate_line(bufnr, snippet, approx)
   if not snippet or snippet == "" then
-    return approx
+    return nil
   end
   local target = vim.trim(snippet)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
@@ -328,7 +330,7 @@ local function locate_line(bufnr, snippet, approx)
       end
     end
   end
-  return best or approx
+  return best
 end
 
 -- Locate a method declaration line by name (nearest `approx`): `name(` at a word boundary that
@@ -370,10 +372,17 @@ local function open_named(name, opts)
     vim.cmd("edit " .. vim.fn.fnameescape(name))
   end
   local bufnr = vim.api.nvim_get_current_buf()
+  -- Relocate to the exact line by snippet text; if that snippet isn't in this buffer (an on-demand
+  -- render can differ slightly from the one the position was computed against), fall back to the
+  -- referenced member's name so the cursor still lands on the call rather than a stale line.
   if opts.find then
-    opts.line = locate_line(bufnr, opts.find, opts.line)
-  end
-  if opts.find_method then
+    local exact = locate_line(bufnr, opts.find, opts.line)
+    if exact then
+      opts.line = exact
+    elseif opts.find_method then
+      opts.line = locate_method_line(bufnr, opts.find_method, opts.line)
+    end
+  elseif opts.find_method then
     opts.line = locate_method_line(bufnr, opts.find_method, opts.line)
   end
   if opts.source_line then

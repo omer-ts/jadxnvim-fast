@@ -382,10 +382,18 @@ final class V2Engine {
 			refClasses.add(top);
 		}
 
-		// Render only the first RENDER_CAP referencing classes for precise per-call-site lines (each
-		// render is a full-closure decompile, so an interface with thousands of implementors would
-		// otherwise take minutes). Every remaining referencing class is still listed (class-granular);
-		// opening it relocates to the symbol by name. So find-usages stays complete AND bounded.
+		// Declaring classes of the override group — the candidate targets a referencing class might call.
+		java.util.Set<String> candidateTargets = new java.util.HashSet<>();
+		for (String key : targetKeys) {
+			int arrow = key.indexOf("->");
+			if (arrow > 0) {
+				candidateTargets.add(key.substring(0, arrow));
+			}
+		}
+
+		// Render only the first RENDER_CAP referencing classes for precise per-call-site lines. Every
+		// remaining referencing class is still listed (class-granular); opening it relocates to the
+		// symbol by name. So find-usages stays complete AND bounded.
 		List<String> ordered = new ArrayList<>(refClasses);
 		int renderN = Math.min(RENDER_CAP, ordered.size());
 
@@ -403,7 +411,7 @@ final class V2Engine {
 				futures.add(pool.submit(() -> {
 					String d = descOf(top);
 					java.util.List<Renderer.Usage> sites =
-							renderer.findUsageSites(d, targetKeys);
+							renderer.findUsageSites(d, candidateTargets, targetKeys);
 					return new Object[] { top, sites };
 				}));
 			}
@@ -422,7 +430,7 @@ final class V2Engine {
 					usages.add(classGranularHit(top, sym.rawName));
 				} else {
 					for (Renderer.Usage u : sites) {
-						usages.add(preciseHit(top, u.line, u.col, u.text));
+						usages.add(preciseHit(top, u.line, u.col, u.text, sym.rawName));
 						if (usages.size() >= MAX_USAGES) {
 							truncated = true;
 							break;
@@ -446,8 +454,9 @@ final class V2Engine {
 		return result;
 	}
 
-	// A precise call site: exact line/col + the code line, re-located in the buffer via `find`.
-	private static Map<String, Object> preciseHit(String id, int line, int col, String text) {
+	// A precise call site: exact line/col + the code line (relocated via `find`), with the symbol name
+	// as a fallback (`member`) in case the light render's line text doesn't match the opened buffer.
+	private static Map<String, Object> preciseHit(String id, int line, int col, String text, String member) {
 		Map<String, Object> u = new LinkedHashMap<>();
 		u.put("id", id);
 		u.put("fullName", id);
@@ -455,6 +464,7 @@ final class V2Engine {
 		u.put("col", col);
 		u.put("text", text);
 		u.put("find", text); // relocate by the code line
+		u.put("member", member); // fallback: relocate to the referenced member by name
 		return u;
 	}
 
