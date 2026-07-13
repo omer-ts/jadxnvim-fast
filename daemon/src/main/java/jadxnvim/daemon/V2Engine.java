@@ -430,7 +430,7 @@ final class V2Engine {
 					usages.add(classGranularHit(top, sym.rawName));
 				} else {
 					for (Renderer.Usage u : sites) {
-						usages.add(preciseHit(top, u.line, u.col, u.text, sym.rawName));
+						usages.add(preciseHit(top, u.line, u.col, u.text, sym.rawName, u.ordinal));
 						if (usages.size() >= MAX_USAGES) {
 							truncated = true;
 							break;
@@ -454,9 +454,11 @@ final class V2Engine {
 		return result;
 	}
 
-	// A precise call site: exact line/col + the code line (relocated via `find`), with the symbol name
-	// as a fallback (`member`) in case the light render's line text doesn't match the opened buffer.
-	private static Map<String, Object> preciseHit(String id, int line, int col, String text, String member) {
+	// A precise call site: exact line/col + the code line (relocated via `find`). If the light render's
+	// line text doesn't match the opened buffer, `ordinal` (the k-th call to the member in this class,
+	// source order) relocates to the k-th call; `member` is the last-resort name relocation.
+	private static Map<String, Object> preciseHit(String id, int line, int col, String text, String member,
+			int ordinal) {
 		Map<String, Object> u = new LinkedHashMap<>();
 		u.put("id", id);
 		u.put("fullName", id);
@@ -465,6 +467,7 @@ final class V2Engine {
 		u.put("text", text);
 		u.put("find", text); // relocate by the code line
 		u.put("member", member); // fallback: relocate to the referenced member by name
+		u.put("ordinal", ordinal); // fallback: relocate to the k-th call of the member
 		return u;
 	}
 

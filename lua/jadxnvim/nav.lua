@@ -246,17 +246,21 @@ function M.find_usages()
           id = u.id,
           line = u.line,
           col = u.col,
-          -- `find` (the code line) re-locates a precise call site by text; `member` (the symbol name)
-          -- re-locates a class-granular hit (one not rendered for exact lines) by the referenced name.
+          -- `find` (the code line) re-locates a precise call site by text; if it doesn't match, the
+          -- k-th call (`find_ordinal` + `member`) then the nearest by name keep the cursor on the call.
           -- Fall back to u.text for the legacy engine, whose usages carry the source line as text.
           find = u.find or u.text,
           member = u.member,
+          find_ordinal = u.ordinal,
         }
       end
       local title = string.format(" Usages of %s (%d%s) ", name, #usages, res.truncated and "+" or "")
       local on_open = function(it)
-        -- Re-locate in the opened buffer: by the code line for precise sites, else by the symbol name.
-        code.open(it.id, { line = it.line, col = it.col, find = it.find, find_method = it.member })
+        -- Re-locate in the opened buffer: by the code line for precise sites, else the k-th call.
+        code.open(it.id, {
+          line = it.line, col = it.col,
+          find = it.find, find_method = it.member, find_ordinal = it.find_ordinal,
+        })
       end
       -- For <C-f> (Frida) in the usages picker, hook the searched symbol itself: the target method
       -- (all overloads) or the whole class — not each call site.

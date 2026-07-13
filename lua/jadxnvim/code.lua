@@ -333,6 +333,31 @@ local function locate_line(bufnr, snippet, approx)
   return best
 end
 
+-- The line of the `n`-th call to `name` in the buffer (a `name(` that isn't a declaration — i.e.
+-- preceded by `.`/`(`/space, not a return type). Calls are counted in source order, so this maps a
+-- usage's ordinal (k-th call to the target in its class) onto the k-th call in the opened buffer even
+-- when the on-demand render's line text didn't match — keeping distinct usages on distinct call sites.
+local function locate_nth_call(bufnr, name, n)
+  if not (name and name ~= "" and n and n >= 1) then
+    return nil
+  end
+  local esc = vim.pesc(name)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local count = 0
+  for i, l in ipairs(lines) do
+    -- a call: `name(` preceded by `.`, `(`, `,`, space, etc. — not another identifier char and not a
+    -- declaration (a declaration has a return type before the name, e.g. `void name(`).
+    local s = l:find("[%.%(%[,%s=+%-*/!&|?:{}]" .. esc .. "%s*%(") or l:find("^%s*" .. esc .. "%s*%(")
+    if s and not l:find("[%w_%.>%]]%s+" .. esc .. "%s*%(") then
+      count = count + 1
+      if count == n then
+        return i
+      end
+    end
+  end
+  return nil -- fewer calls than n (renders disagree on count) — caller falls back
+end
+
 -- Locate a method declaration line by name (nearest `approx`): `name(` at a word boundary that
 -- isn't a call. Keeps navigation on the real declaration even if this buffer's copy decompiled
 -- slightly differently from the position the daemon computed.
@@ -374,13 +399,17 @@ local function open_named(name, opts)
   local bufnr = vim.api.nvim_get_current_buf()
   -- Relocate to the exact line by snippet text; if that snippet isn't in this buffer (an on-demand
   -- render can differ slightly from the one the position was computed against), fall back to the
-  -- referenced member's name so the cursor still lands on the call rather than a stale line.
+  -- k-th call of the referenced member (find_ordinal), then to the nearest occurrence by name — so the
+  -- cursor still lands on the intended call rather than a stale line.
   if opts.find then
     local exact = locate_line(bufnr, opts.find, opts.line)
     if exact then
       opts.line = exact
-    elseif opts.find_method then
-      opts.line = locate_method_line(bufnr, opts.find_method, opts.line)
+    else
+      opts.line = (opts.find_ordinal and opts.find_method
+            and locate_nth_call(bufnr, opts.find_method, opts.find_ordinal))
+        or (opts.find_method and locate_method_line(bufnr, opts.find_method, opts.line))
+        or opts.line
     end
   elseif opts.find_method then
     opts.line = locate_method_line(bufnr, opts.find_method, opts.line)

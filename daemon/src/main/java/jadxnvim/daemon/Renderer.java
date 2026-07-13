@@ -46,11 +46,13 @@ public final class Renderer {
 		public final int line;
 		public final int col;
 		public final String text;
+		public final int ordinal; // 1-based index of this call-line among the target's calls, source order
 
-		Usage(int line, int col, String text) {
+		Usage(int line, int col, String text, int ordinal) {
 			this.line = line;
 			this.col = col;
 			this.text = text;
+			this.ordinal = ordinal;
 		}
 	}
 
@@ -230,8 +232,9 @@ public final class Renderer {
 				}
 				String code = info.getCodeStr();
 				String[] lines = code.split("\n", -1);
-				java.util.List<Usage> out = new ArrayList<>();
-				java.util.Set<Integer> seenLines = new java.util.HashSet<>();
+				// Collect the offsets of references to the target, then process them in source (offset)
+				// order so each usage's ordinal is its position among the target's calls in this class.
+				java.util.List<Integer> offs = new ArrayList<>();
 				for (Map.Entry<Integer, ICodeAnnotation> e : md.getAsMap().entrySet()) {
 					ICodeAnnotation.AnnType t = e.getValue().getAnnType();
 					// References only (not the declaration itself).
@@ -248,12 +251,20 @@ public final class Renderer {
 					if (s == null || !targetKeys.contains(s.targetKey)) {
 						continue;
 					}
+					offs.add(off);
+				}
+				java.util.Collections.sort(offs);
+				java.util.List<Usage> out = new ArrayList<>();
+				java.util.Set<Integer> seenLines = new java.util.HashSet<>();
+				int ordinal = 0;
+				for (int off : offs) {
 					int[] lc = Positions.toLineCol(code, off);
 					if (!seenLines.add(lc[0])) {
 						continue; // one entry per line
 					}
+					ordinal++;
 					String text = lc[0] >= 1 && lc[0] <= lines.length ? lines[lc[0] - 1].strip() : "";
-					out.add(new Usage(lc[0], lc[1], text));
+					out.add(new Usage(lc[0], lc[1], text, ordinal));
 				}
 				return out;
 			}
