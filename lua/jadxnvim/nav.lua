@@ -207,26 +207,60 @@ function M.goto_def()
   end)
 end
 
+-- Candidate task ids for a dispatcher construction at `line`: the integer LITERALS on the call
+-- lines, plus a light dataflow trace — for each variable passed as an argument, the constant it was
+-- most recently assigned above the call (so `int i2 = 5; ... new X.Y(a, i2)` resolves too). The
+-- daemon keeps only the candidate that is a real case in the dispatch switch, so over-collecting is
+-- harmless.
+local function gather_task_ids(buf, line)
+  local ints, seen = {}, {}
+  local function add(n)
+    n = tonumber(n)
+    if n and not seen[n] then
+      seen[n] = true
+      ints[#ints + 1] = n
+    end
+  end
+  -- the call may wrap over a few lines
+  local ctx = vim.api.nvim_buf_get_lines(buf, line - 1, line + 2, false)
+  local vars = {}
+  for _, l in ipairs(ctx) do
+    for n in (" " .. l):gmatch("[^%w_%.](%d+)") do
+      add(n) -- literal args
+    end
+    for v in l:gmatch("([%a_][%w_]*)%s*[,%)]") do
+      vars[v] = true -- identifiers in argument position -> trace them
+    end
+  end
+  -- trace each argument variable to its nearest constant assignment above the call (bounded window)
+  local top = math.max(0, line - 400)
+  local up = vim.api.nvim_buf_get_lines(buf, top, line, false)
+  for v in pairs(vars) do
+    local esc = vim.pesc(v)
+    for i = #up, 1, -1 do
+      local n = up[i]:match("[^%w_%.]" .. esc .. "%s*=%s*(%-?%d+)%s*;")
+        or up[i]:match("^%s*" .. esc .. "%s*=%s*(%-?%d+)%s*;")
+      if n then
+        add(n)
+        break
+      end
+    end
+  end
+  return ints
+end
+
 -- Resolve a merged-lambda/-callback dispatcher call to the branch it actually runs. Optimizers
 -- (R8 / Meta's Redex) merge many lambdas into one class dispatched by an integer id
 -- (`switch (this.$t)`), so a call like `new X.Uez(.., 5)` means "run case 5 of X.Uez". Put the cursor
 -- on the dispatcher class name in the construction and this jumps to `case 5:` in its dispatch switch.
+-- The id may be a literal or a variable assigned a constant nearby (traced by gather_task_ids).
 function M.resolve_task()
   local id, line, col = code.cursor_target()
   if not id then
     notify("not in a jadx code buffer", vim.log.levels.WARN)
     return
   end
-  -- Integer literals near the cursor (the call's args may wrap over a few lines) are the candidate
-  -- task ids; the daemon keeps only the one that is a real case in the dispatch switch.
-  local buf = vim.api.nvim_get_current_buf()
-  local ctx = vim.api.nvim_buf_get_lines(buf, line - 1, line + 2, false)
-  local ints = {}
-  for _, l in ipairs(ctx) do
-    for n in (" " .. l):gmatch("[^%w_%.](%d+)") do
-      ints[#ints + 1] = tonumber(n)
-    end
-  end
+  local ints = gather_task_ids(vim.api.nvim_get_current_buf(), line)
   rpc.request("resolveTask", { id = id, line = line, col = col, taskIds = ints }, function(err, res)
     vim.schedule(function()
       if err then
