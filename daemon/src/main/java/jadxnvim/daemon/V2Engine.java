@@ -445,8 +445,11 @@ final class V2Engine {
 				String top = ordered.get(i);
 				futures.add(pool.submit(() -> {
 					String d = descOf(top);
+					// Pass the member name for methods so the renderer can recover a precise call line by
+					// text when jadx can't annotate the call (e.g. a call through a framework base type).
+					String memberName = sym.kind == Db.KIND_METHOD ? sym.rawName : null;
 					java.util.List<Renderer.Usage> sites =
-							renderer.findUsageSites(d, candidateTargets, targetKeys);
+							renderer.findUsageSites(d, candidateTargets, targetKeys, memberName);
 					return new Object[] { top, sites };
 				}));
 			}
@@ -824,7 +827,7 @@ final class V2Engine {
 			for (int i = 0; i < renderN; i++) {
 				String top = ordered.get(i);
 				futures.add(pool.submit(() -> new Object[] { top,
-						renderer.findCallerMethods(descOf(top), candidateTargets, targetKeys) }));
+						renderer.findCallerMethods(descOf(top), candidateTargets, targetKeys, targetRawName) }));
 			}
 			for (java.util.concurrent.Future<Object[]> f : futures) {
 				Object[] r;
