@@ -443,14 +443,25 @@ local function expand_callers(node, cb)
   end)
 end
 
--- Build hierarchy nodes for a list of caller entries from the daemon.
+-- Collapse whitespace and clip a call-site line for compact display.
+local function trunc(s, n)
+  s = (s or ""):gsub("%s+", " "):gsub("^%s+", "")
+  if #s > n then
+    return s:sub(1, n - 1) .. "…"
+  end
+  return s
+end
+
+-- Build hierarchy nodes for a list of caller entries from the daemon. Method-resolved callers show
+-- the call-site code (relocated on open by that text, so the line number — which comes from a lighter
+-- render than the opened buffer — is deliberately not shown); class-granular callers show the class.
 function M._caller_nodes(callers)
   local icons = require("jadxnvim.icons")
   local nodes = {}
   for _, c in ipairs(callers or {}) do
     local label = c.fullName or c.name or c.id
-    if c.line and c.line > 1 then
-      label = label .. ":" .. c.line
+    if c.key and c.text and c.text ~= "" then
+      label = label .. "   " .. trunc(c.text, 60)
     end
     nodes[#nodes + 1] = {
       label = label,
@@ -474,6 +485,9 @@ function M.call_hierarchy()
     notify("not in a jadx code buffer", vim.log.levels.WARN)
     return
   end
+  -- Resolving the caller methods renders the top referencing classes, which can take a few seconds on
+  -- a very hot method — let the user know the (async) work is underway.
+  notify("resolving callers…", vim.log.levels.INFO)
   rpc.request("callHierarchy", { id = id, line = line, col = col }, function(err, res)
     vim.schedule(function()
       if err then
@@ -493,6 +507,7 @@ function M.call_hierarchy()
         icon = icons.get("method"),
         openable = res.root ~= nil,
         id = res.root and res.root.id,
+        member = res.root and res.root.name, -- open the method's declaration, not just its class
         expandable = #children > 0,
         children = #children > 0 and children or nil,
         _open = true,

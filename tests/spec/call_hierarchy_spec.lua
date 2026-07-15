@@ -102,6 +102,12 @@ H.spec_fast(function(win)
       local shown_win = vim.fn.bufwinid(cbuf)
       H.check("caller opened outside the hierarchy panel",
         shown_win ~= -1 and not vim.b[vim.api.nvim_win_get_buf(shown_win)].jadx_hierarchy)
+      -- the cursor relocated onto the actual call site (a line that calls process), not line 1
+      if shown_win ~= -1 then
+        local cl = vim.api.nvim_win_get_cursor(shown_win)[1]
+        local text = (vim.api.nvim_buf_get_lines(cbuf, cl - 1, cl, false))[1] or ""
+        H.check("cursor landed on the call site", text:find("process%s*%(") ~= nil, cl .. ": " .. text)
+      end
     end
   end
 end)
