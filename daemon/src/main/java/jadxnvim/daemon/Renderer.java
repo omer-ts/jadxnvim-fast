@@ -238,7 +238,7 @@ public final class Renderer {
 	 * text — the data that makes find-usages navigable, resolved on demand for just this one class.
 	 */
 	public java.util.List<Usage> findUsageSites(String refClassDesc, java.util.Set<String> candidateTargets,
-			java.util.Set<String> targetKeys) throws Exception {
+			java.util.Set<String> targetKeys, String memberName) throws Exception {
 		String fqn = DexIndexer.descToFqn(refClassDesc);
 		File miniDex = new File(workDir, "usages-" + tmpSeq.incrementAndGet() + ".dex");
 		try {
@@ -302,6 +302,14 @@ public final class Renderer {
 					String text = lc[0] >= 1 && lc[0] <= lines.length ? lines[lc[0] - 1].strip() : "";
 					out.add(new Usage(lc[0], lc[1], text, ordinal));
 				}
+				// Fallback: jadx couldn't annotate any call, but the xref index says this class DOES
+				// reference the target — typically a call to a FRAMEWORK method (e.g. an overridden
+				// onReceive invoked through android.content.BroadcastReceiver), which the mini-dex can't
+				// resolve because the framework class isn't in it. Recover the call line(s) by scanning
+				// for the member invoked as a call, so the usage lands precisely instead of at line 1.
+				if (out.isEmpty() && memberName != null && !memberName.isEmpty()) {
+					out.addAll(scanCallSites(lines, memberName));
+				}
 				return out;
 			}
 		} finally {
@@ -343,7 +351,7 @@ public final class Renderer {
 	 * method (its first call site).
 	 */
 	public java.util.List<Caller> findCallerMethods(String refClassDesc, java.util.Set<String> candidateTargets,
-			java.util.Set<String> targetKeys) throws Exception {
+			java.util.Set<String> targetKeys, String memberName) throws Exception {
 		String fqn = DexIndexer.descToFqn(refClassDesc);
 		File miniDex = new File(workDir, "callers-" + tmpSeq.incrementAndGet() + ".dex");
 		try {
@@ -396,6 +404,14 @@ public final class Renderer {
 					}
 					offs.add(off);
 				}
+				// Fallback (same as find-usages): if jadx annotated no call but the xref index says this
+				// class references the target — typically a call through a framework base type the mini-dex
+				// can't resolve — recover the call offsets by text so the caller method still resolves.
+				if (offs.isEmpty() && memberName != null && !memberName.isEmpty()) {
+					for (Usage u : scanCallSites(lines, memberName)) {
+						offs.add(Positions.toOffset(code, u.line, u.col));
+					}
+				}
 				java.util.Collections.sort(offs);
 
 				java.util.List<Caller> out = new ArrayList<>();
@@ -429,6 +445,25 @@ public final class Renderer {
 				// best effort
 			}
 		}
+	}
+
+	// Text fallback for a member invoked as a call (`obj.member(` or a bare `member(` that isn't a
+	// declaration), used when jadx can't annotate the call (framework-typed receiver). One Usage per
+	// matching line, in source order, so ordinals and code-line relocation still work.
+	private static java.util.List<Usage> scanCallSites(String[] lines, String member) {
+		java.util.List<Usage> out = new ArrayList<>();
+		java.util.regex.Pattern dotted = java.util.regex.Pattern.compile(
+				"\\." + java.util.regex.Pattern.quote(member) + "\\s*\\(");
+		int ordinal = 0;
+		for (int i = 0; i < lines.length; i++) {
+			java.util.regex.Matcher m = dotted.matcher(lines[i]);
+			if (m.find()) {
+				ordinal++;
+				int col = m.start() + 1; // position of the member name (after the '.')
+				out.add(new Usage(i + 1, col, lines[i].strip(), ordinal));
+			}
+		}
+		return out;
 	}
 
 	private static void collectMethods(JavaClass cls, java.util.List<JavaMethod> out) {

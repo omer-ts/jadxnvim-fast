@@ -319,54 +319,165 @@ final class V2Engine {
 
 	private Map<String, Object> gotoDef(String id, int line, int col) throws Exception {
 		Map<String, Object> result = new LinkedHashMap<>();
-		String desc = descOf(id);
-		Renderer.ResolvedSymbol sym = renderer.resolveAt(desc, line, col);
+		Renderer.ResolvedSymbol sym = renderer.resolveAt(descOf(id), line, col);
 		if (sym == null) {
-			result.put("found", false);
-			return result;
+			// jadx couldn't resolve the symbol (e.g. a virtual call through a framework/unresolved type,
+			// like receiver.onReceive() on an android.content.BroadcastReceiver field). Fall back to a
+			// name-based go-to-implementations off the rendered token.
+			return gotoDefByName(id, line, col);
 		}
 		String topFqn = topLevel(DexIndexer.descToFqn(sym.declClassDesc));
 		String topDesc = descOf(topFqn);
-		if (db.classIdOf(topDesc) < 0) {
-			// Declaring class is not in this APK (a framework/library type) — nothing to open.
-			result.put("found", false);
+		// go-to-implementations across the type hierarchy (for a method): declaration + overrides.
+		List<Map<String, Object>> impls = sym.kind == Db.KIND_METHOD ? implTargets(sym) : List.of();
+
+		if (db.classIdOf(topDesc) >= 0) {
+			Renderer.Pos pos = renderer.declarationPos(topDesc, sym);
+			result.put("found", true);
+			result.put("kind", kindName(sym.kind));
+			result.put("name", sym.displayName);
+			result.put("id", topFqn);
+			result.put("line", pos.line);
+			result.put("col", pos.col);
+			if (impls.size() > 1) {
+				result.put("targets", impls);
+			}
 			return result;
 		}
-		Renderer.Pos pos = renderer.declarationPos(topDesc, sym);
-		result.put("found", true);
-		result.put("kind", kindName(sym.kind));
-		result.put("name", sym.displayName);
-		result.put("id", topFqn);
-		result.put("line", pos.line);
-		result.put("col", pos.col);
+		// Declaring class is a framework/library type not in this APK. If the method has implementations
+		// in the APK (overrides), jump there instead of failing; else try a name-based match.
+		if (!impls.isEmpty()) {
+			return methodTargetsResult(sym.displayName, sym.rawName, impls);
+		}
+		return gotoDefByName(id, line, col);
+	}
 
-		// go-to-implementations: for a method, offer every class that declares/overrides it (the
-		// declaration + concrete implementations across the type hierarchy), so gd on an abstract or
-		// interface method lets you jump to any implementation rather than just the declaration.
-		if (sym.kind == Db.KIND_METHOD) {
-			List<Db.ImplHit> impls = db.implementations(sym.targetKey, 400);
-			if (impls.size() > 1) {
-				List<Map<String, Object>> targets = new ArrayList<>();
-				java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
-				for (Db.ImplHit im : impls) {
-					String implTop = topLevel(im.fqn);
-					if (!seen.add(implTop)) {
+	// The implementation targets for a resolved method: its declaring class + every APK class that
+	// overrides it, deduped by top-level class. (Buffers are per top-level class; the frontend
+	// relocates to the method by name on open.)
+	private List<Map<String, Object>> implTargets(Renderer.ResolvedSymbol sym) throws Exception {
+		List<Db.ImplHit> impls = db.implementations(sym.targetKey, 400);
+		List<Map<String, Object>> targets = new ArrayList<>();
+		java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+		for (Db.ImplHit im : impls) {
+			String implTop = topLevel(im.fqn);
+			if (!seen.add(implTop)) {
+				continue;
+			}
+			Map<String, Object> t = new LinkedHashMap<>();
+			t.put("id", implTop);
+			t.put("fullName", im.fqn);
+			t.put("name", sym.displayName);
+			t.put("rawName", sym.rawName);
+			t.put("abstract", (im.access & 0x0400) != 0); // ACC_ABSTRACT
+			targets.add(t);
+		}
+		return targets;
+	}
+
+	// Build a go-to-def result from a set of method targets (jump to the first; picker if >1). id/line
+	// are the first target's; the frontend relocates to the declaration by member name.
+	private static Map<String, Object> methodTargetsResult(String name, String rawName,
+			List<Map<String, Object>> targets) {
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("found", true);
+		result.put("kind", "method");
+		result.put("name", name);
+		result.put("id", targets.get(0).get("id"));
+		result.put("member", rawName);
+		result.put("line", 1);
+		result.put("col", 0);
+		if (targets.size() > 1) {
+			result.put("targets", targets);
+		}
+		return result;
+	}
+
+	/**
+	 * Go-to-def fallback when jadx can't resolve the symbol: if the token under the cursor is a method
+	 * call, offer every APK class that declares a method with that name (go-to-implementations by name).
+	 * This recovers navigation for calls made through a framework/unresolved receiver type, which the
+	 * mini-dex render can't annotate.
+	 */
+	private Map<String, Object> gotoDefByName(String hostId, int line, int col) throws Exception {
+		Map<String, Object> notFound = new LinkedHashMap<>();
+		notFound.put("found", false);
+		String code;
+		try {
+			code = renderClass(hostId);
+		} catch (Exception e) {
+			return notFound;
+		}
+		String[] lines = code.split("\n", -1);
+		if (line < 1 || line > lines.length) {
+			return notFound;
+		}
+		String ln = lines[line - 1];
+		if (col < 0 || col > ln.length()) {
+			return notFound;
+		}
+		int s = col;
+		int e = col;
+		while (s > 0 && isIdentChar(ln.charAt(s - 1))) {
+			s--;
+		}
+		while (e < ln.length() && isIdentChar(ln.charAt(e))) {
+			e++;
+		}
+		if (s >= e) {
+			return notFound;
+		}
+		String name = ln.substring(s, e);
+		// Only method calls: the next non-space char after the identifier must be '('.
+		int k = e;
+		while (k < ln.length() && Character.isWhitespace(ln.charAt(k))) {
+			k++;
+		}
+		if (k >= ln.length() || ln.charAt(k) != '(') {
+			return notFound;
+		}
+		List<Map<String, Object>> targets = methodTargetsByName(name, 60);
+		if (targets.isEmpty()) {
+			return notFound;
+		}
+		return methodTargetsResult(name, name, targets);
+	}
+
+	private static boolean isIdentChar(char c) {
+		return Character.isJavaIdentifierPart(c) || c == '$';
+	}
+
+	// APK classes (deduped by top-level) that declare a method with the given name.
+	private List<Map<String, Object>> methodTargetsByName(String name, int cap) throws Exception {
+		List<Map<String, Object>> out = new ArrayList<>();
+		java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+		String sql = "SELECT c.fqn, m.access FROM methods m JOIN classes c ON c.id=m.class_id "
+				+ "WHERE m.name=? ORDER BY c.fqn LIMIT ?";
+		try (PreparedStatement ps = db.connection().prepareStatement(sql)) {
+			ps.setString(1, name);
+			ps.setInt(2, cap * 4);
+			try (ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					String fqn = rs.getString(1);
+					int access = rs.getInt(2);
+					String top = topLevel(fqn);
+					if (!seen.add(top)) {
 						continue;
 					}
 					Map<String, Object> t = new LinkedHashMap<>();
-					t.put("id", implTop);
-					t.put("fullName", im.fqn);
-					t.put("name", sym.displayName);
-					t.put("rawName", sym.rawName);
-					t.put("abstract", (im.access & 0x0400) != 0); // ACC_ABSTRACT
-					targets.add(t);
-				}
-				if (targets.size() > 1) {
-					result.put("targets", targets);
+					t.put("id", top);
+					t.put("fullName", fqn);
+					t.put("name", name);
+					t.put("rawName", name);
+					t.put("abstract", (access & 0x0400) != 0);
+					out.add(t);
+					if (out.size() >= cap) {
+						break;
+					}
 				}
 			}
 		}
-		return result;
+		return out;
 	}
 
 	private Map<String, Object> findUsages(String id, int line, int col) throws Exception {
@@ -445,8 +556,11 @@ final class V2Engine {
 				String top = ordered.get(i);
 				futures.add(pool.submit(() -> {
 					String d = descOf(top);
+					// Pass the member name for methods so the renderer can recover a precise call line by
+					// text when jadx can't annotate the call (e.g. a call through a framework base type).
+					String memberName = sym.kind == Db.KIND_METHOD ? sym.rawName : null;
 					java.util.List<Renderer.Usage> sites =
-							renderer.findUsageSites(d, candidateTargets, targetKeys);
+							renderer.findUsageSites(d, candidateTargets, targetKeys, memberName);
 					return new Object[] { top, sites };
 				}));
 			}
@@ -824,7 +938,7 @@ final class V2Engine {
 			for (int i = 0; i < renderN; i++) {
 				String top = ordered.get(i);
 				futures.add(pool.submit(() -> new Object[] { top,
-						renderer.findCallerMethods(descOf(top), candidateTargets, targetKeys) }));
+						renderer.findCallerMethods(descOf(top), candidateTargets, targetKeys, targetRawName) }));
 			}
 			for (java.util.concurrent.Future<Object[]> f : futures) {
 				Object[] r;
