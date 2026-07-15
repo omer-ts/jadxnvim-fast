@@ -184,7 +184,7 @@ local function capture_session()
       end
     end
   end
-  return { buffers = buffers, active = active }
+  return { buffers = buffers, active = active, history = require("jadxnvim.searches").export() }
 end
 
 local function save_session()
@@ -197,8 +197,9 @@ local function save_session()
     return
   end
   local snap = capture_session()
-  -- Don't clobber a good session with an empty snapshot (e.g. after a daemon crash wiped buffers).
-  if #snap.buffers > 0 then
+  -- Don't clobber a good session with an empty snapshot (e.g. after a daemon crash wiped buffers),
+  -- but do persist a non-empty search history even with no open tabs.
+  if #snap.buffers > 0 or (snap.history and #snap.history > 0) then
     session.save(M._project, snap)
   end
 end
@@ -209,7 +210,15 @@ local function restore_session(project)
     return
   end
   local st = session.load(project)
-  if not st or type(st.buffers) ~= "table" or #st.buffers == 0 then
+  if not st then
+    return
+  end
+  -- Restore the full search history (with results) before project.restore seeds .jadx query strings,
+  -- so the seeding dedups against these and the manager shows real results rather than empty stubs.
+  if type(st.history) == "table" and #st.history > 0 then
+    require("jadxnvim.searches").import(st.history)
+  end
+  if type(st.buffers) ~= "table" or #st.buffers == 0 then
     return
   end
   for _, e in ipairs(st.buffers) do

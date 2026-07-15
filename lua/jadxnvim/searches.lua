@@ -63,6 +63,95 @@ local function reopen(entry)
   })
 end
 
+-- Data-only fields kept when caching an item (functions/UI never go to disk). These are exactly the
+-- fields code.open needs to relocate onto the result, across every search kind.
+local ITEM_FIELDS = { "text", "id", "index", "line", "col", "snippet", "find", "member",
+  "find_ordinal", "ordinal", "kind", "name", "fullName" }
+local MAX_ITEMS = 2000 -- cap items cached per entry so the session file stays bounded
+
+local function sanitize_items(items)
+  local out = {}
+  for i, it in ipairs(items or {}) do
+    if i > MAX_ITEMS then
+      break
+    end
+    local c = {}
+    for _, f in ipairs(ITEM_FIELDS) do
+      c[f] = it[f]
+    end
+    out[i] = c
+  end
+  return out
+end
+
+--- A serializable snapshot of the full history (results included) for the per-project session cache.
+--- Project-seeded stubs (rerun, no real results) are skipped — the real entries supersede them.
+function M.export()
+  local out = {}
+  for _, e in ipairs(saved) do
+    if not e.rerun and type(e.items) == "table" and #e.items > 0 then
+      out[#out + 1] = {
+        kind = e.kind, query = e.query, title = e.title, time = e.time,
+        items = sanitize_items(e.items),
+      }
+    end
+  end
+  return out
+end
+
+-- Reopen a restored result using whatever navigation fields it carries (works for every search kind:
+-- class = id only; text = id+line+snippet; xref = id+line+find+member+ordinal; method = id+index+name).
+local function restored_open(it)
+  if not it or not it.id then
+    return
+  end
+  local code = require("jadxnvim.code")
+  if it.index and (it.kind == "method" or it.name) then
+    require("jadxnvim.rpc").request("memberPos", { id = it.id, index = it.index }, function(e, r)
+      vim.schedule(function()
+        code.open(it.id, { line = r and r.line, col = r and r.col, find_method = it.name })
+      end)
+    end)
+    return
+  end
+  code.open(it.id, {
+    line = it.line, col = it.col,
+    find = it.find or it.snippet,
+    find_method = it.member,
+    find_ordinal = it.find_ordinal or it.ordinal,
+  })
+end
+
+--- Restore full history entries (with their results) from the session cache, so the manager's
+--- overview shows real results and reopening a past search is instant (no re-run). Deduped by title;
+--- appended after any entries already recorded this session so those stay newest-first.
+function M.import(list)
+  if type(list) ~= "table" then
+    return
+  end
+  local preview = require("jadxnvim.preview")
+  local have = {}
+  for _, e in ipairs(saved) do
+    if e.title then
+      have[e.title] = true
+    end
+  end
+  for _, e in ipairs(list) do
+    if type(e) == "table" and e.title and not have[e.title] and type(e.items) == "table" then
+      have[e.title] = true
+      saved[#saved + 1] = {
+        kind = e.kind, query = e.query, title = e.title, time = e.time,
+        items = e.items,
+        previewer = preview.class(),
+        on_select = restored_open,
+      }
+    end
+  end
+  while #saved > MAX do
+    table.remove(saved)
+  end
+end
+
 --- The distinct query strings in the history, newest first (for persisting to the .jadx).
 function M.query_history()
   local seen, out = {}, {}
