@@ -648,6 +648,9 @@ final class V2Engine {
 
 	// Recursion caps so a wide/deep (or cyclic via interfaces) hierarchy can't blow up the response.
 	private static final int HIER_NODE_BUDGET = 2000;
+	// Cap on class-granular (not method-resolved) callers in a call hierarchy — keeps the tree focused
+	// on the method-resolved callers; gr lists every referencing class exhaustively.
+	private static final int CALLER_CG_CAP = 200;
 
 	/**
 	 * The super/subtype tree of a class, served entirely from the SQLite hierarchy (no rendering).
@@ -848,8 +851,16 @@ final class V2Engine {
 			pool.shutdownNow();
 		}
 		// Referencing classes beyond the render cap: listed but not method-resolved (open to inspect).
+		// The method-resolved callers are the value of a call hierarchy, so bound this tail — for an
+		// exhaustive flat list of every referencing class, find-usages (gr) is the tool.
+		int cg = 0;
 		for (int i = renderN; i < ordered.size(); i++) {
+			if (cg >= CALLER_CG_CAP) {
+				truncated[0] = true;
+				break;
+			}
 			callers.add(classGranularCaller(ordered.get(i), targetRawName));
+			cg++;
 		}
 		return callers;
 	}
