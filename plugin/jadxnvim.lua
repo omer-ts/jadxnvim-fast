@@ -59,6 +59,14 @@ vim.api.nvim_create_user_command("JadxUsages", function()
   require("jadxnvim.nav").find_usages()
 end, { desc = "jadxnvim: find usages of symbol under cursor" })
 
+vim.api.nvim_create_user_command("JadxCallers", function()
+  require("jadxnvim.nav").call_hierarchy()
+end, { desc = "jadxnvim: incoming call hierarchy for the method under cursor" })
+
+vim.api.nvim_create_user_command("JadxTypeHierarchy", function()
+  require("jadxnvim.nav").type_hierarchy()
+end, { desc = "jadxnvim: super/subtype hierarchy for the class under cursor" })
+
 vim.api.nvim_create_user_command("JadxSearch", function(opts)
   require("jadxnvim.search").text(opts.args)
 end, { nargs = "?", desc = "jadxnvim: full-text search across decompiled code" })

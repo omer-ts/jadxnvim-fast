@@ -1,116 +1,100 @@
 # jadxnvim
 
 A Neovim front-end for [jadx](https://github.com/skylot/jadx) — browse and analyze decompiled
-Android APKs from the terminal, over SSH, on large projects, without leaving the editor.
+Android APKs from the terminal, over SSH, on huge apps, without leaving the editor.
 
-jadxnvim does **not** replace jadx-gui. It is a second interface that reads/writes the same
-project format, so a project opened in jadxnvim can be opened in jadx-gui (and vice versa) with
-renames and comments intact.
+The default **fast engine** opens and browses a **700 MB APK in seconds at a few hundred MB of RAM**:
+it indexes the dex tables directly (no decompilation) into a memory-mapped database and decompiles a
+class with jadx only when you actually open it. jadx's classic whole-APK parse (minutes, many GB) is
+never on the hot path.
+
+jadxnvim does **not** replace jadx-gui. It reads/writes the same project format, so a project opened
+in jadxnvim can be opened in jadx-gui (and vice versa) with renames and comments intact.
 
 ## How it works
 
 ```
-  Neovim plugin (Lua)  <--- newline JSON-RPC over stdio --->  jadxd daemon (JVM, embeds jadx-core)
+  Neovim plugin (Lua)  <--- newline JSON-RPC over stdio --->  jadxd daemon (JVM)
 ```
 
-The daemon embeds `jadx-core` as a library. It parses the APK once, then decompiles a class on
-demand for browsing. On first load it also **exports** the decompiled sources in the background into
-a compact, ripgrep-friendly index, so **full-text search runs at ripgrep speed** even on very large
-APKs. The export is cached, so subsequent opens skip it.
+Both run on the same (powerful) machine you SSH into; communication is local stdio, so there is no
+network protocol or auth to configure. The daemon has **two engines**:
 
-Benchmarks (this is not a small tool): a large APK (540 MB, **396k classes**) parses in ~80 s, exports
-in ~3 min (one-time, cached), after which full-text search returns in **~0.1–0.3 s**. Instagram
-(136 MB, 158k classes) is proportionally faster.
+### Fast engine (default, for `.apk` / `.dex`)
 
-Both the daemon and Neovim are meant to run on the same (powerful) machine you SSH into;
-communication is local stdio, so there is no network protocol or auth to configure.
+The insight: jadx has no lazy class loading — the moment you want *any* Java, it parses the whole APK.
+So the fast engine stops using jadx for navigation and uses it only to render the one class you're
+looking at:
+
+- **Index — dexlib2 → SQLite.** On open, the dex tables (classes, methods, fields, string constants,
+  a bytecode cross-reference graph, the class hierarchy) are read directly with dexlib2 — *memory-
+  mapped and lazy, no decompilation* — and written to a memory-mapped SQLite database
+  (`<name>.jadxnvim/index.db`). Everything you do to *navigate* — browse the tree, name/content
+  search, go-to-definition, find-usages — is served from that, instantly, independent of jadx. Built
+  once, cached, rebuilt only if the APK changes.
+- **Render — jadx-core, on demand, mini-dex isolated.** When (and only when) you open a class, the
+  engine extracts *that class plus a bounded 1-hop reference closure* into a tiny synthetic dex and
+  hands it to jadx. Decompiling one class costs what that class costs — MB-scale RAM, a fraction of a
+  second — never the whole-APK `load()`.
+
+**Advanced ops that need jadx's whole-program model** — rename, comment, resource *content*, smali —
+fall through to the classic engine, which builds the model lazily the first time you use one of them
+(a one-time cost you pay only if you reach for those). Browse / view / search / gd / gr never do.
+
+### Classic engine (`.jar` / `.class`, or `fast = false`)
+
+Embeds `jadx-core`, parses the whole APK once, decompiles on demand, and exports the sources into a
+ripgrep-friendly index for fast full-text search. This is what `.jar`/`.class` inputs use (dexlib2
+reads dex only), and what you get with `fast = false`. See [Classic engine](#classic-engine-details).
+
+## Benchmarks (fast engine)
+
+Measured on **Instagram 136 MB / 165,819 classes**, `-Xmx512m` (it fits in half a gig):
+
+| Operation | Cost |
+| --- | --- |
+| Build the index (dexlib2 → SQLite, one time, cached) | ~25–30 s |
+| Open + browse + name/content search | instant, memory-mapped, ~hundreds of MB |
+| View a class (`getCode`, on-demand render) | ~150–300 ms; first render pays a one-time ~1.5 s class-map build |
+| Go-to-definition | instant (SQLite) + one render for the target's declaration |
+| Find-usages (`gr`) | precise & bounded — typically sub-second; a 3,831-implementor interface method resolves in ~1.2 s |
+| Go-to-implementations (`gd` on an interface method, 40 impls) | ~180 ms (pure SQLite, no render) |
+
+The on-disk index is disposable/rebuildable and lives in the gitignored `<name>.jadxnvim/` cache
+(~1 GB for Instagram, ~90 MB for a 10 MB app — mostly the cross-reference graph and FTS).
 
 ## Requirements
 
-- Java 17+ (the daemon is built/run on the JVM)
-- Neovim 0.10+
-- [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) on `PATH` for fast full-text search
-  (jadxnvim falls back to an in-memory scan if it's missing)
-- No system Gradle needed — the repo ships a Gradle wrapper
-- Enough RAM for very large APKs. jadxnvim sizes the heap to 70% of available memory automatically
-  (`-XX:MaxRAMPercentage`, so it respects container/cgroup limits). If indexing still gets OOM-killed
-  (daemon exits with code 137), jadxnvim reopens the project **without** the search index so browsing
-  and (slower) in-memory search keep working — give the JVM more memory via `java_args = { "-Xmx24g" }`,
-  lower the export concurrency (`java_args = { "-Djadxnvim.indexThreads=4" }`), or set `export = false`.
-
-  Rough memory floor (measured, a large APK — 540 MB / 396k classes, idle after load):
-
-  | mode | live heap (idle) | notes |
-  | --- | --- | --- |
-  | default (`usage = true`) | ~6.9 GB | full jadx-gui-quality output + precise `gr` |
-  | `usage = false` | ~4.6 GB | skips jadx's ~2.3 GB xref graph (see below) |
-  | `lean = true` | ~0.5–1.5 GB | browse/search/nav served from disk; parsed model kept resident for instant edits |
-  | `lean = true` + `keep_model = false` | **~120 MB** | also drops the model after export (slow first edit) |
-
-  jadx builds a global cross-reference (usage) graph at load — ~2.3 GB of it for a large APK — that powers
-  precise find-usages (`gr`) and single-use anonymous-class inlining. Set `usage = false` to skip it:
-  `gr` then falls back to a fast name-based text search, and anonymous classes aren't inlined.
-
-  **Lean mode (`lean = true`)** goes further: once the on-load export is written, jadxnvim serves the
-  class tree, code view, search, the fuzzy finders, **go-to-def and find-usages** straight from the
-  on-disk export (the export also writes an rg-searchable cross-reference index), and jadx's usage graph
-  is skipped entirely. Once the export is **cached**, opening the project skips the multi-GB parse peak —
-  a large APK opens in ~0 s. Implies `usage = false`; requires `export = true`. Cost: the cross-reference
-  index adds disk (≈2 GB for a large APK, on top of the ~1 GB of decompiled shards) — it's queried with
-  ripgrep and never loaded into RAM, and lives in the gitignored `<name>.jadxnvim/` cache.
-
-  By default lean mode **keeps jadx's parsed model resident** (pre-warmed in the background after a fast
-  cached open) so the first rename/comment is *instant* rather than re-parsing the whole APK on demand.
-  `NoOpCodeCache` keeps decompiled text out of the heap, so the retained model is just parsed structures
-  (~0.5–1.5 GB even on a 400k-class APK). After an edit, reopening the project **reuses the existing
-  index** and refreshes stale names in the background instead of blocking on a full re-index — the class
-  you're viewing always shows current names. On RAM-constrained hosts set `keep_model = false` (or pass
-  `--drop-model`) to drop the model after export; the first edit then re-parses the APK once (a
-  multi-second-to-minute stall on huge APKs) and steady-state RAM falls to ~120 MB.
+- **Java 17+** (the daemon runs on the JVM). Tested on JDK 23.
+- **Neovim 0.10+**
+- No system Gradle needed — the repo ships a Gradle wrapper.
+- [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) — **only** for the classic engine's
+  full-text search; the fast engine doesn't need it.
+- RAM: the fast engine is happy in a few hundred MB even on 700 MB APKs. jadxnvim sizes the heap to
+  70 % of available memory (`-XX:MaxRAMPercentage`, so it respects container/cgroup limits); override
+  with `java_args = { "-Xmx4g" }` if you want a hard cap.
 
 ## Build the daemon
 
 ```sh
 cd daemon
-./gradlew shadowJar         # produces daemon/build/libs/jadxd.jar
+./gradlew shadowJar         # produces daemon/build/libs/jadxd.jar   (Windows: ./gradlew.bat)
 ```
-
-On Windows: `./gradlew.bat shadowJar`.
-
-## Tests
-
-A headless test suite runs the daemon + plugin against a small fixture compiled from
-`tests/fixtures/src`, and runs on CI (see `.github/workflows/ci.yml`):
-
-```sh
-bash tests/run.sh        # builds the daemon jar + fixture jar if needed, runs every spec
-```
-
-Each `tests/spec/*_spec.lua` opens the fixture in a fresh headless Neovim and asserts behaviour
-(load/tree, search, xref, edit + `.jadx` round-trip, Frida hooks, project state). Requires `nvim`,
-a JDK (for `javac`/`jar`), and optionally `rg` on `PATH`.
-
-After pulling changes that add daemon features, rebuild the jar and restart Neovim (the daemon runs
-for the life of a Neovim session). If the plugin ever warns that *"the jadxd daemon is out of date"*,
-it means a running daemon predates a method the plugin needs — rebuild as above and restart.
 
 ## Install the plugin (optional)
 
-You only need this if you want the `:Jadx` commands available in your normal Neovim sessions — the
-`scripts/jadxnvim` CLI launcher below works without it. Point your plugin manager at this repo, or
-add it to the runtimepath. With lazy.nvim:
+You only need this if you want the `:Jadx` commands in your normal Neovim sessions — the
+`scripts/jadxnvim` CLI launcher below works without it. With lazy.nvim:
 
 ```lua
 {
   dir = "/path/to/jadxnvim",
   config = function()
     require("jadxnvim").setup({
+      -- fast = true,               -- fast engine for .apk/.dex (default). false = classic engine.
       -- jar defaults to <repo>/daemon/build/libs/jadxd.jar
-      -- jar = "/custom/path/jadxd.jar",
       -- java = "java",
-      -- java_args = { "-Xmx24g" }, -- override the auto heap size
-      -- export = true,             -- decompile to a ripgrep index on load (fast search); cached
-      -- rg = "/path/to/rg",        -- ripgrep binary (default: auto-detect on PATH)
+      -- java_args = { "-Xmx4g" },  -- override the auto heap size
     })
   end,
 }
@@ -118,30 +102,25 @@ add it to the runtimepath. With lazy.nvim:
 
 ## Launch from the shell (CLI)
 
-The quickest way in — open a project straight from your terminal, no need to start Neovim and run
-`:Jadx` yourself:
-
 ```sh
 # Linux / macOS / SSH server:
 scripts/jadxnvim app.apk
 scripts/jadxnvim project.jadx
-scripts/jadxnvim --temp app.apk   # work in memory, don't write a .jadx
+scripts/jadxnvim --temp app.apk    # work in memory, don't write a .jadx
 
 # Windows (PowerShell):
 scripts\jadxnvim.ps1 app.apk
 ```
 
-Put it on your `PATH` for a bare `jadxnvim app.apk` command, e.g.:
+Symlink it onto your `PATH` for a bare `jadxnvim app.apk`:
 
 ```sh
 ln -s "$PWD/scripts/jadxnvim" ~/.local/bin/jadxnvim   # (chmod +x scripts/jadxnvim once)
 ```
 
-The launcher prepends this repo to Neovim's `runtimepath` for the session, so it works even if you
-haven't added the plugin to your config — your normal config (colors, keymaps, other plugins) still
-loads, and the project opens automatically. It builds the daemon jar on first run if needed.
-Set `JADXD_JAVA_OPTS=-Xmx6g` for very large APKs, or `JADXNVIM_NVIM` to choose the nvim binary.
-Extra args after the project are passed through to `nvim`.
+The launcher prepends this repo to Neovim's `runtimepath` for the session (so your normal config still
+loads), opens the project automatically, and builds the daemon jar on first run if needed. Set
+`JADXD_JAVA_OPTS=-Xmx4g` for very large APKs, or `JADXNVIM_NVIM` to choose the nvim binary.
 
 ## Usage (inside Neovim)
 
@@ -151,155 +130,162 @@ Extra args after the project are passed through to `nvim`.
 | `:JadxHelp`            | Command palette: list every command & shortcut, run the selected one |
 | `:JadxTree`            | Focus the project tree                                          |
 | `:JadxGotoPackage {p}` | Jump the tree to a package (Tab-completes package names)         |
-| `:JadxGotoSource [f]`  | Jump a stack-trace frame `Class(File.java:line)` to its smali source line |
-| `:JadxGotoSourceJava [f]` | Same, but open the decompiled Java at the nearest position (the method) |
 | `:JadxDef`             | Go to definition of the symbol under the cursor                 |
 | `:JadxUsages`          | Find usages of the symbol under the cursor (xref, browsable + preview) |
-| `:JadxSearch [text]`   | Full-text search across decompiled code (streamed → quickfix)   |
+| `:JadxCallers`         | Incoming call hierarchy for the method under the cursor (expandable tree) |
+| `:JadxTypeHierarchy`   | Super/subtype hierarchy for the class under the cursor          |
+| `:JadxSearch [text]`   | Full-text search across code (streamed → quickfix)              |
 | `:JadxSearchName [q]`  | Search class/method/field names                                 |
-| `:JadxSearchCancel`    | Cancel the running search                                       |
 | `:JadxFindClass`       | Fuzzy-find a class                                              |
 | `:JadxFindMethod`      | Fuzzy-find a method (jumps to its declaration)                  |
 | `:JadxFindText`        | Full-text search, then fuzzy-narrow the results                |
 | `:JadxRename`          | Rename the symbol under the cursor (persists to `.jadx`)        |
 | `:JadxComment`         | Comment the symbol under the cursor (persists to `.jadx`)       |
-| `:JadxBookmark`        | Toggle a bookmark at the cursor                                 |
-| `:JadxBookmarks`       | List / jump to / delete bookmarks                              |
-| `:JadxFridaHook`       | Generate a Frida hook for the symbol under the cursor           |
-| `:JadxFridaHookClass`  | Generate a Frida hook for every method of the current class     |
+| `:JadxBookmark` / `:JadxBookmarks` | Toggle / list bookmarks                             |
+| `:JadxFridaHook` / `:JadxFridaHookClass` | Generate a Frida hook for the symbol / whole class |
 | `:JadxClose`           | Close the project and stop the daemon                           |
 
-### Fuzzy finders
-
-A self-contained fuzzy picker (built on Neovim's `matchfuzzy` — **no Telescope/fzf-lua required**)
-is bound to these global keys when a project is open:
-
-| Key         | Finds                                                         |
-| ----------- | ------------------------------------------------------------- |
-| `<Space>ff` | text — enter a term, watch results stream in, then fuzzy them |
-| `<Space>fc` | classes                                                       |
-| `<Space>fd` | methods (jumps to the declaration)                            |
-| `<Space>fv` | everything — classes + methods + text in one list (jadx-gui-style) |
-| `<Space>fs` | **search history** — reopen or delete past searches / xrefs (also `:JadxHistory`) |
-| `<Space>fb` | **bookmarks** — jump to or delete bookmarked positions (also `:JadxBookmarks`) |
-| `<Space>fh` | **help / command palette** — every command & shortcut; Enter runs it (also `:JadxHelp`) |
-
-**Search history:** every text search, xref (find-usages), class/method search is recorded. `<Space>fs`
-opens a history list — each entry shows its type icon, query + count, and age, with a preview of its
-results. `<CR>` reopens the full result set (after you closed it), `<C-x>` / `dd` deletes an entry,
-`<C-l>` clears all.
-
-In the picker: type to filter, `<C-n>`/`<C-p>` or `<Up>`/`<Down>` (`<C-d>`/`<C-u>` to page) to move,
-`<CR>` to open, `<Esc>` to cancel. `<C-t>` sends the current results to a **persistent scratch pane**
-(a normal, searchable buffer where `<CR>` opens a result and `q` closes). `<C-f>` generates a
-**Frida hook script** for the results (classes → hook the class, methods → hook the method, a usages
-list → hook the searched method) into a scratch `.js` buffer. A **syntax-highlighted preview** of the highlighted result is
-shown beside the list (bat-style — line-numbered and centered on the match). A status footer shows
-`shown / total` (and `searching… N found` while a text search is still streaming). Bound to literal `<Space>` so it works regardless of your `mapleader`.
-Rebind or disable via `keys` in `setup()`:
-
-```lua
-require("jadxnvim").setup({
-  keys = {
-    find_text = "<Space>ff",      -- set to false to skip mapping
-    find_classes = "<Space>fc",
-    find_methods = "<Space>fd",
-  },
-})
-```
-
-In the **tree** window the project is split into two sections, each row tagged with a type icon:
-
-- **Sources** — packages → classes (`<CR>` / `o` expands a package or opens a class).
-- **Resources** — the APK's resource files as a directory tree; opening one (`AndroidManifest.xml`,
-  `res/values/strings.xml`, …) shows its **decoded** text, syntax-highlighted by extension. In lean
-  mode the resource *list* is served from disk; opening a resource's *content* uses the resident model
-  (or, with `keep_model = false`, rebuilds it once — like smali).
-
-Press `/` to **filter** the tree (case-insensitive; `<Esc>` clears). The icons default to Nerd Font
-glyphs — override them (or switch to plain ASCII) via `icons` in `setup()`:
-
-```lua
-require("jadxnvim").setup({
-  icons = { class = "C", package = "pkg", folder = "/", file = "-" }, -- any subset; see lua/jadxnvim/icons.lua
-})
-```
-
-In a **code** buffer (`jadx://<class>`, read-only `java`):
+### In a code buffer (`jadx://<class>`, read-only Java)
 
 | Key          | Action                         |
 | ------------ | ------------------------------ |
-| `gd`         | Go to definition (falls back to class/method name search if unresolved). On a call through an interface/base type it lists **all implementations** to pick from |
-| `gr`         | Find usages (xref) — browsable list with preview; on an overriding method it also finds virtual-dispatch calls made through the interface/base type |
-| `<Tab>`      | Toggle Java ⟷ Smali (syncs to the same method; remembers each pane's cursor) |
-| `<leader>jr` | Rename (classes, methods, fields, and **local variables**; a constructor renames its class) |
+| `gd`         | Go to definition. On an abstract/interface method it lists **all implementations** to pick from |
+| `gr`         | Find usages (xref) — browsable list with preview; includes **virtual-dispatch calls** made through a super/interface/subtype |
+| `<leader>jk` | **Call hierarchy** — incoming callers of the method, as an expandable tree (see below) |
+| `<leader>ji` | **Type hierarchy** — super/subtype tree of the class (see below) |
+| `<leader>jt` | **Resolve a merged-lambda dispatcher call** to the branch it runs (see below) |
+| `<Tab>`      | Toggle Java ⟷ Smali (syncs to the same method) |
+| `<leader>jr` | Rename (classes, methods, fields, local variables) |
 | `<leader>jc` | Comment                        |
-| `<leader>jh` | Frida hook the symbol under the cursor (a method — and every implementation for an interface call) |
-| `<leader>jH` | Frida hook every method of this class |
-| `<leader>jm` | Toggle a bookmark at the cursor |
+| `<leader>jh` / `<leader>jH` | Frida hook the symbol / every method of the class |
+| `<leader>jm` | Toggle a bookmark               |
 
-In code buffers `y` / `Y` copy to your **computer's** clipboard — over SSH too, via OSC 52 (no
-`xclip`/`win32yank` needed). Disable with `clipboard = false` in `setup()`, or it steps aside if
-you've already configured a clipboard provider.
+`y` / `Y` copy to your **computer's** clipboard — over SSH too, via OSC 52. gd/gr integrate with the
+jumplist and quickfix (`<C-o>`/`<C-i>`, `:cnext`/`:cprev`).
 
-Decompiled buffers are set up for **folding** (`zc`/`za` to fold a block, `zM`/`zR` to close/open
-all). By default (`folding = "auto"`) they use treesitter's fold expression when the Java parser is
-active — folding `if`/`for`/method `{ }` blocks precisely — and fall back to indent folding
-otherwise. Set `folding = "indent"`, `"expr"`, or `false` in `setup()` to override.
+### Fuzzy finders
 
-Go-to-definition and usages integrate with the jumplist and quickfix, so `<C-o>`/`<C-i>` and
-`:cnext`/`:cprev` work as usual.
+A self-contained fuzzy picker (Neovim's `matchfuzzy` — **no Telescope/fzf-lua needed**), bound to
+global keys when a project is open:
+
+| Key | Finds |
+| --- | --- |
+| `<Space>ff` | text — stream results, then fuzzy them |
+| `<Space>fc` | classes |
+| `<Space>fd` | methods (jumps to the declaration) |
+| `<Space>fv` | everything — classes + methods + text (jadx-gui-style) |
+| `<Space>fs` / `<Space>fb` / `<Space>fh` | search history / bookmarks / command palette |
+
+In the tree, `/` filters (fast engine: the filter searches **all** classes server-side, so a match in
+a collapsed package still shows). Tree rows carry Nerd-Font type icons (configurable via `icons`).
+
+## Fast-engine navigation
+
+Everything below is served from the SQLite index + on-demand render — no whole-APK model.
+
+- **Class search** matches the **original (raw) name**, a **qualified/partial path** (`X.001`,
+  `auth.LoginActivity`), **and the jadx-rendered name**. jadx renames classes whose raw name isn't a
+  valid Java identifier — `X.000` renders as `AnonymousClass000`, `X.0Ac` as `C0Ac` (23 % of classes
+  in an obfuscated APK) — so the tree and results show both, e.g. `000  → AnonymousClass000`, and
+  either name finds the class.
+
+- **Find-usages (`gr`)** returns the actual call sites — exact line and the code line as text, not
+  just "used in class X". For a method it searches the whole **override group** (calls made through a
+  super/interface/subtype), so virtual-dispatch usages aren't missed: an interface method called only
+  through its implementations goes from *0* usages (naïve exact-key search) to all of them. On a hot
+  method it renders the first ~30 referencing classes for exact lines and lists the rest class-
+  granular (open one to relocate by name) — complete **and** bounded (~1 s even for thousands of
+  usages). Multiple calls in one class each resolve to their own distinct call site.
+
+- **Go-to-implementations.** `gd` on an abstract/interface method (or a call to one) offers every
+  class that declares/overrides it — pick an implementation to jump to. Instant (pure SQLite).
+
+- **Call hierarchy (`<leader>jk`).** "Who calls this method", as an expandable tree in a bottom
+  split. Each caller is resolved to the enclosing **caller method** (with the exact call site), and
+  every caller can be expanded to *its own* callers, recursively — walk the call graph inward without
+  leaving the editor. Callers are found over the method's whole override group, so virtual-dispatch
+  calls made through a super/interface/subtype are included. `<CR>`/`o` jumps to a call site; `<Tab>`
+  expands a node. Complete but bounded (renders the first ~30 referencing classes for precise caller
+  methods, lists the rest to open on demand).
+
+- **Type hierarchy (`<leader>ji`).** The super/subtype tree of the class (or the type under the
+  cursor): supertypes it extends/implements above, subtypes that extend/implement it below, both
+  transitive. Interfaces and classes are marked; framework/library types show as `(external)`. Served
+  entirely from the SQLite class hierarchy (no rendering). `<CR>` opens a type.
+
+- **Content search** covers dex **string constants** across *all* classes with no decompilation
+  (instant), plus the decompiled Java of classes you've viewed (a source FTS filled lazily).
+
+### Merged-lambda dispatcher resolver (`<leader>jt`)
+
+Optimizers (R8, Meta's **Redex** — which Instagram uses) merge hundreds of lambdas/callbacks into one
+class dispatched by an integer id, rendered as `switch (this.$t)`. So `new X.Uez(.., 5)` (or a factory
+`X.Uez.A00(.., 5)`) really means *"run case 5 of X.Uez"* — and on Instagram `X.000.A00()` has a
+**3117-case** switch. Put the cursor on the dispatcher class in the construction and `<leader>jt`
+jumps straight to `case N:` in its dispatch switch. The id may be a **literal**, or a **local variable
+assigned a constant** (resolved by a light constant-dataflow trace).
+
+The CLI can list these directly: `jadxd dispatchers <apk> [minCases]` scans the bytecode (dexlib2, no
+decompilation) for classes whose method holds a large packed/sparse switch.
+
+## CLI (`jadxd`)
+
+The daemon jar doubles as a standalone CLI over the fast index (no Neovim needed):
+
+```sh
+java -jar daemon/build/libs/jadxd.jar index      app.apk                 # build the SQLite index
+java -jar daemon/build/libs/jadxd.jar search     app.jadxnvim/index.db  LoginActivity
+java -jar daemon/build/libs/jadxd.jar xref       app.jadxnvim/index.db  "Ljava/lang/String;"
+java -jar daemon/build/libs/jadxd.jar decompile  app.apk  com.example.Foo
+java -jar daemon/build/libs/jadxd.jar dispatchers app.apk 20
+java -jar daemon/build/libs/jadxd.jar stats      app.jadxnvim/index.db
+```
 
 ## Seamless jadx-gui interop
 
-Opening an APK **creates a `.jadx` project next to it automatically** (use `--temp` / `temp = true`
-to work purely in memory and never write a file). Renames and comments are stored in jadx's native
-code-data format and written to that `.jadx` (same `projectVersion`/`files`/`codeData` shape and
-GSON serialization jadx-gui uses). Open the same `.jadx` in jadx-gui and your renames/comments are
-there; conversely, opening a project edited in jadx-gui shows its renames/comments in jadxnvim.
+Opening an APK **creates a `.jadx` project next to it automatically** (use `--temp` / `temp = true` to
+stay in memory). Renames and comments are stored in jadx's native code-data format and written to that
+`.jadx` (same `projectVersion`/`files`/`codeData` shape and GSON serialization jadx-gui uses), so the
+same project opens in jadx-gui with your edits intact, and vice versa. jadxnvim also reads/writes
+jadx-gui's UI state (open tabs, search history, `cacheDir`, bookmarks) and preserves fields it doesn't
+manage, so round-tripping never loses state. (In the fast engine, the first rename/comment builds the
+jadx model on demand; browsing and search don't.)
 
-jadxnvim also **reads and writes jadx-gui's UI-state**, in jadx-gui's own format:
+## Classic engine details
 
-- **Open tabs** — your open class buffers are saved as the project's `openTabs` (as jadx-gui
-  `TabViewState`s). Reopen the project — in jadxnvim or jadx-gui — and the same tabs come back.
-- **Search history** — text searches, xrefs and name searches are recorded to the project's
-  `searchHistory`; on open they're available again (re-runnable) in `<Space>fs`, and populate
-  jadx-gui's search dropdown.
-- **cacheDir** — the project points at jadxnvim's on-disk cache (`<name>.jadxnvim/`, a dedicated
-  `gui-cache` subdir for jadx-gui so it never touches jadxnvim's index).
-- **Bookmarks** — `<leader>jm` bookmarks the position under the cursor; `<Space>fb` lists/jumps.
-  They're written as jadx-gui bookmarked tabs (`openTabs` with `bookmarked: true` + `caret`), so they
-  show up in jadx-gui's *Bookmarked tabs* panel; jadxnvim also keeps a richer list (multiple per
-  class, with a text snippet) in its own preserved field.
+With `fast = false` (or for `.jar`/`.class` inputs), the daemon embeds `jadx-core`, parses the whole
+APK once, decompiles on demand, and exports the sources into a ripgrep index for full-text search
+(cached). This is the heavier, higher-fidelity path; its knobs (`export`, `usage`, `lean`,
+`keep_model`, `-Djadxnvim.indexThreads`) trade RAM for features on very large APKs. Rough idle memory
+floor on a 540 MB / 396k-class APK: `usage = true` ≈ 6.9 GB (full jadx-gui-quality output + precise
+`gr`), `usage = false` ≈ 4.6 GB (skips jadx's ~2.3 GB xref graph), `lean = true` ≈ 0.5–1.5 GB
+(browse/search/nav served from the on-disk export), `lean = true` + `keep_model = false` ≈ 120 MB
+(drops the model after export; slow first edit).
 
-Any fields jadxnvim doesn't manage (tree state, plugin options, ...) are preserved, so round-tripping
-a jadx-gui project never loses its state. The input APK is referenced relatively, so a project
-directory stays portable. (Verified against jadx-gui's own project loader: a project jadxnvim writes
-loads in jadx-gui with the rename applied and the tabs/search-history restored.)
+## Tests
+
+```sh
+bash tests/run.sh        # builds the daemon + a fixture jar, runs every spec in headless Neovim
+```
+
+Each `tests/spec/*_spec.lua` opens a fixture in a fresh headless Neovim and asserts behaviour. The
+`.jar` fixture exercises the classic engine + the shared frontend; the **fast-engine specs**
+(`v2_fast`, `call_hierarchy`, `type_hierarchy`) run against a `.dex` built from the same sources with
+Android's `d8` — they self-skip when `d8` isn't found (set `$D8` or `$ANDROID_HOME`). Requires
+`nvim`, a JDK (for `javac`/`jar`), and `rg` on `PATH`; `d8` (Android build-tools) for the fast-engine
+specs.
 
 ## Status
 
-All v1 milestones are implemented and tested against real APKs (incl. a 136 MB / 158k-class app):
+The fast engine (default) is implemented and validated end-to-end against real APKs up to 700 MB
+(Instagram 136 MB / 165k classes throughout):
 
-- [x] Daemon: lazy load, package tree, on-demand class decompilation
-- [x] Plugin: project tree, code view
-- [x] Cross-references (go-to-definition, find-usages)
-- [x] Search (class/method/field names, and ripgrep full-text over an on-load export — fast on
-      400k-class APKs, cached, with results re-located onto the live decompiled line)
-- [x] Search history: reopen (with results) or delete past text searches / xrefs / name searches,
-      with per-entry result previews (`<Space>fs` / `:JadxHistory`)
-- [x] Class / method finders stream matches server-side (query-driven), scanning the raw parsed
-      model (`getClassNode().getMethods()`, like jadx-gui) so no class is decompiled during a name
-      search — sub-second on a 400k-class APK with no OOM, even without the export. Once the on-load
-      export is ready they ripgrep a class/method **name index** for an extra speedup.
-- [x] Rename + comments persisted to the `.jadx` project (jadx-gui interop)
-- [x] Built-in fuzzy finders for classes / methods / text (no external picker needed)
-- [x] Java ⟷ Smali toggle (`<Tab>`) and a load progress bar (animated, or real % with `prefetch`)
-- [x] Syntax highlighting for Java and Smali (applies a readable palette on a bare Neovim; a
-      colorscheme you set is respected)
-- [x] Resource browser: a Resources section in the tree (directory tree of the APK's resources),
-      with decoded, syntax-highlighted viewing of `AndroidManifest.xml`, `res/**`, etc.
-- [x] Tree type icons (Nerd Font, configurable) and a `/` tree filter
-
-Roadmap toward broader jadx-gui parity: certificate info, bookmarks, deobfuscation toggle,
-mappings import/export, and instruction-level comments.
+- [x] dexlib2 → SQLite index; instant open + browse + name/content search at low RAM
+- [x] On-demand mini-dex class rendering (no whole-APK model)
+- [x] Class search over raw names, qualified paths, and jadx-rendered names
+- [x] Go-to-definition, go-to-implementations, and precise find-usages with override groups
+- [x] Call hierarchy (expandable incoming callers) and type hierarchy (super/subtype tree)
+- [x] Merged-lambda dispatcher resolver (`<leader>jt`) + `jadxd dispatchers` scanner
+- [x] Rename / comment / resources / smali via the classic model, built lazily on demand
+- [x] Full jadx-gui project interop (renames, comments, tabs, search history, bookmarks)
+- [x] Classic engine retained for `.jar`/`.class` and `fast = false`

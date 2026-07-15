@@ -37,6 +37,13 @@ final class V2Engine {
 			return size() > CODE_CACHE_MAX;
 		}
 	};
+	// Rendered smali cache so toggling Java⟷Smali repeatedly is instant after the first render.
+	private final Map<String, String> smaliCache = new LinkedHashMap<>(64, 0.75f, true) {
+		@Override
+		protected boolean removeEldestEntry(Map.Entry<String, String> e) {
+			return size() > CODE_CACHE_MAX;
+		}
+	};
 
 	private final ExecutorService searchExec = Executors.newSingleThreadExecutor(r -> {
 		Thread t = new Thread(r, "jadxd-v2-search");
@@ -64,6 +71,8 @@ final class V2Engine {
 				return listMethods(optInt(params, "limit", 100000));
 			case "getCode":
 				return getCode(reqStr(params, "id"));
+			case "getSmali":
+				return getSmali(reqStr(params, "id"));
 			case "memberPos":
 				return memberPos(reqStr(params, "id"), reqInt(params, "index"));
 			case "gotoDef":
@@ -73,6 +82,10 @@ final class V2Engine {
 			case "resolveTask":
 				return resolveTask(reqStr(params, "id"), reqInt(params, "line"), reqInt(params, "col"),
 						intList(params, "taskIds"));
+			case "typeHierarchy":
+				return typeHierarchy(params);
+			case "callHierarchy":
+				return callHierarchy(params);
 			case "searchName":
 				return startSearch("name", params);
 			case "searchText":
@@ -198,6 +211,25 @@ final class V2Engine {
 		result.put("id", id);
 		result.put("fullName", id);
 		result.put("code", code);
+		return result;
+	}
+
+	private Map<String, Object> getSmali(String id) throws Exception {
+		String smali;
+		synchronized (smaliCache) {
+			smali = smaliCache.get(id);
+		}
+		if (smali == null) {
+			Renderer.Result r = renderer.smali(descOf(id));
+			smali = r.code;
+			synchronized (smaliCache) {
+				smaliCache.put(id, smali);
+			}
+		}
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("id", id);
+		result.put("fullName", id);
+		result.put("smali", smali);
 		return result;
 	}
 
@@ -612,6 +644,259 @@ final class V2Engine {
 		return out;
 	}
 
+	// --- type hierarchy ------------------------------------------------------
+
+	// Recursion caps so a wide/deep (or cyclic via interfaces) hierarchy can't blow up the response.
+	private static final int HIER_NODE_BUDGET = 2000;
+
+	/**
+	 * The super/subtype tree of a class, served entirely from the SQLite hierarchy (no rendering).
+	 * {@code supers} walks up (superclass + interfaces, transitively), {@code subs} walks down
+	 * (subclasses + implementors). The class under the cursor can be given as {@code id}; if
+	 * {@code line}/{@code col} are supplied and resolve to a type, that type is used instead.
+	 */
+	private Map<String, Object> typeHierarchy(JsonObject params) throws Exception {
+		String id = reqStr(params, "id");
+		String desc = descOf(id);
+		// If the cursor is on a type reference, use that type rather than the whole buffer's class.
+		if (params.has("line") && params.has("col")) {
+			try {
+				Renderer.ResolvedSymbol sym = renderer.resolveAt(desc, optInt(params, "line", 1),
+						optInt(params, "col", 0));
+				if (sym != null && sym.kind == Db.KIND_CLASS && db.classIdOf(sym.declClassDesc) >= 0) {
+					desc = sym.declClassDesc;
+				}
+			} catch (Exception ignore) {
+				// fall back to the buffer's class
+			}
+		}
+		Map<String, Object> result = new LinkedHashMap<>();
+		if (db.classIdOf(desc) < 0) {
+			result.put("found", false);
+			return result;
+		}
+		String fqn = DexIndexer.descToFqn(desc);
+		int access = classAccess(desc);
+		int[] budget = { HIER_NODE_BUDGET };
+		java.util.Set<String> upSeen = new java.util.HashSet<>();
+		upSeen.add(desc);
+		java.util.Set<String> downSeen = new java.util.HashSet<>();
+		downSeen.add(desc);
+		result.put("found", true);
+		result.put("id", topLevel(fqn));
+		result.put("fullName", fqn);
+		result.put("name", simpleName(fqn));
+		result.put("kind", (access & 0x200) != 0 ? "interface" : "class");
+		result.put("supers", hierChildren(desc, true, upSeen, budget));
+		result.put("subs", hierChildren(desc, false, downSeen, budget));
+		return result;
+	}
+
+	private List<Map<String, Object>> hierChildren(String desc, boolean up, java.util.Set<String> visited,
+			int[] budget) throws Exception {
+		List<Map<String, Object>> out = new ArrayList<>();
+		if (budget[0] <= 0) {
+			return out;
+		}
+		List<Db.TypeRef> refs = up ? db.supersOf(desc) : db.subsOf(desc);
+		for (Db.TypeRef r : refs) {
+			if (budget[0] <= 0) {
+				break;
+			}
+			budget[0]--;
+			Map<String, Object> node = new LinkedHashMap<>();
+			node.put("id", topLevel(r.fqn));
+			node.put("fullName", r.fqn);
+			node.put("name", simpleName(r.fqn));
+			node.put("kind", r.isInterface() ? "interface" : "class");
+			node.put("inApk", r.inApk);
+			// Recurse only into in-APK types not already on this path (guards interface DAGs/cycles).
+			if (r.inApk && visited.add(r.desc)) {
+				List<Map<String, Object>> kids = hierChildren(r.desc, up, visited, budget);
+				if (!kids.isEmpty()) {
+					node.put(up ? "supers" : "subs", kids);
+				}
+			}
+			out.add(node);
+		}
+		return out;
+	}
+
+	private int classAccess(String desc) throws Exception {
+		try (PreparedStatement ps = db.connection().prepareStatement("SELECT access FROM classes WHERE desc=?")) {
+			ps.setString(1, desc);
+			try (ResultSet rs = ps.executeQuery()) {
+				return rs.next() ? rs.getInt(1) : 0;
+			}
+		}
+	}
+
+	// --- call hierarchy (incoming callers) -----------------------------------
+
+	/**
+	 * The incoming callers of a method — "who calls this", one entry per caller method, each itself
+	 * expandable (pass its {@code key} back). Resolves the method either from the cursor
+	 * ({@code id}/{@code line}/{@code col}) for the initial request, or directly from a {@code key} for
+	 * an expansion. Callers are resolved over the method's whole override group (so virtual-dispatch
+	 * callers aren't missed), rendering up to {@link #RENDER_CAP} referencing classes for precise
+	 * caller methods and listing the rest class-granular — complete but bounded.
+	 */
+	private Map<String, Object> callHierarchy(JsonObject params) throws Exception {
+		Map<String, Object> result = new LinkedHashMap<>();
+		String key;
+		String rootName;
+		if (params.has("key") && !params.get("key").isJsonNull()) {
+			key = reqStr(params, "key");
+			rootName = optStr(params, "name", rawNameOfKey(key));
+		} else {
+			Renderer.ResolvedSymbol sym = renderer.resolveAt(descOf(reqStr(params, "id")),
+					reqInt(params, "line"), reqInt(params, "col"));
+			if (sym == null || sym.kind != Db.KIND_METHOD) {
+				result.put("found", false);
+				result.put("reason", "put the cursor on a method to see its callers");
+				return result;
+			}
+			key = sym.targetKey;
+			rootName = sym.displayName;
+		}
+		int arrow = key.indexOf("->");
+		if (arrow < 0) {
+			result.put("found", false);
+			result.put("reason", "not a method");
+			return result;
+		}
+		String rootClassFqn = topLevel(DexIndexer.descToFqn(key.substring(0, arrow)));
+		String targetRawName = rawNameOfKey(key);
+
+		Map<String, Object> root = new LinkedHashMap<>();
+		root.put("key", key);
+		root.put("name", rootName);
+		root.put("id", rootClassFqn);
+		root.put("fullName", DexIndexer.descToFqn(key.substring(0, arrow)) + "." + targetRawName);
+
+		boolean[] truncated = { false };
+		List<Map<String, Object>> callers = computeCallers(key, targetRawName, truncated);
+		result.put("found", true);
+		result.put("root", root);
+		result.put("callers", callers);
+		result.put("truncated", truncated[0]);
+		return result;
+	}
+
+	private List<Map<String, Object>> computeCallers(String key, String targetRawName, boolean[] truncated)
+			throws Exception {
+		// Whole override group of the target, so callers via a super/interface/subtype are found.
+		java.util.Set<String> targetKeys = new java.util.LinkedHashSet<>(db.overrideKeys(key, 300));
+		java.util.Set<String> candidateTargets = new java.util.HashSet<>();
+		for (String k : targetKeys) {
+			int a = k.indexOf("->");
+			if (a > 0) {
+				candidateTargets.add(k.substring(0, a));
+			}
+		}
+		List<Db.XrefHit> hits = db.xrefsToAny(new ArrayList<>(targetKeys), MAX_USAGES * 8);
+		java.util.LinkedHashSet<String> refClasses = new java.util.LinkedHashSet<>();
+		for (Db.XrefHit h : hits) {
+			String top = topLevel(h.srcClassFqn);
+			if (refClasses.size() >= REF_CLASS_CAP) {
+				truncated[0] = true;
+				break;
+			}
+			refClasses.add(top);
+		}
+		List<String> ordered = new ArrayList<>(refClasses);
+		int renderN = Math.min(RENDER_CAP, ordered.size());
+
+		List<Map<String, Object>> callers = new ArrayList<>();
+		java.util.Set<String> seenKeys = new java.util.HashSet<>();
+		int threads = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors()));
+		java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(
+				threads, r -> {
+					Thread t = new Thread(r, "jadxd-callers");
+					t.setDaemon(true);
+					return t;
+				});
+		try {
+			List<java.util.concurrent.Future<Object[]>> futures = new ArrayList<>();
+			for (int i = 0; i < renderN; i++) {
+				String top = ordered.get(i);
+				futures.add(pool.submit(() -> new Object[] { top,
+						renderer.findCallerMethods(descOf(top), candidateTargets, targetKeys) }));
+			}
+			for (java.util.concurrent.Future<Object[]> f : futures) {
+				Object[] r;
+				try {
+					r = f.get();
+				} catch (Exception e) {
+					continue;
+				}
+				String top = (String) r[0];
+				@SuppressWarnings("unchecked")
+				List<Renderer.Caller> found = (List<Renderer.Caller>) r[1];
+				if (found.isEmpty()) {
+					callers.add(classGranularCaller(top, targetRawName));
+				} else {
+					for (Renderer.Caller c : found) {
+						if (c.callerKey != null && !seenKeys.add(c.callerKey)) {
+							continue;
+						}
+						callers.add(callerHit(top, c, targetRawName));
+					}
+				}
+			}
+		} finally {
+			pool.shutdownNow();
+		}
+		// Referencing classes beyond the render cap: listed but not method-resolved (open to inspect).
+		for (int i = renderN; i < ordered.size(); i++) {
+			callers.add(classGranularCaller(ordered.get(i), targetRawName));
+		}
+		return callers;
+	}
+
+	// A resolved caller: opens the caller class at the call site (relocated by code line / k-th call),
+	// and carries `key` so it can itself be expanded to ITS callers.
+	private static Map<String, Object> callerHit(String id, Renderer.Caller c, String targetRawName) {
+		Map<String, Object> m = new LinkedHashMap<>();
+		m.put("id", id);
+		m.put("key", c.callerKey);          // null when the call is outside any method (not expandable)
+		m.put("name", c.callerName);
+		m.put("fullName", c.callerClassFqn + "." + c.callerName);
+		m.put("line", c.line);
+		m.put("col", c.col);
+		m.put("text", c.text);
+		m.put("find", c.text);              // relocate to the call site by code line
+		m.put("member", targetRawName);     // fallback: the called member's name
+		m.put("ordinal", c.ordinal);        // fallback: the k-th call of the member
+		m.put("expandable", c.callerKey != null);
+		return m;
+	}
+
+	// A referencing class we didn't render (beyond the cap) or with no method-level site: open it and
+	// relocate to the called member by name; not expandable (no caller method resolved).
+	private static Map<String, Object> classGranularCaller(String id, String targetRawName) {
+		Map<String, Object> m = new LinkedHashMap<>();
+		m.put("id", id);
+		m.put("name", id);
+		m.put("fullName", id);
+		m.put("line", 1);
+		m.put("col", 0);
+		m.put("text", id);
+		m.put("member", targetRawName);
+		m.put("expandable", false);
+		return m;
+	}
+
+	// The runtime (raw) method name encoded in a dexlib2 method key: between "->" and "(".
+	private static String rawNameOfKey(String key) {
+		int arrow = key.indexOf("->");
+		if (arrow < 0) {
+			return key;
+		}
+		int paren = key.indexOf('(', arrow);
+		return paren > arrow ? key.substring(arrow + 2, paren) : key.substring(arrow + 2);
+	}
+
 	// --- search (streamed) --------------------------------------------------
 
 	private Map<String, Object> startSearch(String kind, JsonObject params) {
@@ -785,6 +1070,12 @@ final class V2Engine {
 	private static String topLevel(String fqn) {
 		int d = fqn.indexOf('$');
 		return d >= 0 ? fqn.substring(0, d) : fqn;
+	}
+
+	// Simple (last-segment) name of a dotted fqn, keeping any Outer$Inner tail.
+	private static String simpleName(String fqn) {
+		int d = fqn.lastIndexOf('.');
+		return d >= 0 ? fqn.substring(d + 1) : fqn;
 	}
 
 	private static String kindName(int kind) {

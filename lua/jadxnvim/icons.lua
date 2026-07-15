@@ -11,6 +11,7 @@ M.icons = {
   resources = "\239\129\187", -- U+F07B  Resources section (folder)
   package = "\239\146\135", -- U+F487  a Java package
   class = "\238\173\155", -- U+EB5B  a class
+  interface = "\238\173\161", -- U+EB61  an interface
   method = "\238\170\140", -- U+EA8C  a method
   field = "\238\173\159", -- U+EB5F  a field
   folder = "\239\129\187", -- U+F07B  a resource directory (collapsed)

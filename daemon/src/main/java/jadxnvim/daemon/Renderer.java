@@ -161,6 +161,42 @@ public final class Renderer {
 	}
 
 	/**
+	 * Produce the smali (bytecode) listing of {@code classDesc} from a mini-dex — the target class and
+	 * its inner classes only, with NO reference closure (smali is the class's own bytecode, so cross-
+	 * class types don't need resolving) and NO Java decompilation. Lets the fast engine serve the
+	 * Java⟷Smali toggle without building jadx's whole-APK model.
+	 */
+	public Result smali(String classDesc) throws Exception {
+		String fqn = DexIndexer.descToFqn(classDesc);
+		File miniDex = new File(workDir, "smali-" + Integer.toHexString(classDesc.hashCode()) + ".dex");
+		try {
+			int n = extractor.extract(classDesc, miniDex);
+			if (n == 0) {
+				throw new IllegalArgumentException("class not found in APK: " + fqn);
+			}
+			JadxArgs args = new JadxArgs();
+			args.getInputFiles().add(miniDex);
+			args.setCodeCache(NoOpCodeCache.INSTANCE);
+			args.setSkipResources(true);
+			args.setThreadsCount(1);
+			try (JadxDecompiler jadx = new JadxDecompiler(args)) {
+				jadx.load();
+				JavaClass target = findClass(jadx.getClasses(), fqn);
+				if (target == null) {
+					throw new IllegalArgumentException("class not found in APK: " + fqn);
+				}
+				return new Result(fqn, target.getSmali(), 1);
+			}
+		} finally {
+			try {
+				Files.deleteIfExists(miniDex.toPath());
+			} catch (Exception ignore) {
+				// best effort
+			}
+		}
+	}
+
+	/**
 	 * Resolve the symbol referenced at (line, col) in the rendered class {@code classDesc}, keyed so
 	 * it can be looked up in the SQLite xref index. Returns null if nothing resolves there.
 	 */
@@ -275,6 +311,149 @@ public final class Renderer {
 				// best effort
 			}
 		}
+	}
+
+	/** An enclosing caller method that references the target, for call-hierarchy navigation. */
+	public static final class Caller {
+		public final String callerKey;      // dexlib2 method key of the caller (null if a call outside any method)
+		public final String callerName;     // caller method display name
+		public final String callerClassFqn; // caller's declaring class (may be an inner class)
+		public final int line;
+		public final int col;
+		public final int ordinal;           // k-th call to the target in this class (relocation fallback)
+		public final String text;
+
+		Caller(String callerKey, String callerName, String callerClassFqn, int line, int col, int ordinal,
+				String text) {
+			this.callerKey = callerKey;
+			this.callerName = callerName;
+			this.callerClassFqn = callerClassFqn;
+			this.line = line;
+			this.col = col;
+			this.ordinal = ordinal;
+			this.text = text;
+		}
+	}
+
+	/**
+	 * Find, in {@code refClassDesc}, the enclosing methods that reference the symbol keyed by
+	 * {@code targetKeys} — the "who calls this" set for a call hierarchy. Like {@link #findUsageSites}
+	 * but each hit is mapped to the caller method that lexically contains it (via jadx's method
+	 * declaration positions), so the caller can itself be expanded. One entry per distinct caller
+	 * method (its first call site).
+	 */
+	public java.util.List<Caller> findCallerMethods(String refClassDesc, java.util.Set<String> candidateTargets,
+			java.util.Set<String> targetKeys) throws Exception {
+		String fqn = DexIndexer.descToFqn(refClassDesc);
+		File miniDex = new File(workDir, "callers-" + tmpSeq.incrementAndGet() + ".dex");
+		try {
+			int n = extractor.extractForUsages(refClassDesc, candidateTargets, miniDex);
+			if (n == 0) {
+				return java.util.List.of();
+			}
+			JadxArgs args = new JadxArgs();
+			args.getInputFiles().add(miniDex);
+			args.setCodeCache(NoOpCodeCache.INSTANCE);
+			args.setSkipResources(true);
+			args.setShowInconsistentCode(true);
+			args.setThreadsCount(1);
+			try (JadxDecompiler jadx = new JadxDecompiler(args)) {
+				jadx.load();
+				JavaClass refClass = findClass(jadx.getClasses(), fqn);
+				if (refClass == null) {
+					return java.util.List.of();
+				}
+				ICodeInfo info = refClass.getCodeInfo();
+				ICodeMetadata md = info.getCodeMetadata();
+				if (md == null) {
+					return java.util.List.of();
+				}
+				String code = info.getCodeStr();
+				String[] lines = code.split("\n", -1);
+				// Methods (incl. inner classes) sorted by declaration position, so the enclosing method
+				// of a call offset is the last method declared at or before it.
+				java.util.List<JavaMethod> methods = new ArrayList<>();
+				collectMethods(refClass, methods);
+				methods.removeIf(m -> m.getDefPos() < 0);
+				methods.sort(java.util.Comparator.comparingInt(JavaMethod::getDefPos));
+
+				// Reference offsets to the target, in source order.
+				java.util.List<Integer> offs = new ArrayList<>();
+				for (Map.Entry<Integer, ICodeAnnotation> e : md.getAsMap().entrySet()) {
+					ICodeAnnotation.AnnType t = e.getValue().getAnnType();
+					if (t != ICodeAnnotation.AnnType.CLASS && t != ICodeAnnotation.AnnType.METHOD
+							&& t != ICodeAnnotation.AnnType.FIELD) {
+						continue;
+					}
+					int off = e.getKey();
+					JavaNode node = jadx.getJavaNodeAtPosition(info, off);
+					if (node == null) {
+						continue;
+					}
+					ResolvedSymbol s = symbolOf(node);
+					if (s == null || !targetKeys.contains(s.targetKey)) {
+						continue;
+					}
+					offs.add(off);
+				}
+				java.util.Collections.sort(offs);
+
+				java.util.List<Caller> out = new ArrayList<>();
+				java.util.Set<String> seenCallers = new java.util.HashSet<>();
+				java.util.Set<Integer> seenLines = new java.util.HashSet<>();
+				int ordinal = 0;
+				for (int off : offs) {
+					int[] lc = Positions.toLineCol(code, off);
+					if (!seenLines.add(lc[0])) {
+						continue; // one entry per line for ordinal counting
+					}
+					ordinal++;
+					JavaMethod encl = enclosingMethod(methods, off);
+					String key = encl == null ? null : methodKey(encl);
+					String dedup = key != null ? key : "class:" + fqn;
+					if (!seenCallers.add(dedup)) {
+						continue; // first call site per caller method only
+					}
+					String text = lc[0] >= 1 && lc[0] <= lines.length ? lines[lc[0] - 1].strip() : "";
+					String name = encl != null ? encl.getName() : simpleName(fqn);
+					String classFqn = encl != null && encl.getDeclaringClass() != null
+							? encl.getDeclaringClass().getFullName() : fqn;
+					out.add(new Caller(key, name, classFqn, lc[0], lc[1], ordinal, text));
+				}
+				return out;
+			}
+		} finally {
+			try {
+				Files.deleteIfExists(miniDex.toPath());
+			} catch (Exception ignore) {
+				// best effort
+			}
+		}
+	}
+
+	private static void collectMethods(JavaClass cls, java.util.List<JavaMethod> out) {
+		out.addAll(cls.getMethods());
+		for (JavaClass inner : cls.getInnerClasses()) {
+			collectMethods(inner, out);
+		}
+	}
+
+	// The method whose declaration is the last at or before {@code off} (methods sorted by defPos).
+	private static JavaMethod enclosingMethod(java.util.List<JavaMethod> sorted, int off) {
+		JavaMethod best = null;
+		for (JavaMethod m : sorted) {
+			if (m.getDefPos() <= off) {
+				best = m;
+			} else {
+				break;
+			}
+		}
+		return best;
+	}
+
+	private static String simpleName(String fqn) {
+		int d = fqn.lastIndexOf('.');
+		return d >= 0 ? fqn.substring(d + 1) : fqn;
 	}
 
 	// Find the class/method/field node in cls (recursively through inner classes) whose key matches.

@@ -102,6 +102,8 @@ local function java_keymaps(bufnr)
   vim.keymap.set("n", "gr", nav("find_usages"), opts)
   -- resolve a merged-lambda dispatcher call (`new X.Y(.., N)`) to its `case N:` branch
   vim.keymap.set("n", "<leader>jt", nav("resolve_task"), opts)
+  vim.keymap.set("n", "<leader>jk", nav("call_hierarchy"), opts) -- incoming callers of the method
+  vim.keymap.set("n", "<leader>ji", nav("type_hierarchy"), opts) -- super/subtype hierarchy
   vim.keymap.set("n", "<leader>jr", function()
     require("jadxnvim.edit").rename()
   end, opts)
@@ -145,10 +147,10 @@ end
 local function fill_java(bufnr, id)
   local err, result = fetch("getCode", id)
   vim.bo[bufnr].modifiable = true
-  if err then
+  if err or not result then
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
       "// jadxnvim: failed to load " .. id,
-      "// " .. (err.message or "unknown error"),
+      "// " .. ((err and err.message) or "the daemon did not respond in time"),
     })
     vim.bo[bufnr].modifiable = false
     return
@@ -166,10 +168,10 @@ end
 local function fill_smali(bufnr, id)
   local err, result = fetch("getSmali", id)
   vim.bo[bufnr].modifiable = true
-  if err then
+  if err or not result then
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
       "; jadxnvim: failed to load smali for " .. id,
-      "; " .. (err.message or "unknown error"),
+      "; " .. ((err and err.message) or "the daemon did not respond in time"),
     })
     vim.bo[bufnr].modifiable = false
     return
@@ -187,10 +189,10 @@ end
 local function fill_resource(bufnr, name)
   local err, result = fetch("getResource", name, "name")
   vim.bo[bufnr].modifiable = true
-  if err then
+  if err or not result then
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
       "// jadxnvim: failed to load resource " .. name,
-      "// " .. (err.message or "unknown error"),
+      "// " .. ((err and err.message) or "the daemon did not respond in time"),
     })
     vim.bo[bufnr].modifiable = false
     return
@@ -548,14 +550,20 @@ function M.reset_views()
   view_mem = {}
 end
 
---- The window to show code in: prefer a non-tree window, else open a vertical split.
+-- A side-panel window (the project tree or the hierarchy view) is never a place to show code.
+local function is_panel(win)
+  local b = vim.api.nvim_win_get_buf(win)
+  return vim.b[b].jadx_tree or vim.b[b].jadx_hierarchy
+end
+
+--- The window to show code in: prefer a non-panel window, else open a vertical split.
 function M.target_win()
   local cur = vim.api.nvim_get_current_win()
-  if not vim.b[vim.api.nvim_win_get_buf(cur)].jadx_tree then
+  if not is_panel(cur) then
     return cur
   end
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    if not vim.b[vim.api.nvim_win_get_buf(win)].jadx_tree then
+    if not is_panel(win) then
       return win
     end
   end

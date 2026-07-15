@@ -12,6 +12,9 @@ M.repo = assert(os.getenv("JADXNVIM_REPO"), "JADXNVIM_REPO not set")
 M.fixture = assert(os.getenv("JADX_TEST_JAR"), "JADX_TEST_JAR not set")
 M.jar = os.getenv("JADXNVIM_JAR") or (M.repo .. "/daemon/build/libs/jadxd.jar")
 M.rg = os.getenv("JADXNVIM_RG")
+-- The .dex fixture drives the v2/fast engine (dexlib2 reads dex/apk only). Unset when d8 wasn't
+-- available at build time; fast-engine specs call M.skip_without_dex() to opt out cleanly.
+M.dex = os.getenv("JADX_TEST_DEX")
 
 local jadx = require("jadxnvim")
 local rpc = require("jadxnvim.rpc")
@@ -87,6 +90,53 @@ function M.open(opts)
   local win = code.target_win()
   vim.api.nvim_set_current_win(win)
   return win
+end
+
+--- Skip a fast-engine spec cleanly (exit 0) when no .dex fixture was built (d8 unavailable).
+function M.skip_without_dex()
+  if not M.dex or M.dex == "" then
+    io.stderr:write("  SKIP (no .dex fixture — d8 not available)\n")
+    vim.cmd("cquit 0")
+  end
+end
+
+--- Open the .dex fixture with the v2/fast engine and wait until the tree is populated. Fast mode
+--- serves the tree/search/code from the SQLite index (built on open), so there is no export to wait
+--- on. Returns the code window.
+function M.open_fast()
+  M.skip_without_dex()
+  jadx.setup({ jar = M.jar, rg = M.rg, session = false, fast = true, export = false, temp = true })
+  jadx.open(M.dex)
+  local ok = vim.wait(120000, function()
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_get_name(b):match("jadx://tree$") and #vim.api.nvim_buf_get_lines(b, 0, -1, false) > 1 then
+        return true
+      end
+    end
+    return false
+  end, 100)
+  M.check("fast project loaded", ok)
+  vim.wait(300)
+  local win = code.target_win()
+  vim.api.nvim_set_current_win(win)
+  return win
+end
+
+--- Run a fast-engine spec body against the freshly-opened .dex fixture, then finish.
+function M.spec_fast(fn)
+  local win = M.open_fast()
+  local ok, err = pcall(fn, win)
+  if not ok then
+    M.check("spec raised no error", false, err)
+  end
+  M.done()
+end
+
+--- Synchronous RPC helper used by hierarchy specs (returns just the result, asserting no error).
+function M.rpc_ok(method, params)
+  local err, res = M.req(method, params)
+  M.check(method .. " ok", not err, err and err.message)
+  return res
 end
 
 --- Open class `id` into the given window and return its buffer + lines.
