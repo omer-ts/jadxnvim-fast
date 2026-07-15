@@ -577,6 +577,80 @@ public final class Db implements AutoCloseable {
 		return out;
 	}
 
+	// --- type hierarchy (superclass/interface graph, no rendering) -----------
+
+	/** A neighbouring type in the class hierarchy. {@code inApk} is false for framework/library types. */
+	public static final class TypeRef {
+		public final String desc;
+		public final String fqn;
+		public final int access; // -1 when the type is not in this APK
+		public final boolean inApk;
+
+		TypeRef(String desc, String fqn, int access, boolean inApk) {
+			this.desc = desc;
+			this.fqn = fqn;
+			this.access = access;
+			this.inApk = inApk;
+		}
+
+		public boolean isInterface() {
+			return access >= 0 && (access & 0x200) != 0; // ACC_INTERFACE
+		}
+	}
+
+	// Resolve a descriptor to a TypeRef, marking whether it is present in this APK.
+	private TypeRef typeRef(String desc) throws SQLException {
+		try (PreparedStatement ps = conn.prepareStatement("SELECT fqn,access FROM classes WHERE desc=?")) {
+			ps.setString(1, desc);
+			try (ResultSet rs = ps.executeQuery()) {
+				if (rs.next()) {
+					return new TypeRef(desc, rs.getString(1), rs.getInt(2), true);
+				}
+			}
+		}
+		return new TypeRef(desc, DexIndexer.descToFqn(desc), -1, false);
+	}
+
+	/** Direct supertypes of {@code desc}: its superclass (unless Object) plus declared interfaces. */
+	public synchronized List<TypeRef> supersOf(String desc) throws SQLException {
+		List<TypeRef> out = new ArrayList<>();
+		String sup = queryOne("SELECT super_desc FROM classes WHERE desc=?", desc);
+		if (sup != null && !sup.isEmpty() && !"Ljava/lang/Object;".equals(sup)) {
+			out.add(typeRef(sup));
+		}
+		for (String iface : queryList(
+				"SELECT ci.iface_desc FROM class_iface ci JOIN classes c ON c.id=ci.class_id WHERE c.desc=?",
+				desc)) {
+			out.add(typeRef(iface));
+		}
+		return out;
+	}
+
+	/** Direct subtypes of {@code desc}: subclasses (extend it) plus implementors (implement it). */
+	public synchronized List<TypeRef> subsOf(String desc) throws SQLException {
+		java.util.LinkedHashMap<String, TypeRef> out = new java.util.LinkedHashMap<>();
+		try (PreparedStatement ps = conn.prepareStatement(
+				"SELECT desc,fqn,access FROM classes WHERE super_desc=? ORDER BY fqn")) {
+			ps.setString(1, desc);
+			try (ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					out.putIfAbsent(rs.getString(1), new TypeRef(rs.getString(1), rs.getString(2), rs.getInt(3), true));
+				}
+			}
+		}
+		try (PreparedStatement ps = conn.prepareStatement(
+				"SELECT c.desc,c.fqn,c.access FROM class_iface ci JOIN classes c ON c.id=ci.class_id "
+						+ "WHERE ci.iface_desc=? ORDER BY c.fqn")) {
+			ps.setString(1, desc);
+			try (ResultSet rs = ps.executeQuery()) {
+				while (rs.next()) {
+					out.putIfAbsent(rs.getString(1), new TypeRef(rs.getString(1), rs.getString(2), rs.getInt(3), true));
+				}
+			}
+		}
+		return new ArrayList<>(out.values());
+	}
+
 	@Override
 	public synchronized void close() throws SQLException {
 		conn.close();

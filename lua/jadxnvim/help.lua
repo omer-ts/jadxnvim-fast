@@ -32,6 +32,9 @@ local function entries()
     -- Navigate
     { group = "Navigate", key = "gd", name = "Go to definition", desc = "resolve symbol (implementations picker for interfaces)", ctx = "code", run = run("nav", "goto_def") },
     { group = "Navigate", key = "gr", name = "Find usages", desc = "cross-references (incl. polymorphic)", ctx = "code", run = run("nav", "find_usages") },
+    { group = "Navigate", key = "<leader>jk", name = "Call hierarchy", desc = "incoming callers of the method (expandable)", ctx = "code", run = run("nav", "call_hierarchy") },
+    { group = "Navigate", key = "<leader>ji", name = "Type hierarchy", desc = "super/subtype tree of the class", ctx = "code", run = run("nav", "type_hierarchy") },
+    { group = "Navigate", key = "<leader>jt", name = "Resolve dispatcher task", desc = "merged-lambda switch → case branch", ctx = "code", run = run("nav", "resolve_task") },
     { group = "Navigate", key = "<Tab>", name = "Toggle Java ⟷ Smali", desc = "in a code buffer", ctx = "code", run = run("code", "toggle_view") },
     { group = "Navigate", key = ":JadxTree", name = "Focus the tree", desc = "project explorer (/ to filter)", run = run("tree", "open") },
     { group = "Navigate", key = ":JadxGotoPackage", name = "Go to package", desc = "jump the tree to a package (Tab-completes)", run = excmd("JadxGotoPackage") },

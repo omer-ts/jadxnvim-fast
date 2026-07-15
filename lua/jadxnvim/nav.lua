@@ -346,6 +346,166 @@ function M.find_usages()
   end)
 end
 
+-- Open the source for a hierarchy node in the code window (call site for callers, class for types).
+local function open_hier_node(n)
+  if not n or not n.id then
+    return
+  end
+  code.open(n.id, {
+    line = n.line, col = n.col,
+    find = n.find, find_method = n.member, find_ordinal = n.ordinal,
+  })
+end
+
+local function type_icon(kind)
+  local icons = require("jadxnvim.icons")
+  return icons.get(kind == "interface" and "interface" or "class")
+end
+
+-- Turn a server type-hierarchy node into a hierarchy.lua node (recursively, following `dir`).
+local function type_node(t, dir)
+  local kids = {}
+  for _, k in ipairs(t[dir] or {}) do
+    kids[#kids + 1] = type_node(k, dir)
+  end
+  local label = t.name or t.id
+  if t.inApk == false then
+    label = label .. "  (external)"
+  end
+  return {
+    label = label,
+    icon = type_icon(t.kind),
+    openable = t.inApk ~= false,
+    id = t.id,
+    expandable = #kids > 0,
+    children = #kids > 0 and kids or nil,
+    _open = true, -- type hierarchies are small; show them fully expanded
+  }
+end
+
+--- Show the super/subtype hierarchy of the class in the current buffer (or the type under the cursor)
+--- in a tree: supertypes it extends/implements above, subtypes that extend/implement it below.
+function M.type_hierarchy()
+  local id, line, col = code.cursor_target()
+  if not id then
+    notify("not in a jadx code buffer", vim.log.levels.WARN)
+    return
+  end
+  rpc.request("typeHierarchy", { id = id, line = line, col = col }, function(err, res)
+    vim.schedule(function()
+      if err then
+        notify("type hierarchy failed: " .. (err.message or "?"), vim.log.levels.ERROR)
+        return
+      end
+      if not res.found then
+        notify("no type hierarchy (class not in this APK)", vim.log.levels.WARN)
+        return
+      end
+      local supers, subs = {}, {}
+      for _, t in ipairs(res.supers or {}) do
+        supers[#supers + 1] = type_node(t, "supers")
+      end
+      for _, t in ipairs(res.subs or {}) do
+        subs[#subs + 1] = type_node(t, "subs")
+      end
+      local self_node = {
+        label = res.name or id,
+        icon = type_icon(res.kind),
+        openable = true,
+        id = res.id,
+      }
+      local roots = {
+        { label = string.format("Supertypes (%d)", #supers), expandable = #supers > 0,
+          children = #supers > 0 and supers or nil, _open = true },
+        self_node,
+        { label = string.format("Subtypes (%d)", #subs), expandable = #subs > 0,
+          children = #subs > 0 and subs or nil, _open = true },
+      }
+      require("jadxnvim.hierarchy").show({
+        title = " Type hierarchy: " .. (res.fullName or res.name or id) .. " ",
+        roots = roots,
+        on_open = open_hier_node,
+      })
+    end)
+  end)
+end
+
+-- Lazily fetch a caller node's own callers when it is expanded in the tree.
+local function expand_callers(node, cb)
+  rpc.request("callHierarchy", { key = node.key, name = node.name }, function(err, res)
+    vim.schedule(function()
+      if err or not res or not res.found then
+        cb({})
+        return
+      end
+      cb(M._caller_nodes(res.callers))
+    end)
+  end)
+end
+
+-- Build hierarchy nodes for a list of caller entries from the daemon.
+function M._caller_nodes(callers)
+  local icons = require("jadxnvim.icons")
+  local nodes = {}
+  for _, c in ipairs(callers or {}) do
+    local label = c.fullName or c.name or c.id
+    if c.line and c.line > 1 then
+      label = label .. ":" .. c.line
+    end
+    nodes[#nodes + 1] = {
+      label = label,
+      icon = icons.get(c.key and "method" or "class"),
+      openable = true,
+      id = c.id, line = c.line, col = c.col,
+      find = c.find, member = c.member, ordinal = c.ordinal,
+      key = c.key,
+      expandable = c.expandable == true,
+      expand = c.expandable == true and expand_callers or nil,
+    }
+  end
+  return nodes
+end
+
+--- Show the incoming call hierarchy ("who calls this") for the method under the cursor: a tree of
+--- caller methods, each expandable to its own callers.
+function M.call_hierarchy()
+  local id, line, col = code.cursor_target()
+  if not id then
+    notify("not in a jadx code buffer", vim.log.levels.WARN)
+    return
+  end
+  rpc.request("callHierarchy", { id = id, line = line, col = col }, function(err, res)
+    vim.schedule(function()
+      if err then
+        notify("call hierarchy failed: " .. (err.message or "?"), vim.log.levels.ERROR)
+        return
+      end
+      if not res.found then
+        notify("call hierarchy: " .. (res.reason or "put the cursor on a method"), vim.log.levels.WARN)
+        return
+      end
+      local icons = require("jadxnvim.icons")
+      local children = M._caller_nodes(res.callers)
+      local root = {
+        label = (res.root and res.root.fullName or res.root and res.root.name or "method")
+          .. string.format("  — %d caller%s%s", #children, #children == 1 and "" or "s",
+            res.truncated and "+" or ""),
+        icon = icons.get("method"),
+        openable = res.root ~= nil,
+        id = res.root and res.root.id,
+        expandable = #children > 0,
+        children = #children > 0 and children or nil,
+        _open = true,
+      }
+      require("jadxnvim.hierarchy").show({
+        title = " Call hierarchy: " .. (res.root and res.root.fullName or "callers") .. " ",
+        roots = { root },
+        on_open = open_hier_node,
+      })
+    end)
+  end)
+end
+
 --- Generate a Frida hook for the symbol under the cursor: the method (all overloads — and every
 --- implementation, for an interface/virtual call) or the whole class.
 function M.frida_hook()
