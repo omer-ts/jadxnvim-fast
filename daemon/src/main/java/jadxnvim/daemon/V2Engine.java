@@ -44,6 +44,13 @@ final class V2Engine {
 			return size() > CODE_CACHE_MAX;
 		}
 	};
+	// Java-line → source-line map cache (drives the Java→Smali follow view); one render per class.
+	private final Map<String, Map<String, Object>> lineMapCache = new LinkedHashMap<>(64, 0.75f, true) {
+		@Override
+		protected boolean removeEldestEntry(Map.Entry<String, Map<String, Object>> e) {
+			return size() > CODE_CACHE_MAX;
+		}
+	};
 
 	private final ExecutorService searchExec = Executors.newSingleThreadExecutor(r -> {
 		Thread t = new Thread(r, "jadxd-v2-search");
@@ -73,6 +80,8 @@ final class V2Engine {
 				return getCode(reqStr(params, "id"));
 			case "getSmali":
 				return getSmali(reqStr(params, "id"));
+			case "getLineMap":
+				return getLineMap(reqStr(params, "id"));
 			case "memberPos":
 				return memberPos(reqStr(params, "id"), reqInt(params, "index"));
 			case "gotoDef":
@@ -230,6 +239,33 @@ final class V2Engine {
 		result.put("id", id);
 		result.put("fullName", id);
 		result.put("smali", smali);
+		return result;
+	}
+
+	/**
+	 * The decompiled-Java-line → original-source-line map for class {@code id}, used by the frontend's
+	 * Java→Smali follow view to point at the matching smali {@code .line} directive. Returned as a
+	 * JSON object with string keys (java line) → int values (source line); empty {@code map} when the
+	 * class has no debug line info. Rendered once per class and cached.
+	 */
+	private Map<String, Object> getLineMap(String id) throws Exception {
+		Map<String, Object> jmap;
+		synchronized (lineMapCache) {
+			jmap = lineMapCache.get(id);
+		}
+		if (jmap == null) {
+			Map<Integer, Integer> raw = renderer.sourceLineMap(descOf(id));
+			jmap = new LinkedHashMap<>();
+			for (Map.Entry<Integer, Integer> e : raw.entrySet()) {
+				jmap.put(String.valueOf(e.getKey()), e.getValue());
+			}
+			synchronized (lineMapCache) {
+				lineMapCache.put(id, jmap);
+			}
+		}
+		Map<String, Object> result = new LinkedHashMap<>();
+		result.put("id", id);
+		result.put("map", jmap);
 		return result;
 	}
 
