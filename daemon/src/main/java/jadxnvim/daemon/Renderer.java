@@ -197,6 +197,25 @@ public final class Renderer {
 	}
 
 	/**
+	 * The decompiled-Java-line → original-source-line map for {@code classDesc} (jadx's debug-line
+	 * metadata, {@link ICodeMetadata#getLineMapping()}), rendered WITH the closure so its line numbers
+	 * match the {@link #decompile} (getCode) buffer. Keys and values are 1-based line numbers. Empty
+	 * when the class carries no debug line info (e.g. the dex was stripped by an obfuscator) — callers
+	 * then degrade to method-level sync. This is the bridge that lets the Java view point at the
+	 * matching smali {@code .line} directive, since both derive from the same source line numbers.
+	 */
+	public Map<Integer, Integer> sourceLineMap(String classDesc) throws Exception {
+		Map<Integer, Integer> m = withRenderedClass(classDesc, true, null, (jadx, cls, info, code) -> {
+			ICodeMetadata md = info.getCodeMetadata();
+			Map<Integer, Integer> lm = md == null ? null : md.getLineMapping();
+			return lm == null || lm.isEmpty()
+					? new java.util.LinkedHashMap<Integer, Integer>()
+					: new java.util.LinkedHashMap<>(lm);
+		});
+		return m == null ? new java.util.LinkedHashMap<>() : m;
+	}
+
+	/**
 	 * Resolve the symbol referenced at (line, col) in the rendered class {@code classDesc}, keyed so
 	 * it can be looked up in the SQLite xref index. Returns null if nothing resolves there.
 	 */

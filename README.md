@@ -134,6 +134,7 @@ loads), opens the project automatically, and builds the daemon jar on first run 
 | `:JadxUsages`          | Find usages of the symbol under the cursor (xref, browsable + preview) |
 | `:JadxCallers`         | Incoming call hierarchy for the method under the cursor (expandable tree) |
 | `:JadxTypeHierarchy`   | Super/subtype hierarchy for the class under the cursor          |
+| `:JadxFollowSmali`     | Toggle a live split that keeps the Java and smali panes synced  |
 | `:JadxSearch [text]`   | Full-text search across code (streamed → quickfix)              |
 | `:JadxSearchName [q]`  | Search class/method/field names                                 |
 | `:JadxFindClass`       | Fuzzy-find a class                                              |
@@ -155,6 +156,7 @@ loads), opens the project automatically, and builds the daemon jar on first run 
 | `<leader>ji` | **Type hierarchy** — super/subtype tree of the class (see below) |
 | `<leader>jt` | **Resolve a merged-lambda dispatcher call** to the branch it runs (see below) |
 | `<Tab>`      | Toggle Java ⟷ Smali (syncs to the same method) |
+| `<leader>jf` | **Follow Java ⟷ Smali** — live split; the two panes track each other's cursor (see below) |
 | `<leader>jr` | Rename (classes, methods, fields, local variables) |
 | `<leader>jc` | Comment                        |
 | `<leader>jh` / `<leader>jH` | Frida hook the symbol / every method of the class |
@@ -212,6 +214,16 @@ Everything below is served from the SQLite index + on-demand render — no whole
   cursor): supertypes it extends/implements above, subtypes that extend/implement it below, both
   transitive. Interfaces and classes are marked; framework/library types show as `(external)`. Served
   entirely from the SQLite class hierarchy (no rendering). `<CR>` opens a type.
+
+- **Follow Java ⟷ Smali (`<leader>jf`).** Open a live smali split beside the Java view and keep the
+  two panes pinned to each other, **both ways**: move around the decompiled Java and the smali scrolls
+  and highlights the matching instructions; move around the smali and the Java jumps to the matching
+  source. `<Tab>` *replaces* the current buffer to read smali; follow keeps **both** side-by-side and
+  tracks whichever pane you're driving. The mapping is exact, not heuristic — jadx reports each
+  decompiled line's original source line and smali carries the same source lines as `.line`
+  directives, so a Java line resolves to the matching `.line` inside the enclosing method (and back).
+  When the dex has no debug line info (obfuscator-stripped) it degrades to method-level sync.
+  `<leader>jf` again (or `:JadxFollowSmali`, or closing the split) turns it off.
 
 - **Content search** covers dex **string constants** across *all* classes with no decompilation
   (instant), plus the decompiled Java of classes you've viewed (a source FTS filled lazily).

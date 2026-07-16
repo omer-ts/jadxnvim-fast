@@ -104,6 +104,9 @@ local function java_keymaps(bufnr)
   vim.keymap.set("n", "<leader>jt", nav("resolve_task"), opts)
   vim.keymap.set("n", "<leader>jk", nav("call_hierarchy"), opts) -- incoming callers of the method
   vim.keymap.set("n", "<leader>ji", nav("type_hierarchy"), opts) -- super/subtype hierarchy
+  vim.keymap.set("n", "<leader>jf", function()
+    M.toggle_follow()
+  end, opts) -- live Java→Smali follow split
   vim.keymap.set("n", "<leader>jr", function()
     require("jadxnvim.edit").rename()
   end, opts)
@@ -259,6 +262,8 @@ function M.setup()
   end
   pcall(vim.cmd, "filetype on")
   apply_default_colors()
+  -- Highlight of the smali line the follow view is synced to (user-overridable via `default`).
+  pcall(vim.api.nvim_set_hl, 0, "JadxFollowLine", { link = "Visual", default = true })
 
   local group = vim.api.nvim_create_augroup("jadxnvim_code", { clear = true })
   vim.api.nvim_create_autocmd("BufReadCmd", {
@@ -550,6 +555,322 @@ function M.reset_views()
   view_mem = {}
 end
 
+-- ============================ Java ⟷ Smali follow view ============================
+-- A live split that keeps the Java and smali panes pinned to each other. Toggled with <leader>jf.
+-- Unlike <Tab> (which replaces the current buffer), follow opens a dedicated smali split and syncs
+-- BOTH ways: move in the Java pane and the smali scrolls to the matching bytecode; move in the smali
+-- pane and the Java jumps to the matching source. The mapping is principled: jadx reports each
+-- decompiled Java line's original source line (getLineMap); smali carries the same source lines as
+-- `.line N` directives — so Java line ⟷ source line ⟷ the matching `.line` inside the enclosing
+-- method. With no debug info (stripped dex) it degrades to method-level sync.
+
+local follow = { active = false, jwin = nil, swin = nil, srcmaps = {}, ns = nil, syncing = false }
+
+-- Java-line → source-line map for a class (cached per id; one daemon render). Empty on error or when
+-- the dex has no line info, in which case the sync falls back to method granularity.
+local function fetch_srcmap(id)
+  local cached = follow.srcmaps[id]
+  if cached then
+    return cached
+  end
+  local err, result = fetch("getLineMap", id)
+  local map = {}
+  if not err and result and result.map then
+    for k, v in pairs(result.map) do
+      map[tonumber(k)] = tonumber(v)
+    end
+  end
+  follow.srcmaps[id] = map
+  return map
+end
+
+-- [start, end] buffer line range of the smali method named `name` (its `.method` decl line through
+-- the matching `.end method`), or nil if not found.
+local function smali_method_range(bufnr, name)
+  local start = smali_method_line(bufnr, name)
+  if not start then
+    return nil, nil
+  end
+  local rest = vim.api.nvim_buf_get_lines(bufnr, start, -1, false)
+  local endl = start + #rest
+  for i, l in ipairs(rest) do
+    if l:match("^%s*%.end%s+method") then
+      endl = start + i
+      break
+    end
+  end
+  return start, endl
+end
+
+-- Buffer line of the `.line srcline` directive within [mstart, mend] (or nearest `.line` <= srcline
+-- in that range). nil when no directive is at/below srcline — smali only emits `.line` where debug
+-- info exists, so a Java line with no exact match snaps to the closest preceding bytecode line.
+local function smali_line_for_src(bufnr, srcline, mstart, mend)
+  if not srcline then
+    return nil
+  end
+  local base = mstart or 1
+  local lines = vim.api.nvim_buf_get_lines(bufnr, base - 1, mend or -1, false)
+  local best, best_n
+  for i, l in ipairs(lines) do
+    local n = l:match("^%s*%.line%s+(%d+)")
+    if n then
+      n = tonumber(n)
+      if n == srcline then
+        return base + i - 1
+      end
+      if n <= srcline and (not best_n or n > best_n) then
+        best, best_n = base + i - 1, n
+      end
+    end
+  end
+  return best
+end
+
+-- Mirror the Java cursor into the follow smali split: load the matching class if needed, then move
+-- (and highlight) the smali line corresponding to the Java line under the cursor.
+local function follow_sync()
+  if not follow.active or follow.syncing then
+    return
+  end
+  local jwin, swin = follow.jwin, follow.swin
+  if not (jwin and vim.api.nvim_win_is_valid(jwin) and swin and vim.api.nvim_win_is_valid(swin)) then
+    M.stop_follow()
+    return
+  end
+  -- Only drive the sync from the Java window; ignore cursor moves in the smali split itself.
+  if vim.api.nvim_get_current_win() ~= jwin then
+    return
+  end
+  local jbuf = vim.api.nvim_win_get_buf(jwin)
+  if vim.b[jbuf].jadx_view ~= "java" then
+    return
+  end
+  local id = vim.b[jbuf].jadx_class_id
+  if not id then
+    return
+  end
+  follow.syncing = true
+  local ok, err = pcall(function()
+    local sbuf = vim.api.nvim_win_get_buf(swin)
+    if vim.b[sbuf].jadx_class_id ~= id then
+      -- Java window navigated to another class: bring the smali split along.
+      vim.api.nvim_win_call(swin, function()
+        vim.cmd("edit " .. vim.fn.fnameescape(SMALI_PREFIX .. id))
+      end)
+      sbuf = vim.api.nvim_win_get_buf(swin)
+    end
+    local jline = vim.api.nvim_win_get_cursor(jwin)[1]
+    local srcmap = fetch_srcmap(id)
+    local srcline = srcmap[jline]
+    if not srcline then
+      for l = jline, 1, -1 do -- nearest mapped Java line at/above the cursor
+        if srcmap[l] then
+          srcline = srcmap[l]
+          break
+        end
+      end
+    end
+    local method = nearest_method_name(jbuf, jline, false)
+    local mstart, mend
+    if method then
+      mstart, mend = smali_method_range(sbuf, method)
+    end
+    local target = smali_line_for_src(sbuf, srcline, mstart, mend) or mstart or 1
+    target = math.max(1, math.min(target, vim.api.nvim_buf_line_count(sbuf)))
+    pcall(vim.api.nvim_win_set_cursor, swin, { target, 0 })
+    vim.api.nvim_win_call(swin, function()
+      vim.cmd("normal! zz")
+    end)
+    vim.api.nvim_buf_clear_namespace(sbuf, follow.ns, 0, -1)
+    pcall(vim.api.nvim_buf_set_extmark, sbuf, follow.ns, target - 1, 0, {
+      line_hl_group = "JadxFollowLine",
+    })
+  end)
+  follow.syncing = false
+  if not ok then
+    vim.notify("[jadxnvim] follow sync: " .. tostring(err), vim.log.levels.DEBUG)
+  end
+end
+
+-- Name of the smali method enclosing `line` (nearest `.method ... name(` at/above it), or nil.
+local function smali_method_at(bufnr, line)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, line, false)
+  for i = #lines, 1, -1 do
+    local n = lines[i]:match("^%s*%.method%s.-([%w_$<>]+)%(")
+    if n then
+      return n
+    end
+  end
+end
+
+-- The source line for smali `line`: the nearest `.line N` directive at/above it, not crossing the
+-- enclosing `.method` boundary. nil when the method carries no debug line info.
+local function smali_src_at(bufnr, line)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, line, false)
+  for i = #lines, 1, -1 do
+    local l = lines[i]
+    if l:match("^%s*%.method%s") then
+      return nil -- reached the method header without a `.line` above the cursor
+    end
+    local n = l:match("^%s*%.line%s+(%d+)")
+    if n then
+      return tonumber(n)
+    end
+  end
+end
+
+-- The Java line mapping to `srcline` (inverse of the java→source map), preferring the occurrence
+-- nearest `near` (the enclosing method's decl line) so a source line reused across methods resolves
+-- within the right one.
+local function java_line_for_src(srcmap, srcline, near)
+  if not srcline then
+    return nil
+  end
+  local best, best_d
+  for jl, src in pairs(srcmap) do
+    if src == srcline then
+      local d = near and math.abs(jl - near) or 0
+      if not best_d or d < best_d then
+        best, best_d = jl, d
+      end
+    end
+  end
+  return best
+end
+
+-- Reverse sync: mirror the smali cursor back into the Java pane (load the matching class if needed),
+-- then move (and highlight) the Java line corresponding to the bytecode under the cursor.
+local function follow_sync_smali()
+  if not follow.active or follow.syncing then
+    return
+  end
+  local jwin, swin = follow.jwin, follow.swin
+  if not (jwin and vim.api.nvim_win_is_valid(jwin) and swin and vim.api.nvim_win_is_valid(swin)) then
+    M.stop_follow()
+    return
+  end
+  if vim.api.nvim_get_current_win() ~= swin then
+    return
+  end
+  local sbuf = vim.api.nvim_win_get_buf(swin)
+  local id = vim.b[sbuf].jadx_class_id
+  if not id then
+    return
+  end
+  follow.syncing = true
+  local ok, err = pcall(function()
+    local jbuf = vim.api.nvim_win_get_buf(jwin)
+    if vim.b[jbuf].jadx_view ~= "java" or vim.b[jbuf].jadx_class_id ~= id then
+      -- Smali showing a different class than the Java pane: bring the Java pane along.
+      vim.api.nvim_win_call(jwin, function()
+        vim.cmd("edit " .. vim.fn.fnameescape(JAVA_PREFIX .. id))
+      end)
+      jbuf = vim.api.nvim_win_get_buf(jwin)
+    end
+    local sline = vim.api.nvim_win_get_cursor(swin)[1]
+    local srcline = smali_src_at(sbuf, sline)
+    local method = smali_method_at(sbuf, sline)
+    local srcmap = fetch_srcmap(id)
+    local near = method and locate_method_line(jbuf, method, nil) or nil
+    local target = java_line_for_src(srcmap, srcline, near) or near or 1
+    target = math.max(1, math.min(target, vim.api.nvim_buf_line_count(jbuf)))
+    pcall(vim.api.nvim_win_set_cursor, jwin, { target, 0 })
+    vim.api.nvim_win_call(jwin, function()
+      vim.cmd("normal! zz")
+    end)
+    vim.api.nvim_buf_clear_namespace(jbuf, follow.ns, 0, -1)
+    pcall(vim.api.nvim_buf_set_extmark, jbuf, follow.ns, target - 1, 0, {
+      line_hl_group = "JadxFollowLine",
+    })
+  end)
+  follow.syncing = false
+  if not ok then
+    vim.notify("[jadxnvim] follow sync: " .. tostring(err), vim.log.levels.DEBUG)
+  end
+end
+
+-- Route a cursor move to the sync for whichever follow pane is active (Java drives smali, or vice
+-- versa). Moves the sync makes in the OTHER pane don't re-enter (guarded by follow.syncing).
+local function follow_on_move()
+  local cur = vim.api.nvim_get_current_win()
+  if cur == follow.jwin then
+    follow_sync()
+  elseif cur == follow.swin then
+    follow_sync_smali()
+  end
+end
+
+--- Turn the Java ⟷ Smali follow split off: close the split we opened and detach the sync.
+function M.stop_follow()
+  if not follow.active then
+    return
+  end
+  follow.active = false
+  if follow.aug then
+    pcall(vim.api.nvim_del_augroup_by_id, follow.aug)
+    follow.aug = nil
+  end
+  if follow.ns and follow.jwin and vim.api.nvim_win_is_valid(follow.jwin) then
+    pcall(vim.api.nvim_buf_clear_namespace, vim.api.nvim_win_get_buf(follow.jwin), follow.ns, 0, -1)
+  end
+  if follow.swin and vim.api.nvim_win_is_valid(follow.swin) then
+    if follow.ns then
+      pcall(vim.api.nvim_buf_clear_namespace, vim.api.nvim_win_get_buf(follow.swin), follow.ns, 0, -1)
+    end
+    pcall(vim.api.nvim_win_close, follow.swin, false)
+  end
+  follow.swin, follow.jwin = nil, nil
+  vim.notify("jadxnvim: Java ⟷ Smali follow OFF", vim.log.levels.INFO)
+end
+
+--- Toggle the Java ⟷ Smali follow split. Off → open a smali split for the current class and keep the
+--- two panes synced to each other on every cursor move (either direction); on → close it. Must be
+--- started from a Java code buffer.
+function M.toggle_follow()
+  if follow.active then
+    M.stop_follow()
+    return
+  end
+  local jbuf = vim.api.nvim_get_current_buf()
+  local id = vim.b[jbuf].jadx_class_id
+  if not id or vim.b[jbuf].jadx_view ~= "java" then
+    vim.notify("jadxnvim: open a Java class buffer first (follow links Java ⟷ Smali)", vim.log.levels.WARN)
+    return
+  end
+  local jwin = vim.api.nvim_get_current_win()
+  vim.cmd("rightbelow vsplit " .. vim.fn.fnameescape(SMALI_PREFIX .. id))
+  local swin = vim.api.nvim_get_current_win()
+  vim.w[swin].jadx_follow = true
+  vim.wo[swin].cursorline = true
+  vim.api.nvim_set_current_win(jwin) -- keep editing focus on the Java pane
+
+  follow.active = true
+  follow.jwin, follow.swin, follow.jbuf = jwin, swin, jbuf
+  follow.ns = follow.ns or vim.api.nvim_create_namespace("jadxnvim_follow")
+  follow.aug = vim.api.nvim_create_augroup("jadxnvim_follow", { clear = true })
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+    group = follow.aug,
+    callback = follow_on_move,
+  })
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = follow.aug,
+    callback = function(ev)
+      local w = tonumber(ev.match)
+      if w == follow.swin or w == follow.jwin then
+        M.stop_follow()
+      end
+    end,
+  })
+  follow_sync()
+  vim.notify("jadxnvim: Java ⟷ Smali follow ON (<leader>jf to turn off)", vim.log.levels.INFO)
+end
+
+--- True while the follow split is active (used by tests / callers).
+function M.follow_active()
+  return follow.active
+end
+
 -- A side-panel window (the project tree or the hierarchy view) is never a place to show code.
 local function is_panel(win)
   local b = vim.api.nvim_win_get_buf(win)
@@ -665,6 +986,8 @@ end
 
 --- Wipe all decompiled-code buffers (e.g. when switching projects).
 function M.reset()
+  pcall(M.stop_follow)
+  follow.srcmaps = {}
   view_mem = {}
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(b) then

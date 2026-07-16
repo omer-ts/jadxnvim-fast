@@ -67,6 +67,10 @@ vim.api.nvim_create_user_command("JadxTypeHierarchy", function()
   require("jadxnvim.nav").type_hierarchy()
 end, { desc = "jadxnvim: super/subtype hierarchy for the class under cursor" })
 
+vim.api.nvim_create_user_command("JadxFollowSmali", function()
+  require("jadxnvim.code").toggle_follow()
+end, { desc = "jadxnvim: toggle a live split that keeps the Java and smali panes synced (both ways)" })
+
 vim.api.nvim_create_user_command("JadxSearch", function(opts)
   require("jadxnvim.search").text(opts.args)
 end, { nargs = "?", desc = "jadxnvim: full-text search across decompiled code" })
